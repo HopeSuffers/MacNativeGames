@@ -308,24 +308,18 @@ def enum_table(listed):
 
 
 def enumerate_states(deps, table):
-    """Bind states to translate for a shader whose default translation read `deps`: each engine slot it reads alone in
-    each of its other types, all of them together in their most common type, and the vertex attributes it reads as
-    unsigned (alone and with the scene slots). Duplicates of what the translator ends up depending on are dropped later."""
+    """Bind states to translate for a shader whose default translation read `deps`: every engine slot it reads in its
+    most common other type at once (the scene textures bound together: shadows, volumes, cube maps), and the vertex
+    attributes it reads as unsigned. One slot at a time (~63,000 variants, ~7 GB) or every type of every slot
+    (~112,000, ~12 GB) did not fit a 460 GB Mac's free space; misses still compile in the background without a stall."""
     tex_alt, attr_alt = table
     slots = [s for s in sorted(deps.get('tex', {}), key=int) if s in tex_alt]
     attrs = [s for s in sorted(deps.get('attr', {}), key=int) if s in attr_alt]
     states = []
-    for s in slots:
-        for kind in tex_alt[s]:
-            states.append(dict(tex={s: kind}, img={}, attr={}, fout={}))
-    together = {s: tex_alt[s][0] for s in slots}
-    if len(slots) > 1:
-        states.append(dict(tex=together, img={}, attr={}, fout={}))
+    if slots:
+        states.append(dict(tex={s: tex_alt[s][0] for s in slots}, img={}, attr={}, fout={}))
     if attrs:
-        uint = {s: attr_alt[s][0] for s in attrs}
-        states.append(dict(tex={}, img={}, attr=uint, fout={}))
-        if together:
-            states.append(dict(tex=together, img={}, attr=uint, fout={}))
+        states.append(dict(tex={}, img={}, attr={s: attr_alt[s][0] for s in attrs}, fout={}))
     return states[:ENUM_MAX]
 
 
