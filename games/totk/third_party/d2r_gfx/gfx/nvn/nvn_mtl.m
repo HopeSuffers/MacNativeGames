@@ -5788,6 +5788,33 @@ static id<MTLFunction> fs_fn_border(NvShader *fs, int nodepth) {
     os_unfair_lock_unlock(&lock);
     return fn;
 }
+/* Non-blocking fs_fn_border (Mac, async pipelines): the patched function when it is compiled, else nil after starting
+   its compile on a background queue; *pending says whether a border function is needed but not ready (the draw waits). */
+static id<MTLFunction> fs_fn_border_try(NvShader *fs, int nodepth, int *pending) {
+    *pending = 0;
+    if (!fs || !sh_has_src(fs)) return nil;
+    float colours[8][4]; int aids[8], n;
+    NSString *key = border_key(fs, 1, colours, aids, &n);
+    if (!key) return nil;
+    if (nodepth && fs->writes_depth) key = [@"nodepth;" stringByAppendingString:key];
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    static NSMutableSet *busy;
+    os_unfair_lock_lock(&lock);
+    id<MTLFunction> fn = fs->bpatch[key];
+    BOOL start = NO;
+    if (!fn) {
+        if (!busy) busy = [NSMutableSet set];
+        NSString *bk = [NSString stringWithFormat:@"%p;%@", fs, key];
+        if (![busy containsObject:bk]) { [busy addObject:bk]; start = YES; }
+        *pending = 1;
+        if (start) dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            fs_fn_border(fs, nodepth);   // compiles and caches it in fs->bpatch (its own lock)
+            os_unfair_lock_lock(&lock); [busy removeObject:bk]; os_unfair_lock_unlock(&lock);
+        });
+    }
+    os_unfair_lock_unlock(&lock);
+    return fn;
+}
 static id<MTLFunction> vs_fn_for(NvShader *vs, NvShader *fs, int layered, int border) {
     static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
     if (layered && !vs_layerable(vs)) MDIE("vertex shader %s cannot write the render target array index", vs->key);
@@ -6116,7 +6143,9 @@ static void pso_pend_reclaim(uint64_t submit) {
         g_pp[i].ps = nil; g_pp[i].used = 0; g_pp_reclaimed++;
     }
 }
-static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // 提交线程调：没在缓存、没在表里才丢 | Called by the submit thread: kick only if it is neither in the cache nor in the table
+static void pso_pend_kick_fn(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> fsfn);
+static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) { pso_pend_kick_fn(k, vs, fs, nil); }
+static void pso_pend_kick_fn(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> fsfn) {   // 提交线程调：没在缓存、没在表里才丢 | Called by the submit thread: kick only if it is neither in the cache nor in the table
     if (hm_get_id(&g_pso, k)) return;
     pthread_mutex_lock(&g_pp_mu);
     pso_pend_reclaim(g_sub_serial);
@@ -6126,8 +6155,13 @@ static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // �
     if (at < 0 && slot < 0) g_pp_full++;
     pthread_mutex_unlock(&g_pp_mu);
     if (at >= 0 || slot < 0) return;
-    MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, nil, 0); g_pp_kicked++;
+    g_pp_kicked++;
+    pso_key kc = *k;
+    /* The descriptor is built on the background queue too (2026-10-20): it can compile a patched vertex function
+       (missing varyings, layered pass, border colour) or fragment function from source, hundreds of ms on the submit
+       thread. pso_desc reads only the key and the two shaders; the patch caches have their own locks. */
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        MTLRenderPipelineDescriptor *d = pso_desc(&kc, vs, fs, fsfn, 0);
         NSError *e = nil; id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
         pthread_mutex_lock(&g_pp_mu); g_pp[slot].ps = ps; g_pp[slot].done = 1; pthread_cond_broadcast(&g_pp_cv); pthread_mutex_unlock(&g_pp_mu);
     });
@@ -6157,11 +6191,11 @@ static uint64_t pso_wait_ns(void) {
     return (uint64_t)v;
 }
 // Submit thread. Returns the finished pipeline (taken out of the table) or nil when it is still compiling.
-static id<MTLRenderPipelineState> pso_pend_try(const pso_key *k, NvShader *vs, NvShader *fs) {
+static id<MTLRenderPipelineState> pso_pend_try(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> fsfn) {
     pthread_mutex_lock(&g_pp_mu);
     int at = pso_pend_find(k);
     pthread_mutex_unlock(&g_pp_mu);
-    if (at < 0) { pso_pend_kick(k, vs, fs); pthread_mutex_lock(&g_pp_mu); at = pso_pend_find(k); pthread_mutex_unlock(&g_pp_mu); }
+    if (at < 0) { pso_pend_kick_fn(k, vs, fs, fsfn); pthread_mutex_lock(&g_pp_mu); at = pso_pend_find(k); pthread_mutex_unlock(&g_pp_mu); }
     if (at < 0) return nil;   // table full: the next draw kicks it again
     id<MTLRenderPipelineState> ps = nil;
     uint64_t t0 = bp_now(), budget = pso_wait_ns();
@@ -6185,15 +6219,23 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     if (g_pass.layered) k.a2c |= PSO_LAYERED;   // TOTK: layered pass (see g_lay)
     if (g_mfx.role) k.a2c |= (uint32_t)g_mfx.role << 2;   // TOTK_MFX: scene / UI copy variant (see pso_desc)
     if (g_pso_lmap) { memcpy(k.lmap, g_pso_lmap, 8); k.fsfn = (__bridge void *)g_pso_fsfn; }
-    __unsafe_unretained id<MTLFunction> bfn = !g_pso_lmap && !g_mfx.role ? fs_fn_border(fs, k.dfmt == 0) : nil;   // TOTK: sampler border colour emulation
+    int bpending = 0;
+    __unsafe_unretained id<MTLFunction> bfn = g_pso_lmap || g_mfx.role ? nil :
+        pso_async() ? fs_fn_border_try(fs, k.dfmt == 0, &bpending) : fs_fn_border(fs, k.dfmt == 0);   // TOTK: sampler border colour emulation
+    if (bpending) {   // its border-colour fragment function is compiling in the background: skip this draw
+        if (++g_pso_skips <= 5 || g_pso_skips % 50 == 0)
+            MLOG("[no-stall] frame %llu: draw skipped while its border-colour shader compiles (%llu pipeline skips so far)",
+                 (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)g_pso_skips);
+        return nil;
+    }
     if (bfn) k.fsfn = (__bridge void *)bfn;
     { float bc[8][4]; int ba[8], bn; if (border_key(vs, 0, bc, ba, &bn)) k.a2c |= PSO_VBORDER; }
     __unsafe_unretained id<MTLRenderPipelineState> cached = (__bridge id<MTLRenderPipelineState>)hm_get_ptr(&g_pso, &k);
     if (cached) return cached;
     id<MTLRenderPipelineState> ps;
     NSError *e = nil; uint64_t bt = bp_now();
-    if (!g_pso_lmap && !bfn && !(k.a2c & PSO_VBORDER) && !g_mfx.role && pso_async()) {
-        ps = pso_pend_try(&k, vs, fs);
+    if (!g_pso_lmap && pso_async()) {
+        ps = pso_pend_try(&k, vs, fs, bfn);
         if (!ps) {   // still compiling: this draw is skipped, a later one takes it
             if (++g_pso_skips <= 5 || g_pso_skips % 50 == 0)
                 MLOG("[no-stall] frame %llu: draw skipped while its pipeline compiles (%llu pipeline skips, %llu shader lookups deferred so far)",
