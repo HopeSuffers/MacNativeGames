@@ -4536,7 +4536,7 @@ static int sh_has_src(NvShader *s) { return s && (s->src || s->src_path); }
     // TOTK: translation inputs and the variant per bound-state signature (prog_fit)
     const uint8_t *ctl[6], *code[6]; NSString *key[6]; uint64_t sig[6]; NSMutableDictionary<NSNumber *, NvShader *> *alt[6];
     void *udc_sh[6]; uint8_t udc_ok, udc_img, udc_imgw; uint32_t udc_cmask;   // udc_*: udc_note_draw's summary of sh[] (valid while sh[] is the same)
-    int missing, miss_has[2]; uint64_t miss_sig[2]; int exp_skip; } @end   // TOTK (iOS): missing = stages whose variant is not translated yet; miss_sig: signature whose variant is missing (prog_fit); exp_skip: TOTK_EXP_SKIP_FS decision (0 unknown, 1 keep, 2 skip)
+    int missing, miss_has[2]; uint64_t miss_sig[2]; int exp_skip; uint64_t miss_gen, miss_fit_gen; } @end   // TOTK (iOS): missing = stages whose variant is not translated yet; miss_sig: signature whose variant is missing (prog_fit); exp_skip: TOTK_EXP_SKIP_FS decision (0 unknown, 1 keep, 2 skip); miss_gen / miss_fit_gen: totk_rt_ready_gen() when the miss was seen (Mac: retried when it moves on)
 @implementation NvProg @end
 /* TOTK_EXP_SKIP_FS=<fragment key prefix>[,<prefix>...] (measurement only, 2026-10-16): drop every draw whose fragment shader key
    starts with one of the prefixes. A render pass whose draws are all dropped is never opened, so the GPU time saved is the
@@ -4925,10 +4925,33 @@ static int rt_range_pr_ro(NvProg *p) {
     for (int k=0;k<6;k++) if (p->sh[k] && (k>1 || p->sh[k]->stage != k || !p->sh[k]->range_ro || p->sh[k]->rf.drv_read[0] || p->sh[k]->rf.drv_read[2])) return 0;
     return 1;
 }
+/* Libraries of variants translated in the background (totk_rt_variant on the Mac), compiled on that queue and taken
+   by shader_get on the submit thread: a new variant costs no compile there either. */
+static NSMutableDictionary<NSString *, NvShader *> *g_ready_libs;
+static os_unfair_lock g_ready_libs_lock = OS_UNFAIR_LOCK_INIT;
+static void ready_library(NSString *name, int stage) {
+    NvShader *sh = shader_load(name, stage);
+    if (!sh) return;
+    os_unfair_lock_lock(&g_ready_libs_lock);
+    if (!g_ready_libs) g_ready_libs = [NSMutableDictionary dictionary];
+    g_ready_libs[name] = sh;
+    os_unfair_lock_unlock(&g_ready_libs_lock);
+}
+__attribute__((constructor)) static void ready_library_register(void) { totk_rt_set_ready_hook(ready_library); }
 static NvShader *shader_get(NSString *pc, int stage) {
     if (!g_shcache) g_shcache = [NSMutableDictionary dictionary];
     NvShader *o = g_shcache[pc];
     if (o) return o;
+    os_unfair_lock_lock(&g_ready_libs_lock);
+    o = g_ready_libs[pc];
+    if (o) [g_ready_libs removeObjectForKey:pc];
+    os_unfair_lock_unlock(&g_ready_libs_lock);
+    if (o) {
+        g_shcache[pc] = o;
+        pso_record("S\t%s\t%d\n", pc.UTF8String, stage);
+        pso_user_record("S\t%s\t%d\n", pc.UTF8String, stage);
+        return o;
+    }
     uint64_t bt = bp_now(); o = shader_load(pc, stage);
     if (!o) { if (survey_shader_log()) MLOG("[survey-shader] frame %llu Metal library FAILED stage %d %s after %.2f ms", (unsigned long long)atomic_load(&g_cur_frame), stage, pc.UTF8String, (bp_now() - bt) / 1e6); return nil; }
     g_shcache[pc] = o;
@@ -4944,15 +4967,33 @@ static uint64_t stage_sig(int st);
    restores copy earlier states), so they are 0 and stage_sig compares only the slots below it (it compared all 128). */
 static int g_tex_hi[6] = {1, 1, 1, 1, 1, 1};
 static NSArray *rt_local(const uint8_t *control, int st);
+/* Mac: a stage whose variant was being translated in the background (missing) is looked up again once a translation
+   finished; the draws of the program were skipped until then. */
+static void prog_retry(NvProg *pr) {
+    uint64_t rg = totk_rt_ready_gen();
+    if (pr->miss_gen == rg) return;
+    pr->miss_gen = rg;
+    for (int st = 0; st < 6; st++) {
+        if (!(pr->missing & 1 << st) || !pr->key[st] || !pr->ctl[st]) continue;
+        NSString *variant = totk_rt_variant(pr->key[st], st, pr->ctl[st], pr->code[st], rt_answers(st), rt_local(pr->ctl[st], st));
+        if (!variant) continue;
+        NvShader *sh = shader_get([variant stringByAppendingString:@"_b"], st);
+        if (!sh) MDIE("TOTK shader translation/reflection unavailable for %s", variant.UTF8String);
+        pr->sh[st] = sh; pr->sig[st] = stage_sig(st);
+        pr->alt[st] = [NSMutableDictionary dictionaryWithObject:sh forKey:@(pr->sig[st])];
+        pr->missing &= ~(1 << st);
+    }
+}
 static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提交线程调用 | Called only on the submit thread
     prog_t *p = (prog_t *)cp;
     static const prog_t *lp; static uint64_t lser, lgen; static NvProg *lpr;   // 上次结果：同一对象、同一序号且序号表未变即直接用 | Last result: same object, same serial and unchanged serial table means it is used directly
     uint64_t gen = g_ser_gen;
-    if (p == lp && p->serial == lser && lpr && (gen == lgen || ser_unaffected(lgen, gen, lser))) { lgen = gen; return lpr; }
+    if (p == lp && p->serial == lser && lpr && (gen == lgen || ser_unaffected(lgen, gen, lser))) { lgen = gen; if (lpr->missing) prog_retry(lpr); return lpr; }
     __unsafe_unretained NvProg *have = p->serial ? (__bridge NvProg *)serial_ptr(p->serial) : nil;
-    if (have) { lp = p; lser = p->serial; lgen = gen; lpr = have; return have; }
+    if (have) { lp = p; lser = p->serial; lgen = gen; lpr = have; if (have->missing) prog_retry(have); return have; }
     shmap_load();
     NvProg *o = [NvProg new];
+    o->miss_gen = totk_rt_ready_gen();   // read before the lookups: a translation finishing meanwhile is retried
     for (unsigned i = 0; i < p->nstage; i++) {
         const uint8_t *control=p->sd[i].control;uint32_t length=0,nvn_stage=0;
         if (!control || !p->sd[i].data) MDIE("null TOTK shader binary");
@@ -5533,11 +5574,13 @@ static int prog_fit(NvProg *pr) {
     for (int st = 0; st < 2; st++) {
         if (!pr->sh[st] || !pr->key[st]) continue;
         uint64_t sg = stage_sig(st); if (sg == pr->sig[st]) continue;
-        if (pr->miss_has[st] && sg == pr->miss_sig[st]) return -1;
+        if (pr->miss_has[st] && sg == pr->miss_sig[st] && pr->miss_fit_gen == totk_rt_ready_gen()) return -1;
         NvShader *v = pr->alt[st][@(sg)];
         if (!v) {
+            uint64_t rg = totk_rt_ready_gen();
             NSString *variant = totk_rt_variant(pr->key[st], st, pr->ctl[st], pr->code[st], rt_answers(st), nil);
-            if (!variant) { pr->miss_sig[st] = sg; pr->miss_has[st] = 1; return -1; }   // iOS: this signature's variant is not translated yet
+            if (!variant) { pr->miss_sig[st] = sg; pr->miss_has[st] = 1; pr->miss_fit_gen = rg; return -1; }   // iOS: not translated yet; Mac: being translated
+            pr->miss_has[st] = 0;
             v = shader_get([variant stringByAppendingString:@"_b"], st);
             if (!v) MDIE("TOTK shader translation/reflection unavailable for %s", variant.UTF8String);
             pr->alt[st][@(sg)] = v;
@@ -6099,6 +6142,41 @@ static id<MTLRenderPipelineState> pso_pend_take(const pso_key *k) {   // 提交�
     pthread_mutex_unlock(&g_pp_mu);
     return ps;
 }
+/* No stall (2026-10-20, Mac): a plain pipeline that is not built yet is compiled in the background; the draw waits for it
+   at most TOTK_PSO_WAIT_US (default 3000) and is skipped otherwise, then picked up by a later draw once done. Merged
+   pass / border variants (descriptor depends on replay planning) still compile here. TOTK_SHADER_SYNC=1: as before. */
+static uint64_t g_pso_skips;
+static int pso_async(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_SHADER_SYNC"); v = !(e && !strcmp(e, "1")); }
+    return v;
+}
+static uint64_t pso_wait_ns(void) {
+    static int64_t v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_PSO_WAIT_US"); v = (e ? atoll(e) : 3000) * 1000; }
+    return (uint64_t)v;
+}
+// Submit thread. Returns the finished pipeline (taken out of the table) or nil when it is still compiling.
+static id<MTLRenderPipelineState> pso_pend_try(const pso_key *k, NvShader *vs, NvShader *fs) {
+    pthread_mutex_lock(&g_pp_mu);
+    int at = pso_pend_find(k);
+    pthread_mutex_unlock(&g_pp_mu);
+    if (at < 0) { pso_pend_kick(k, vs, fs); pthread_mutex_lock(&g_pp_mu); at = pso_pend_find(k); pthread_mutex_unlock(&g_pp_mu); }
+    if (at < 0) return nil;   // table full: the next draw kicks it again
+    id<MTLRenderPipelineState> ps = nil;
+    uint64_t t0 = bp_now(), budget = pso_wait_ns();
+    pthread_mutex_lock(&g_pp_mu);
+    while (!g_pp[at].done && bp_now() - t0 < budget) {
+        uint64_t left = budget - (bp_now() - t0);
+        struct timeval now; gettimeofday(&now, NULL);
+        uint64_t abs_ns = (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_usec * 1000ull + left;
+        struct timespec ts = {(time_t)(abs_ns / 1000000000ull), (long)(abs_ns % 1000000000ull)};
+        pthread_cond_timedwait(&g_pp_cv, &g_pp_mu, &ts);
+    }
+    if (g_pp[at].done) { ps = g_pp[at].ps; g_pp[at].ps = nil; g_pp[at].used = 0; }
+    pthread_mutex_unlock(&g_pp_mu);
+    return ps;
+}
 static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRenderPassDescriptor *unused) {
     (void)unused;
     __unsafe_unretained NvShader *vs = pr->sh[0], *fs = pr->sh[1];
@@ -6114,6 +6192,15 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     if (cached) return cached;
     id<MTLRenderPipelineState> ps;
     NSError *e = nil; uint64_t bt = bp_now();
+    if (!g_pso_lmap && !bfn && !(k.a2c & PSO_VBORDER) && !g_mfx.role && pso_async()) {
+        ps = pso_pend_try(&k, vs, fs);
+        if (!ps) {   // still compiling: this draw is skipped, a later one takes it
+            if (++g_pso_skips <= 5 || g_pso_skips % 50 == 0)
+                MLOG("[no-stall] frame %llu: draw skipped while its pipeline compiles (%llu pipeline skips, %llu shader lookups deferred so far)",
+                     (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)g_pso_skips, (unsigned long long)totk_rt_async_skips());
+            return nil;
+        }
+    } else
     ps = g_pso_lmap ? nil : pso_pend_take(&k);
     if (ps) g_pp_taken++;
     else {
