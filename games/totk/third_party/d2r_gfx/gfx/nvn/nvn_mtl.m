@@ -6388,8 +6388,15 @@ static void warm_plan(NSArray<NSString *> *paths, NSArray<NSString *> *files, NS
             [eligible addObject:line]; ++*tasks;
         }
     }
+    /* Variants the build enumerated (prepare_shader_seed.py, enumerated.txt): compiled into the app and loaded by the
+       first draw that needs one, not warmed here. */
+    NSString *en = [NSString stringWithContentsOfFile:[totk_rt_dir() stringByAppendingPathComponent:@"enumerated.txt"]
+                                             encoding:NSUTF8StringEncoding error:nil];
+    NSSet<NSString *> *enumerated = en ? [NSSet setWithArray:[en componentsSeparatedByString:@"\n"]] : nil;
     for (NSString *file in files) if ([file hasSuffix:@"_b.metal"]) {
-        ++*tasks; [keys addObject:[file stringByDeletingPathExtension]];
+        NSString *name = [file stringByDeletingPathExtension];
+        if ([enumerated containsObject:name]) continue;
+        ++*tasks; [keys addObject:name];
     }
     *shaders = keys.count;
 }

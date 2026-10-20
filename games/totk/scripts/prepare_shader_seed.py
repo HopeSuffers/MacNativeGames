@@ -284,6 +284,55 @@ def plan(shaders, startup, listed):
     return jobs
 
 
+ENUM_MAX = 24   # enumerated bind states per shader at most (a shader reading many engine slots)
+
+
+def enum_table(listed):
+    """Texture types each slot takes besides the default ('2d') in the shared list, most frequent first, and vertex
+    attributes seen as 'uint'. The engine binds its scene textures (shadow maps, volumes, cube maps) to fixed slots and a
+    placeholder 2D texture when a feature is off, so a shader's variants differ in those slots; this is what the list
+    has shown for every shader players met."""
+    tex, attr = {}, {}
+    for _, deps in listed:
+        d = json.loads(deps)
+        for slot, kind in d.get('tex', {}).items():
+            if kind != '2d':
+                tex.setdefault(slot, {}).setdefault(kind, 0)
+                tex[slot][kind] += 1
+        for slot, kind in d.get('attr', {}).items():
+            if kind != 'float':
+                attr.setdefault(slot, {}).setdefault(kind, 0)
+                attr[slot][kind] += 1
+    order = lambda m: {s: [k for k, _ in sorted(c.items(), key=lambda kv: -kv[1]) if c[k] >= 3] for s, c in m.items()}
+    return {k: v for k, v in order(tex).items() if v}, {k: v for k, v in order(attr).items() if v}
+
+
+def enumerate_states(deps, table):
+    """Bind states to translate for a shader whose default translation read `deps`: each engine slot it reads alone in
+    each of its other types, all of them together in their most common type, and the vertex attributes it reads as
+    unsigned (alone and with the scene slots). Duplicates of what the translator ends up depending on are dropped later."""
+    tex_alt, attr_alt = table
+    slots = [s for s in sorted(deps.get('tex', {}), key=int) if s in tex_alt]
+    attrs = [s for s in sorted(deps.get('attr', {}), key=int) if s in attr_alt]
+    states = []
+    for s in slots:
+        for kind in tex_alt[s]:
+            states.append(dict(tex={s: kind}, img={}, attr={}, fout={}))
+    together = {s: tex_alt[s][0] for s in slots}
+    if len(slots) > 1:
+        states.append(dict(tex=together, img={}, attr={}, fout={}))
+    if attrs:
+        uint = {s: attr_alt[s][0] for s in attrs}
+        states.append(dict(tex={}, img={}, attr=uint, fout={}))
+        if together:
+            states.append(dict(tex=together, img={}, attr=uint, fout={}))
+    return states[:ENUM_MAX]
+
+
+def enumerating():
+    return os.environ.get('TOTK_SEED_ENUMERATE', '1') != '0'
+
+
 def prepare(romfs, output, translator, spirv_cross, version, shader_list=LIST, modules=None):
     shared = ShaderList.load(shader_list)
     listed = shared.variants
@@ -292,7 +341,8 @@ def prepare(romfs, output, translator, spirv_cross, version, shader_list=LIST, m
                     translator_sha256=digest(translator.read_bytes()),
                     spirv_cross_sha256=digest(spirv_cross.read_bytes()),
                     preparation_sha256=digest(Path(__file__).read_bytes()),
-                    shader_list_sha256=digest(Path(shader_list).read_bytes()) if Path(shader_list).is_file() else None)
+                    shader_list_sha256=digest(Path(shader_list).read_bytes()) if Path(shader_list).is_file() else None,
+                    enumerate=enumerating())
     marker = output/'seed-manifest.json'
     if marker.exists():
         old = json.loads(marker.read_text())
@@ -309,6 +359,10 @@ def prepare(romfs, output, translator, spirv_cross, version, shader_list=LIST, m
     shaders.update(extra)
     print(f'{len(extra)} more shaders read where the shared list locates them (agl .sharcb, game module)', flush=True)
     jobs = plan(shaders, startup, listed)
+    table = enum_table(listed) if enumerating() else ({}, {})
+    if enumerating():
+        print(f'enumerating bind states: {len(table[0])} texture slots, {len(table[1])} vertex attributes with other types',
+              flush=True)
     # One translator service per core. A shader's jobs (its default bind state, then its listed ones) run in order on
     # one service, because whether a listed job is translated and kept depends on that shader's earlier results; the
     # files each job writes are named after its own shader. The results are then taken in the order of `jobs`, so the
@@ -317,6 +371,7 @@ def prepare(romfs, output, translator, spirv_cross, version, shader_list=LIST, m
     for index, job in enumerate(jobs):
         by_key.setdefault(job[0], []).append(index)
     outcome = [None]*len(jobs)   # ('ok', variant, rows) / ('failed', record) / None (skipped or a duplicate of deps)
+    extra_outcome = []   # enumerated variants that were kept, in completion order (sorted below)
     produced = {}   # key -> {canonical deps: variant}; a shader's .variants rows
     lock = threading.Lock()
     pending = iter(by_key.items())
@@ -336,10 +391,11 @@ def prepare(romfs, output, translator, spirv_cross, version, shader_list=LIST, m
                     return
                 key, indices = item
                 mine = {}
-                for index in indices:
-                    _, answers, variant, why = jobs[index]
+                queue = [(index, jobs[index]) for index in indices]
+                while queue:
+                    index, (_, answers, variant, why) = queue.pop(0)
                     stage, control, code, source = shaders[key]
-                    if why == 'listed' and json.dumps(answers, sort_keys=True, separators=(',', ':')) in mine:
+                    if why in ('listed', 'enumerated') and json.dumps(answers, sort_keys=True, separators=(',', ':')) in mine:
                         continue   # the default (or an earlier row) already gave exactly these deps
                     c1, length = struct.unpack_from('<II', control, 0x700)
                     code_path = staging/(variant+'.code')
@@ -369,7 +425,17 @@ def prepare(romfs, output, translator, spirv_cross, version, shader_list=LIST, m
                         rows = [f'S\t{variant}_b\t'+str({'vs': 0, 'ps': 1, 'cs': 5}[stage])]
                         if stage == 'cs':
                             rows.append(f'C\t{variant}_b')
-                        outcome[index] = ('ok', variant, rows)
+                        if index is None:   # enumerated: shipped compiled, loaded when a draw needs it, not warmed at start
+                            with lock:
+                                extra_outcome.append(('ok', variant, []))
+                        else:
+                            outcome[index] = ('ok', variant, rows)
+                        if why == 'default' and stage != 'cs':
+                            for state in enumerate_states(refl['deps'], table):
+                                answers2 = {**ANSWERS, **state}
+                                queue.append((None, (key, answers2, key+'-'+suffix(answers2), 'enumerated')))
+                    elif index is None:
+                        pass   # an enumerated state the translator cannot make: nothing to ship
                     else:
                         outcome[index] = ('failed', dict(key=key, variant=variant, why=why, stage=stage, source=source,
                                                          error=reply.get('error')))
@@ -392,7 +458,7 @@ def prepare(romfs, output, translator, spirv_cross, version, shader_list=LIST, m
         for future in [pool.submit(worker) for _ in range(workers)]:
             future.result()
     failed, rows, completed = [], [], []
-    for result in outcome:
+    for result in outcome + sorted(extra_outcome, key=lambda r: r[1]):
         if result and result[0] == 'ok':
             completed.append(result[1]); rows.extend(result[2])
         elif result:
@@ -409,14 +475,19 @@ def prepare(romfs, output, translator, spirv_cross, version, shader_list=LIST, m
         if p.name not in wanted:
             p.unlink()
     (staging/'pso_manifest.tsv').write_text('# Prepared from this app\'s local game data; '+CHAIN+'\n'+'\n'.join(rows)+'\n')
+    # The enumerated variants (nvn_mtl.m warm_plan reads this): compiled into the app, loaded by the first draw that
+    # needs one, never warmed at start (about 100,000 of them would make the first start much longer).
+    (staging/'enumerated.txt').write_text(''.join(v+'_b\n' for _, v, _ in sorted(extra_outcome, key=lambda r: r[1])))
     report = dict(**identity, shaders=len(completed), discovered=len(shaders), located=len(extra), startup_shaders=ready,
-                  listed_variants=sum(1 for _, _, _, why in jobs if why == 'listed'), skipped=failed,
+                  listed_variants=sum(1 for _, _, _, why in jobs if why == 'listed'), enumerated_variants=len(extra_outcome),
+                  skipped=failed,
                   archives=archives, seconds=time.monotonic()-started,
                   files={p.name: digest(p.read_bytes()) for p in sorted(staging.iterdir())})
     (staging/'seed-manifest.json').write_text(json.dumps(report, indent=2)+'\n')
     if output.exists():
         shutil.rmtree(output)
     staging.rename(output)
+    print(f'enumerated bind states kept: {len(extra_outcome)}', flush=True)
     print(f'startup seed ready: {len(completed)} shader variants ({ready} startup shaders, the rest from the shared list), '
           f'{len(failed)} skipped', flush=True)
     return report
