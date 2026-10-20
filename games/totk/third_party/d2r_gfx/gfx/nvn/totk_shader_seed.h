@@ -123,7 +123,37 @@ static NSDictionary *totk_seed_import_into(NSString *source, NSString *cache, NS
             if (![data writeToFile:target options:NSDataWritingAtomic error:error]) return nil;
             imported++;
         }
-        NSData *receipt = [NSJSONSerialization dataWithJSONObject:@{@"files_sha256": fingerprint} options:0 error:error];
+        /* Variants an earlier seed brought that this one lacks (another game version: 1.0.0's 14,138 stayed in the cache
+           after a 1.4.3 update, and the warm-up compiled them from source at every start, 25 minutes of background work in
+           play, 2026-10-20): out of the cache and its indexes. Shaders translated on this Mac are in no seed list and stay. */
+        NSMutableSet<NSString *> *seeded = [NSMutableSet set];
+        for (NSString *name in names) if ([name hasSuffix:@"_b.metal"]) [seeded addObject:[name substringToIndex:name.length - 8]];
+        NSArray *was = [old isKindOfClass:NSDictionary.class] && [old[@"seeded"] isKindOfClass:NSArray.class] ? old[@"seeded"] : @[];
+        NSMutableSet<NSString *> *gone = [NSMutableSet set];
+        for (id v in was) if ([v isKindOfClass:NSString.class] && ![seeded containsObject:v] &&
+                             [safe numberOfMatchesInString:[v stringByAppendingString:@"_b.metal"] options:0 range:NSMakeRange(0, [v length] + 8)]) [gone addObject:v];
+        if (gone.count) {
+            for (NSString *v in gone) for (NSString *ext in @[@"_b.metal", @"_b.json", @"_b.metallib"])
+                [fm removeItemAtPath:[cache stringByAppendingPathComponent:[v stringByAppendingString:ext]] error:nil];
+            NSMutableSet<NSString *> *shaders = [NSMutableSet set];
+            for (NSString *v in gone) [shaders addObject:[v componentsSeparatedByString:@"-"].firstObject];
+            for (NSString *key in shaders) {
+                NSString *index = [cache stringByAppendingPathComponent:[key stringByAppendingString:@".variants"]];
+                NSData *d = [NSData dataWithContentsOfFile:index];
+                NSArray *rows = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+                if (![rows isKindOfClass:NSArray.class]) continue;
+                NSMutableArray *keep = [NSMutableArray array];
+                for (id row in rows) if (!([row isKindOfClass:NSDictionary.class] && [gone containsObject:row[@"variant"]])) [keep addObject:row];
+                if (keep.count == rows.count) continue;
+                if (!keep.count) { [fm removeItemAtPath:index error:nil]; continue; }
+                NSData *out = [NSJSONSerialization dataWithJSONObject:keep options:NSJSONWritingSortedKeys error:nil];
+                if (out) [out writeToFile:index options:NSDataWritingAtomic error:nil];
+            }
+            NSLog(@"[shader-seed] removed %lu variants of an earlier seed from the cache", (unsigned long)gone.count);
+        }
+        NSData *receipt = [NSJSONSerialization dataWithJSONObject:@{@"files_sha256": fingerprint,
+                                                                   @"seeded": [seeded.allObjects sortedArrayUsingSelector:@selector(compare:)]}
+                                                          options:0 error:error];
         if (marker && (!receipt || ![receipt writeToFile:marker options:NSDataWritingAtomic error:error])) return nil;
         return @{@"available": @YES, @"shaders": m[@"shaders"], @"imported_files": @(imported)};
     }
