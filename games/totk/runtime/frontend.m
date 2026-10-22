@@ -277,7 +277,7 @@ static void front_menubar_fps(void){   // starts the refresh once the window exi
 @implementation TOTKFrameGraph
 enum { FG_W = 300, FG_H = 112, FG_FRAMES = 300 };
 -(instancetype)initWithFrame:(NSRect)f{(void)f;if((self=[super initWithFrame:NSMakeRect(0,0,FG_W,FG_H)])){self.wantsLayer=YES;self.layer.backgroundColor=[NSColor colorWithCalibratedWhite:0.04 alpha:0.72].CGColor;self.layer.cornerRadius=7;self.layer.borderWidth=1;self.layer.borderColor=[NSColor colorWithCalibratedWhite:1 alpha:0.14].CGColor;
- __weak TOTKFrameGraph *weak=self;self.timer=[NSTimer scheduledTimerWithTimeInterval:1/30.0 repeats:YES block:^(NSTimer *t){(void)t;TOTKFrameGraph *g=weak;if(!g)return;[g position];if(!g.hidden)g.needsDisplay=YES;}];}return self;}
+ __weak TOTKFrameGraph *weak=self;self.timer=[NSTimer scheduledTimerWithTimeInterval:1/15.0 repeats:YES block:^(NSTimer *t){(void)t;TOTKFrameGraph *g=weak;if(!g)return;[g position];if(!g.hidden)g.needsDisplay=YES;}];}return self;}
 -(NSView *)hitTest:(NSPoint)p{(void)p;return nil;}
 -(BOOL)isFlipped{return NO;}
 -(void)position{if(!self.superview)return;
@@ -294,10 +294,15 @@ enum { FG_W = 300, FG_H = 112, FG_FRAMES = 300 };
   [[NSColor colorWithCalibratedWhite:1 alpha:k==2?0.12:0.22] setStroke];NSBezierPath *l=[NSBezierPath bezierPath];l.lineWidth=1;[l moveToPoint:NSMakePoint(NSMinX(plot),y)];[l lineToPoint:NSMakePoint(NSMaxX(plot),y)];
   if(k<2){CGFloat dash[2]={3,3};[l setLineDash:dash count:2 phase:0];}[l stroke];
   [[NSString stringWithFormat:@"%.0f",ms] drawAtPoint:NSMakePoint(4,y-6) withAttributes:lab];}
+ /* The two 300-point lines without antialiasing and with bevel joins: spiky frame times made CoreGraphics' antialiased
+    rasterizer (aa_render / aa_intersection_event) take ~19% of the main thread at 30 Hz during the benchmark, a
+    performance core the game's threads share. Redrawn at 15 Hz. */
+ [[NSGraphicsContext currentContext] setShouldAntialias:NO];
  for(int pass=0;pass<2;pass++){const float *a=pass?v:sv;int m=pass?n:sn;if(m<2)continue;   /* faint: on screen (vsync); orange: the game's frame time */
-  NSBezierPath *p=[NSBezierPath bezierPath];p.lineWidth=pass?1.3:1;p.lineJoinStyle=NSLineJoinStyleRound;
+  NSBezierPath *p=[NSBezierPath bezierPath];p.lineWidth=pass?1.3:1;p.lineJoinStyle=NSLineJoinStyleBevel;
   for(int i=0;i<m;i++){CGFloat x=NSMaxX(plot)-(CGFloat)(m-1-i)*NSWidth(plot)/(FG_FRAMES-1),y=NSMinY(plot)+NSHeight(plot)*MIN(a[i]/top,1);if(i)[p lineToPoint:NSMakePoint(x,y)];else[p moveToPoint:NSMakePoint(x,y)];}
   [(pass?[NSColor colorWithCalibratedRed:1 green:0.78 blue:0.35 alpha:1]:[NSColor colorWithCalibratedWhite:1 alpha:0.28]) setStroke];[p stroke];}
+ [[NSGraphicsContext currentContext] setShouldAntialias:YES];   /* the text below */
  NSString *head=@"Frame time --";
  if(n>0){float s[FG_FRAMES];memcpy(s,v,sizeof(float)*(size_t)n);for(int i=1;i<n;i++){float t=s[i];int j=i-1;while(j>=0&&s[j]<t){s[j+1]=s[j];j--;}s[j+1]=t;}   /* descending */
   int k1=n/100>0?n/100:1;float slow=0;for(int i=0;i<k1;i++)slow+=s[i];slow/=k1;
