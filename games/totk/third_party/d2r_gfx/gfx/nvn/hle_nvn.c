@@ -1122,7 +1122,7 @@ static int inline_bulk_on(void) {
     int v = atomic_load_explicit(&g_inline_bulk_on, memory_order_relaxed);
     if (v < 0) {
         const char *e = getenv("TOTK_INLINE_BULK"); int expected = -1;
-        atomic_compare_exchange_strong(&g_inline_bulk_on, &expected, e && !strcmp(e, "1"));
+        atomic_compare_exchange_strong(&g_inline_bulk_on, &expected, !(e && !strcmp(e, "0")));   // default on since 2026-10-21; TOTK_INLINE_BULK=0 off
         v = atomic_load_explicit(&g_inline_bulk_on, memory_order_relaxed);
     }
     return v;
