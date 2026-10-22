@@ -2833,6 +2833,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     NVN_BLOCKING();
     (void)q; win_t *o = (win_t *)w; o->presents++;
     totk_tl_frame(o->presents); totk_tl(TL_PRES_IN, (uint64_t)idx, 0);
+    { void fps_overlay_note_game(double now_s); fps_overlay_note_game((double)now_ns() / 1e9); }   // frame-time graph: the game's own frame time
     if (runtime_frame_step_update) runtime_frame_step_update(now_ns());
     if (movie_host_tick) movie_host_tick();
     game_work_tick(o->presents);
