@@ -54,3 +54,9 @@ int fps_overlay_value(void);
 /* The same for interpolated frames shown (n counts them); fps_overlay_gen_value() is that rate, or -1. */
 void fps_overlay_note_gen(uint64_t n, double now_s);
 int fps_overlay_gen_value(void);
+/* Frame-time graph: the last n (<= FRAME_GRAPH_N) intervals between game frames reaching the screen, oldest first, in ms.
+   Returns how many were written. TOTK_FRAME_GRAPH=0 hides the graph (runtime/frontend.m). */
+enum { FRAME_GRAPH_N = 1024 };
+int fps_overlay_frame_times(float *out, int n);
+void fps_overlay_note_game(double now_s);   /* the game presented a frame (nvnQueuePresentTexture) */
+int fps_overlay_game_frame_times(float *out, int n);   /* the game's own frame times (ms), oldest first */

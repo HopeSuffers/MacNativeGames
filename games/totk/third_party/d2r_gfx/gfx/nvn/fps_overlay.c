@@ -239,7 +239,32 @@ static void rate_note(rate_meter *m, uint64_t k, double now_s) {
     pthread_mutex_unlock(&m->mu);
 }
 
-void fps_overlay_note(uint64_t ticket, double now_s) { rate_note(&g_game, ticket, now_s); }
+/* Frame-time graph (window frontend, like NX Optimizer's): the time between successive game frames reaching the screen,
+   the last FRAME_GRAPH_N of them in a ring written by the presenting thread and read by the main thread. */
+static float g_ft[FRAME_GRAPH_N]; static _Atomic uint64_t g_ft_n; static double g_ft_last = -1; static uint64_t g_ft_ticket;
+void fps_overlay_note(uint64_t ticket, double now_s) {
+    rate_note(&g_game, ticket, now_s);
+    if (ticket != g_ft_ticket) {
+        if (g_ft_last >= 0 && now_s - g_ft_last < 2.0) { uint64_t i = atomic_load(&g_ft_n); g_ft[i % FRAME_GRAPH_N] = (float)((now_s - g_ft_last) * 1000.0); atomic_store(&g_ft_n, i + 1); }
+        g_ft_last = now_s; g_ft_ticket = ticket;
+    }
+}
+/* The game's frame time (between its presents, before the display's vsync rounds them to 16.7 / 33.3 ms). */
+static float g_gt[FRAME_GRAPH_N]; static _Atomic uint64_t g_gt_n; static double g_gt_last = -1;
+void fps_overlay_note_game(double now_s) {
+    if (g_gt_last >= 0 && now_s - g_gt_last < 2.0) { uint64_t i = atomic_load(&g_gt_n); g_gt[i % FRAME_GRAPH_N] = (float)((now_s - g_gt_last) * 1000.0); atomic_store(&g_gt_n, i + 1); }
+    g_gt_last = now_s;
+}
+int fps_overlay_game_frame_times(float *out, int n) {
+    uint64_t end = atomic_load(&g_gt_n); int k = (int)(end < (uint64_t)n ? end : (uint64_t)n);
+    for (int i = 0; i < k; i++) out[i] = g_gt[(end - (uint64_t)k + (uint64_t)i) % FRAME_GRAPH_N];
+    return k;
+}
+int fps_overlay_frame_times(float *out, int n) {
+    uint64_t end = atomic_load(&g_ft_n); int k = (int)(end < (uint64_t)n ? end : (uint64_t)n);
+    for (int i = 0; i < k; i++) out[i] = g_ft[(end - (uint64_t)k + (uint64_t)i) % FRAME_GRAPH_N];
+    return k;
+}
 int fps_overlay_value(void) { return atomic_load(&g_game.value); }
 void fps_overlay_note_gen(uint64_t n, double now_s) { rate_note(&g_gen, n, now_s); }
 int fps_overlay_gen_value(void) { return atomic_load(&g_gen.value); }
