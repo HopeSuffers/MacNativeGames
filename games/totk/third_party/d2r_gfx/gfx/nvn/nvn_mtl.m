@@ -133,8 +133,9 @@ static uint64_t g_link_dropped;
 static int g_pq_inflight;   // 持 g_pq_mu：已提交给 GPU、完成回调还没来的上屏数 | Under g_pq_mu: number of presents committed to the GPU whose completion callback has not arrived yet
 int g_dm_present_link;   // 出图节拍模式（DM_PRESENT_LINK 的运行时值，同进程交替测量时直接改它）：0 = 自己取 drawable；1 = 显示节拍 60 Hz；2 = 120 Hz 节拍、游戏隔拍出一帧 | Present pacing mode (runtime value of DM_PRESENT_LINK, modified directly during same-process alternating measurement): 0 = acquire the drawable itself; 1 = display link at 60 Hz; 2 = display link at 120 Hz, the game presents a frame every other display-link tick
 static int g_present_latency = 1;
-/* TOTK_VSYNC (default off; =1 on): with vsync off the layer shows each frame as soon as it is done (tearing possible) and
-   the present thread takes its own drawables instead of following the display link (DM_PRESENT_LINK still overrides). */
+/* TOTK_VSYNC (default off; =1 on): the layer's displaySyncEnabled. The display link (DM_PRESENT_LINK, default 1) stays on
+   either way: it shows the newest finished frame at each refresh and never makes the game wait, while a windowed layer
+   taking its own drawables hands them out at the compositor's 60 Hz even without display sync (bench 57.7 vs 64.7 fps). */
 static int vsync_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_VSYNC"); v = e && strcmp(e, "0"); } return v; }
 static uint64_t g_pq_done;
 static uint64_t g_pq_read;
@@ -524,7 +525,7 @@ void mtl_init(void) {
     if (runtime_boot_status) runtime_boot_status(TOTK_UI("创建 Metal 图形设备","Creating the Metal device"),TOTK_UI("准备 GPU、命令队列和图形资源","Preparing the GPU, command queues and graphics resources"));
     g_present_probe = getenv("DM_PRESENT_PROBE") != NULL;
     const char *link = getenv("DM_PRESENT_LINK");
-    g_dm_present_link = link ? atoi(link) : vsync_on(); if (g_dm_present_link < 0 || g_dm_present_link > 2) g_dm_present_link = 1;   // 缺省 1（真机同进程交替：负载超一拍时长帧 15% → 0、帧间隔变匀；稳 60 时与 0 无差别）；DM_PRESENT_LINK=0 关   // 1 = 60 Hz 节拍每拍出图；2 = 120 Hz 节拍、游戏隔拍出一帧（落后时下一个 8.33 ms 拍就能上屏） | Default 1 (real-device same-process alternation: when load exceeds one display-link period, long frames 15% → 0 and frame intervals even out; no difference from 0 at a steady 60); DM_PRESENT_LINK=0 turns it off   // 1 = present on every tick of a 60 Hz display link; 2 = 120 Hz display link, the game presents a frame every other display-link tick (when behind, it can present on the next 8.33 ms display-link tick)
+    g_dm_present_link = link ? atoi(link) : 1; if (g_dm_present_link < 0 || g_dm_present_link > 2) g_dm_present_link = 1;   // 缺省 1（真机同进程交替：负载超一拍时长帧 15% → 0、帧间隔变匀；稳 60 时与 0 无差别）；DM_PRESENT_LINK=0 关   // 1 = 60 Hz 节拍每拍出图；2 = 120 Hz 节拍、游戏隔拍出一帧（落后时下一个 8.33 ms 拍就能上屏） | Default 1 (real-device same-process alternation: when load exceeds one display-link period, long frames 15% → 0 and frame intervals even out; no difference from 0 at a steady 60); DM_PRESENT_LINK=0 turns it off   // 1 = present on every tick of a 60 Hz display link; 2 = 120 Hz display link, the game presents a frame every other display-link tick (when behind, it can present on the next 8.33 ms display-link tick)
     const char *latency = getenv("DM_PRESENT_LATENCY");
     if (latency && atoi(latency) > 0) g_present_latency = atoi(latency);
     g_res_check_on = getenv("DM_RES_CHECK") != NULL;
