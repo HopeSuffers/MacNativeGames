@@ -2059,7 +2059,10 @@ _Atomic int dm_submit_busy;   // TOTK diagnostic: submissions being replayed (ru
 //    job of that image's last present, then for its present ticket as before. The replay frame number travels in the job.
 //  - Operations that destroy or read Metal state (pool / texture / program finalize, ReadTexels / WriteTexels, QueueFinish,
 //    suspend) wait until the queue is empty first (x_drain), so they never overtake a queued replay that still uses them.
-// TOTK_ASYNC_REPLAY=0 (default for now) runs everything on the calling thread as before.
+// TOTK_ASYNC_REPLAY=0 runs everything on the calling thread as before. Default on since 2026-10-21: the NX Optimizer
+// benchmark (bench_run.py) kept its average and raised the 1% / 0.1% lows from 35 / 27 to 38-39 / 30-31 fps, and the
+// 94-frame picture comparison with citron showed no difference from the synchronous replay. On the Mac only: the iPhone
+// and iPad keep the synchronous replay unless TOTK_ASYNC_REPLAY=1 (not measured there).
 enum { XJ_SUBMIT = 1, XJ_PRESENT, XJ_TEXREL };
 typedef struct { int kind, n; uint64_t *h; void *ucap; win_t *win; int idx; double period; int crop[4]; uint64_t frame, sub; tex_t tex; } xjob;   // tex: copy of a finalized texture (XJ_TEXREL); ucap: uniforms captured at the submit call
 #define XQ 64
@@ -2072,7 +2075,7 @@ static win_t *g_xp_win; static uint64_t g_xp_job[4];   // job number of each swa
 static _Atomic uint64_t g_x_drains, g_x_drain_ns;
 static int async_replay(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("TOTK_ASYNC_REPLAY"); v = e && atoi(e) > 0; if (v) LOG("[nvn] 翻译线程：提交与出图排队交给独立线程回放（TOTK_ASYNC_REPLAY=0 关）"); }
+    if (v < 0) { const char *e = getenv("TOTK_ASYNC_REPLAY"); v = e ? atoi(e) > 0 : TARGET_OS_OSX; if (v) LOG("[nvn] 翻译线程：提交与出图排队交给独立线程回放（TOTK_ASYNC_REPLAY=0 关）"); }
     return v;
 }
 static void submit_exec(int n, const uint64_t *h, void *ucap);
