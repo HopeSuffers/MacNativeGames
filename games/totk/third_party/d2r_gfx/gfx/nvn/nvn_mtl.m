@@ -1060,6 +1060,31 @@ static _Atomic int g_cg_on = -1; static int g_cg_force_layers, g_cg_cur, g_cg_pe
 static void cg_flush(void); static int cg_op_safe(unsigned op); static int cg_rt_match(const p_set_rt *r); static void cg_stats_line(void);
 static void skv_set(int on); static int skv_retest(void);   // invisible-draw skipping: runtime switch (flag skip_invisible) and the retest period
 static uint64_t g_sub_serial;   // 第几次提交（并行预编「每次提交只预测一次」用） | Submission index (used by the parallel precompile's 'predict only once per submission')
+/* "flag gpucap <n>": Metal GPU capture of the next n game submissions (about one frame each), started and stopped by the
+   renderer itself between submissions. gpucapture's Layer boundary ends a capture at the drawable present, and the capture
+   layer crashed there on the Metal 4 present path (null dereference in [drawable present], 2026-10-22). Needs
+   MTL_CAPTURE_ENABLED=1 at launch; the trace goes to TOTK_GPUCAP_DIR (default ~/Desktop/totk-captures). */
+static _Atomic int g_gpucap_req; static int g_gpucap_left, g_gpucap_on;
+void gpucap_request(int n) { atomic_store(&g_gpucap_req, n); fprintf(stderr, "[dm] [nvn-mtl] [gpucap] capture of %d submissions requested\n", n); }
+static void gpucap_step(void) {   // submit thread, at the start of each submission
+    if (g_gpucap_on && --g_gpucap_left < 0) {
+        [[MTLCaptureManager sharedCaptureManager] stopCapture]; g_gpucap_on = 0;
+        fprintf(stderr, "[dm] [nvn-mtl] [gpucap] capture stopped\n");
+    }
+    int n = atomic_exchange(&g_gpucap_req, 0);
+    if (n <= 0 || g_gpucap_on) return;
+    MTLCaptureManager *m = [MTLCaptureManager sharedCaptureManager];
+    if (![m supportsDestination:MTLCaptureDestinationGPUTraceDocument]) { fprintf(stderr, "[dm] [nvn-mtl] [gpucap] trace documents unsupported (launch with MTL_CAPTURE_ENABLED=1)\n"); return; }
+    const char *dir = getenv("TOTK_GPUCAP_DIR"); NSString *d = dir ? @(dir) : [NSHomeDirectory() stringByAppendingPathComponent:@"Desktop/totk-captures"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:nil];
+    NSDateFormatter *f = [NSDateFormatter new]; f.dateFormat = @"yyyyMMdd-HHmmss";
+    NSString *path = [d stringByAppendingPathComponent:[NSString stringWithFormat:@"totk-%@-s%llu.gputrace", [f stringFromDate:[NSDate date]], (unsigned long long)g_sub_serial]];
+    MTLCaptureDescriptor *cd = [MTLCaptureDescriptor new]; cd.captureObject = g_dev; cd.destination = MTLCaptureDestinationGPUTraceDocument; cd.outputURL = [NSURL fileURLWithPath:path];
+    NSError *e = nil;
+    if (![m startCaptureWithDescriptor:cd error:&e]) { fprintf(stderr, "[dm] [nvn-mtl] [gpucap] start failed: %s\n", e.localizedDescription.UTF8String); return; }
+    g_gpucap_on = 1; g_gpucap_left = n;
+    fprintf(stderr, "[dm] [nvn-mtl] [gpucap] capturing %d submissions to %s\n", n, path.UTF8String);
+}
 static void pt_apply_request(void);
 static int g_sub_chunks; static uint64_t g_chunk_mark, g_stat_draw; static void chunk_cfg(void);   // mid-submission commits, defined before mtl_sub_commit
 static int g_nupd, g_nshadow; static inline int upd_guard(uint64_t lo, uint64_t hi);   // renamed uniform updates, defined with mtl_sub_update
@@ -1081,6 +1106,7 @@ void mtl_sub_begin(void) {
     pt_apply_request();
     g_sub_thread = pthread_self(); atomic_store(&g_sub_thread_set, 1);
     atomic_store(&g_last_commit_error, 0);
+    gpucap_step();
     g_cb = [g_dev newCommandBuffer];
     // 不在帧中间等 GPU（真机热态：固定 3 个轮转时 GPU 跟不上就每帧在这里阻塞，提交线程睡醒后按低频跑，指令数 −18% 而 CPU 时间 +49%）：
     // 挑一个 GPU 已用完的分配器；都在用就新建；到上限才等最老的那个。超前量由游戏取交换链贴图处的等待约束，与旧接口相同。
@@ -2476,6 +2502,7 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "arg_epoch_check")) { (void)arg_epoch_on(); atomic_store(&g_arg_epoch_check, v != 0); MLOG("[flag] arg_epoch_check = %d verified=%llu extra=%llu", v != 0, (unsigned long long)atomic_load(&g_arg_epoch_verified), (unsigned long long)atomic_load(&g_arg_epoch_extra)); return; }
     if (!strcmp(name, "tex_slots")) { (void)tex_slots_on(); atomic_store(&g_tex_slots_on, v != 0); MLOG("[flag] tex_slots = %d", v != 0); return; }
     if (!strcmp(name, "tex_slots_check")) { (void)tex_slots_on(); atomic_store(&g_tex_slots_check, v != 0); MLOG("[flag] tex_slots_check = %d verified=%llu hits=%llu", v != 0, (unsigned long long)atomic_load(&g_tex_slots_verified), (unsigned long long)atomic_load(&g_tex_slots_hits)); return; }
+    if (!strcmp(name, "gpucap")) { gpucap_request(v); return; }   // Metal GPU capture of the next v submissions (MTL_CAPTURE_ENABLED=1)
     if (!strcmp(name, "render_stream")) { atomic_store(&g_rs_on, v != 0); MLOG("[flag] render_stream = %d (next render pass)", v != 0); return; }
     if (!strcmp(name, "cube_merge")) { atomic_store(&g_cg_on, v != 0); MLOG("[flag] cube_merge = %d", v != 0); return; }
     if (!strcmp(name, "skip_invisible")) { skv_set(v); return; }
