@@ -2470,6 +2470,12 @@ static void dump_frame(void) {
     if (g_frame <= (uint64_t)nframes) LOG("[nvn] %s %llu：%u 个函数 %llu 次调用 |%s", g_frame ? "帧" : "初始化", g_frame, nfn, total, line);
     else if (g_frame % 300 == 0) LOG("[nvn] 帧 %llu：%u 个函数 %llu 次调用", g_frame, nfn, total);
     g_frame++; g_frame_pub = g_frame; cs_dump();
+    /* TOTK_BENCH_FRAMES=<file> (benchmark, 2026-10-20): "<frame> <ns>" at every game frame, on the clock the survey
+       reports use (scripts/bench_run.py cuts the run into its fly segments by those frame numbers). */
+    { static FILE *bf; static int on = -1;
+      if (on < 0) { const char *e = getenv("TOTK_BENCH_FRAMES"); on = e && *e && (bf = fopen(e, "w")) != NULL; }
+      if (on) { fprintf(bf, "%llu %llu\n", (unsigned long long)g_frame, (unsigned long long)clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+                if (!(g_frame % 60)) fflush(bf); } }
     { void runtime_watch_tick(uint64_t); runtime_watch_tick(g_frame); }   // TOTK diagnostic write watchpoint (TOTK_WATCH_ADDR)
     // 每 300 帧读一次常驻内存，交图形层打内存读数行（mtl_mem_stat，低频封顶）。内存看门狗：常驻超过上限就报红自行退出——只在 Mac 宿主上缺省开（24 GB：宿主内存失控
     // 会把整机拖进内核崩溃，同机别的程序两次如此），或测试时用 DM_MEM_CAP_GB=<整数> 指定；玩家的 iOS 包不设上限（被系统杀之前自己退没有意义，反而多一种闪退）
