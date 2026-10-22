@@ -1383,8 +1383,13 @@ def step_warm_metal(tree, out, logs):
     tool = build / 'warm-metal-cache'   # next to the game binary: Metal matches the length of the program's folder path
     tool.unlink(missing_ok=True)        # left by an interrupted build
     sources = sorted(seed.glob('*_b.metal'))
-    if sources and all((build / 'shader-libs' / f'{sha256(src)}.metallib').is_file() for src in sources):
-        say('4/4 app: the startup shaders are compiled into the app (step_shader_libs), so Metal\'s cache needs no warming')
+    missing = [src for src in sources if not (build / 'shader-libs' / f'{sha256(src)}.metallib').is_file()]
+    # A few shaders Metal rejects ahead of time (4 of 31,308 with the enumerated bind states, 2026-10-20: depth textures
+    # gathered at constant offsets, which the game's own compile patches) do not make this step compile the whole seed
+    # again from source (25 minutes): the game compiles those few itself.
+    if sources and len(missing) <= max(100, len(sources) // 100):
+        say('4/4 app: the startup shaders are compiled into the app (step_shader_libs), so Metal\'s cache needs no warming'
+            + (f' ({len(missing)} the game compiles itself)' if missing else ''))
         return
     users = metal_cache_users()
     if users or subprocess.run(['pgrep', '-q', 'totk-native']).returncode == 0:
