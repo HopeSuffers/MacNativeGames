@@ -774,6 +774,16 @@ static int pool_lookup(uint64_t addr, uint64_t len, void **buf, uint64_t *base, 
     *buf = e->buf; *base = e->base; *gpu = e->gpu;
     return 1;
 }
+/* pool_lookup that answers with the pool's guest range [*lo, *hi) (the uniform capture tests many nearby addresses:
+   one inside the last pool found needs no lookup of its own). */
+static int mtl_addr_range(uint64_t addr, uint64_t len, uintptr_t *lo, uintptr_t *hi) {
+    if (pool_tls_on()) { const pool_tls_ent *e = pool_tls_find((uintptr_t)addr, len); if (e) { *lo = e->lo; *hi = e->hi; return 1; } }
+    pthread_mutex_lock(&g_mu);
+    pidx_ent *p = pool_query((uintptr_t)addr, len);
+    if (p) { pool_res(p); *lo = p->lo; *hi = p->hi; if (pool_tls_on()) pool_tls_keep(p); }
+    pthread_mutex_unlock(&g_mu);
+    return p != NULL;
+}
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     uint64_t base, gpu;
     if (!pool_lookup(addr, len, buf, &base, &gpu)) return 0;
@@ -1381,8 +1391,23 @@ static int gw_cmp(const void *x, const void *y) { const gw_t *a = x, *b = y; ret
    and the replay builds its copies from them. done: fence completion at the capture; a GPU write of an earlier submission
    whose fence is above it was not in memory then, so ranges it overlaps are read on the GPU timeline instead (with the
    replay inside the submit call the capture is the replay's own start, as before). */
-typedef struct { uint64_t done; int n; usnap_rng *r; size_t *off; uint8_t *bytes; uint64_t ns; } usnap_cap;
-static _Atomic uint64_t g_ucap_ns, g_ucap_bytes;
+typedef struct { uint64_t done; int n; usnap_rng *r; size_t *off; uint8_t *bytes; size_t cap; uint64_t ns; } usnap_cap;
+/* Capture byte buffers are reused (a few MB each submission): a fresh malloc of that size is fresh pages, and their first
+   touch made the copy three times slower than memcpy (0.18 ms of the submit call for 1.9 MB). */
+static os_unfair_lock g_ucap_pool_lk = OS_UNFAIR_LOCK_INIT; static uint8_t *g_ucap_pool[4]; static size_t g_ucap_pool_cap[4];
+static uint8_t *ucap_bytes_get(size_t need, size_t *cap) {
+    os_unfair_lock_lock(&g_ucap_pool_lk);
+    for (int i = 0; i < 4; i++) if (g_ucap_pool[i] && g_ucap_pool_cap[i] >= need) { uint8_t *b = g_ucap_pool[i]; *cap = g_ucap_pool_cap[i]; g_ucap_pool[i] = NULL; os_unfair_lock_unlock(&g_ucap_pool_lk); return b; }
+    os_unfair_lock_unlock(&g_ucap_pool_lk);
+    *cap = need + need / 4 + 65536; uint8_t *b = malloc(*cap); if (!b) MDIE("uniform capture bytes"); return b;
+}
+static void ucap_bytes_put(uint8_t *b, size_t cap) {
+    if (!b) return;
+    os_unfair_lock_lock(&g_ucap_pool_lk);
+    for (int i = 0; i < 4; i++) if (!g_ucap_pool[i]) { g_ucap_pool[i] = b; g_ucap_pool_cap[i] = cap; os_unfair_lock_unlock(&g_ucap_pool_lk); return; }
+    os_unfair_lock_unlock(&g_ucap_pool_lk); free(b);
+}
+static _Atomic uint64_t g_ucap_ns, g_ucap_bytes, g_ucap_t[4];   // g_ucap_t: collect / sort / merge / copy (diagnostic)
 void *mtl_sub_capture_ubos(const uint64_t *h, int n) {
     static int on = -1;   // TOTK_UBO_CAPTURE=0 (A/B only): the translation thread copies at the start of the replay instead
     if (on < 0) { const char *e = getenv("TOTK_UBO_CAPTURE"); on = !(e && !strcmp(e, "0")); if (!on) MLOG("TOTK_UBO_CAPTURE=0：翻译线程模式下 uniform 在回放开始时才拷（对照用）"); }
@@ -1392,32 +1417,64 @@ void *mtl_sub_capture_ubos(const uint64_t *h, int n) {
     c->done = __atomic_load_n(&g_done, __ATOMIC_ACQUIRE);   // before the bytes: a write completing meanwhile only makes this conservative
     usnap_rngs v = {0};
     for (int i = 0; i < n; i++) usnap_collect(&v, (const uint8_t *)(uintptr_t)h[i], 0);
+    uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), t2 = t1, t3 = t1; atomic_fetch_add(&g_ucap_t[0], t1 - t0);
     if (v.n) {
+        {   /* the same uniform blocks are bound again and again (per-frame / per-material blocks): exact duplicates go
+               before the sort, through a small open-addressing table of the ranges already kept */
+            enum { DH = 1 << 14 }; static uint64_t klo[DH], khi[DH]; static uint32_t stamp[DH]; static uint32_t gen;   // the game's submit thread only
+            if (++gen == 0) { memset(stamp, 0, sizeof stamp); gen = 1; }
+            int m = 0;
+            for (int i = 0; i < v.n; i++) {
+                uint64_t kk = v.r[i].lo ^ (v.r[i].hi << 1); uint32_t h = (uint32_t)((kk * 0x9E3779B97F4A7C15ull) >> 50) & (DH - 1); int dup = 0;
+                for (int probe = 0; probe < 8; probe++, h = (h + 1) & (DH - 1)) {   // a full neighbourhood keeps the range (no false duplicate)
+                    if (stamp[h] != gen) { stamp[h] = gen; klo[h] = v.r[i].lo; khi[h] = v.r[i].hi; break; }
+                    if (klo[h] == v.r[i].lo && khi[h] == v.r[i].hi) { dup = 1; break; }
+                }
+                if (!dup) v.r[m++] = v.r[i];
+            }
+            v.n = m;
+        }
         rng_sort(v.r, v.n);
+        t2 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); atomic_fetch_add(&g_ucap_t[1], t2 - t1);
         int k = -1;   // merge overlapping / touching bindings that lie in one memory pool; drop bindings outside every pool
+        uintptr_t plo = 1, phi = 0;   // the pool of the last lookup: ranges inside it need no new lookup (sorted input: mostly the same pool)
         for (int i = 0; i < v.n; i++) {
-            void *mb; uint64_t mo;
+            uintptr_t lo2, hi2;
             if (k >= 0 && v.r[i].lo <= v.r[k].hi) {
                 if (v.r[i].hi <= v.r[k].hi) continue;
-                if (mtl_addr(v.r[k].lo, v.r[i].hi - v.r[k].lo, &mb, &mo)) { v.r[k].hi = v.r[i].hi; continue; }
+                if (v.r[k].lo >= plo && v.r[i].hi <= phi) { v.r[k].hi = v.r[i].hi; continue; }
+                if (mtl_addr_range(v.r[k].lo, v.r[i].hi - v.r[k].lo, &lo2, &hi2)) { plo = lo2; phi = hi2; v.r[k].hi = v.r[i].hi; continue; }
             }
-            if (!mtl_addr(v.r[i].lo, v.r[i].hi - v.r[i].lo, &mb, &mo)) continue;
+            if (!(v.r[i].lo >= plo && v.r[i].hi <= phi)) {
+                if (!mtl_addr_range(v.r[i].lo, v.r[i].hi - v.r[i].lo, &lo2, &hi2)) continue;
+                plo = lo2; phi = hi2;
+            }
             v.r[++k] = v.r[i];
         }
         c->n = k + 1;
         size_t total = 0;
         c->off = malloc(sizeof *c->off * (size_t)(c->n ? c->n : 1)); if (!c->off) MDIE("uniform capture");
         for (int i = 0; i < c->n; i++) { c->off[i] = total; total += (size_t)(v.r[i].hi - v.r[i].lo); }
-        c->bytes = malloc(total ? total : 1); if (!c->bytes) MDIE("uniform capture bytes");
+        t3 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); atomic_fetch_add(&g_ucap_t[2], t3 - t2);
+        c->bytes = ucap_bytes_get(total ? total : 1, &c->cap);
+        /* Large captures are copied by four threads in contiguous slices of the ranges: about 1,200 scattered ranges of
+           memory other cores just wrote copied at ~10 GB/s on one thread (0.19 ms of the game's submit call for 1.8 MB). */
+        if (total >= (512u << 10) && c->n >= 64) {
+            uint8_t *dst = c->bytes; const size_t *off = c->off; const usnap_rng *rr = v.r; int nr = c->n;
+            dispatch_apply(4, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t k) {
+                int a = (int)((size_t)nr * k / 4), b = (int)((size_t)nr * (k + 1) / 4);
+                for (int i = a; i < b; i++) memcpy(dst + off[i], (const void *)(uintptr_t)rr[i].lo, (size_t)(rr[i].hi - rr[i].lo));
+            });
+        } else
         for (int i = 0; i < c->n; i++) memcpy(c->bytes + c->off[i], (const void *)(uintptr_t)v.r[i].lo, (size_t)(v.r[i].hi - v.r[i].lo));
         c->r = v.r; v.r = NULL;
-        atomic_fetch_add(&g_ucap_bytes, total);
+        atomic_fetch_add(&g_ucap_bytes, total); atomic_fetch_add(&g_ucap_t[3], clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t3);
     }
     free(v.r);
     c->ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0; atomic_fetch_add(&g_ucap_ns, c->ns);
     return c;
 }
-static void ucap_free(usnap_cap *c) { if (c) { free(c->r); free(c->off); free(c->bytes); free(c); } }
+static void ucap_free(usnap_cap *c) { if (c) { free(c->r); free(c->off); ucap_bytes_put(c->bytes, c->cap); free(c); } }
 /* The bytes of [a, a+n) as captured: memory at the capture where a captured range covers them (they are memory now
    elsewhere: no binding of this submission reads there). */
 static void ucap_read(const usnap_cap *c, uint64_t a, uint8_t *out, size_t n) {
@@ -1475,6 +1532,8 @@ void mtl_sub_snapshot_ubos_cap(const uint64_t *h, int n, void *capv) {
     g_usnap_n += (uint64_t)g_nusnap;
     if (++g_usnap_subs % 1800 == 0) {
         uint64_t cns = atomic_exchange(&g_ucap_ns, 0), cby = atomic_exchange(&g_ucap_bytes, 0);
+        { uint64_t a = atomic_exchange(&g_ucap_t[0], 0), b = atomic_exchange(&g_ucap_t[1], 0), c = atomic_exchange(&g_ucap_t[2], 0), d = atomic_exchange(&g_ucap_t[3], 0);
+          MLOG("[nvn] uniform capture in the submit call (ms per submission): collect %.3f / sort %.3f / merge %.3f / copy %.3f", a / 1800 / 1e6, b / 1800 / 1e6, c / 1800 / 1e6, d / 1800 / 1e6); }
         MLOG("[nvn] uniform 提交时快照：每次提交平均 %.0f 段 / %.1f KB / 回放线程 %.3f ms（收集排序 %.3f / 合并 %.3f / 分配并派发 %.3f）；辅助线程拷 %llu 段、回放自取 %llu 段、等辅助线程 %llu 次；本次提交里 GPU 写入使快照失效共 %llu 段，因前次提交的 GPU 写入未完成而不拷贝共 %llu 段%s",
              (double)g_usnap_n / 1800, (double)g_usnap_bytes / 1800 / 1024, (double)g_usnap_ns / 1800 / 1e6,
              (double)g_usnap_t[0] / 1800 / 1e6, (double)g_usnap_t[1] / 1800 / 1e6, (double)g_usnap_t[2] / 1800 / 1e6,
