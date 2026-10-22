@@ -2669,7 +2669,13 @@ static void wb_note(const tex_t *t) {
     nvn_hm_put(&g_wb, &k, e);
     pthread_mutex_unlock(&g_smu);
 }
+static int wb_level_back_body(const tex_t *t, id<MTLTexture> mt, unsigned level, unsigned layer);
+/* The staging buffer and command buffer are autoreleased: the translation thread (eager write-back at present) has no
+   pool of its own, so without this each write-back kept its buffer (2 GB after 7,500 write-backs, GPU budget abort). */
 static int wb_level_back(const tex_t *t, id<MTLTexture> mt, unsigned level, unsigned layer) {
+    @autoreleasepool { return wb_level_back_body(t, mt, level, layer); }
+}
+static int wb_level_back_body(const tex_t *t, id<MTLTexture> mt, unsigned level, unsigned layer) {
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     uint32_t lw = MAX(t->d.width >> level, 1u), lh = MAX(t->d.height >> level, 1u);
     size_t lp = (size_t)((lw + bw - 1) / bw) * bpb, lr = (lh + bh - 1) / bh;
