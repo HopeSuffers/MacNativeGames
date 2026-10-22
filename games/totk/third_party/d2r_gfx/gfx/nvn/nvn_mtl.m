@@ -1938,6 +1938,7 @@ extern uint64_t g_draw_skip[16];
 static _Atomic uint64_t g_cur_frame;
 typedef struct { const void *op; uint64_t frame; int result; } cond_cache_ent;
 static cond_cache_ent g_cond_cache[1024];
+static inline int passdump(void);
 static int cond_eval(const void *payload, const void *op) {
     const p_render_cond *c = payload; uint64_t frame = atomic_load(&g_cur_frame);
     cond_cache_ent *ce = &g_cond_cache[((uintptr_t)op >> 3) & 1023];
@@ -1954,6 +1955,8 @@ static int cond_eval(const void *payload, const void *op) {
         }
     }
     if (unknown) { enabled = 1; g_draw_skip[14]++; } else if (!enabled) g_draw_skip[13]++;
+    if (passdump()) fprintf(stderr, "[pass] F%llu E condval addr=%#llx x=%#llx(%d) y=%#llx(%d) mode=%d -> %s\n", (unsigned long long)frame,
+                            (unsigned long long)c->addr, (unsigned long long)x, kx, (unsigned long long)y, ky, c->mode, unknown ? "unknown" : enabled ? "enabled" : "disabled");
     *ce = (cond_cache_ent){op, frame, enabled};
     return enabled;
 }
@@ -3823,6 +3826,11 @@ static id<MTLTexture> tex_mtl(const tex_t *ct) {
                 if (clean) return pk->tex;
             }
             TILELOG(t, "re-upload from the pool bytes");
+            { static int rl = -1, nlog; if (rl < 0) rl = getenv("TOTK_REUP_LOG") != NULL;   // diagnostic: which textures are re-uploaded, and which of their pages changed
+              if (rl && (t->L.size >= (256u << 10) || nlog++ < 50)) { int dlo, dhi, dn = nvn_dirty_count_since(t->mem, t->L.size, pk->stamp, &dlo, &dhi);
+                  MLOG("[reup] frame %llu ser=%llu nvnfmt=%#x %ux%ux%u levels %u size %llu KB %s; dirty pages %d of %llu (%d..%d)", (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)t->serial, t->d.format,
+                                           t->d.width, t->d.height, t->d.depth, t->d.levels, (unsigned long long)(t->L.size >> 10), pk->hashed ? "hashed" : !pk->tex ? "restored" : "dirty",
+                                           dn, (unsigned long long)((t->L.size + 16383) >> 14), dlo, dhi); } }
             uint64_t st; reup_key nk; g_mip_nodrop = pk->owned; id<MTLTexture> nt = pkg_upload(t, &st, &nk, pk); g_mip_nodrop = 0;   // 池内容变了（流式素材写进同一存储）：换新贴图，在途绘制仍读旧的 | Pool content changed (streamed assets written into the same storage): switch to a new texture; in-flight draws still read the old one
             if (nt) { id<MTLTexture> old = pk->tex; pk->tex = nt; reup_retire(old, &pk->key); pk->key = nk; if (pk->hashed) pk->chash = h; ser_bump(t->serial); pk->stamp = st; pk->seen = st; g_pkg_reuploads++; if (dirtycheck()) pk->hash = full_hash(t->mem, t->L.size); BOTW_REUP_TRACKED(pk, t) }
             else { free(pk->edge); pk->edge = NULL; }   // TOTK (#90): the bytes kept belong to the upload that failed
@@ -7242,7 +7250,17 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
                 "fragment O hl4() { return {float4(0,0,1,1),float4(0,0,1,1),float4(0,0,1,1)}; } fragment O hl5() { return {float4(1,1,1,1),float4(1,1,1,1),float4(1,1,1,1)}; }\n" options:nil error:&e];
                 if (!hl) MLOG("【红】HILITE 着色器编译失败 %s", e.localizedDescription.UTF8String); }
             if (hl) d.fragmentFunction = [hl newFunctionWithName:[NSString stringWithFormat:@"hl%d", i]];
-            break; } }
+            break; }
+        /* DM_NVN_HILITE=all: every fragment shader a colour of its own from its key (logged once per key), to find which
+           shader draws a given pixel in a render-target dump (unorm targets keep the exact value: channel = 4 * level) */
+        if (nk == 1 && !strcmp(keys[0], "all")) {
+            uint64_t h = 1469598103934665603ull; for (const char *c = fs->key; *c; c++) h = (h ^ (uint8_t)*c) * 1099511628211ull;
+            unsigned r = (unsigned)(h & 63) * 4, g = (unsigned)((h >> 6) & 63) * 4, b = (unsigned)((h >> 12) & 63) * 4;
+            NSString *src = [NSString stringWithFormat:@"#include <metal_stdlib>\nusing namespace metal;\nstruct O { float4 c0 [[color(0)]]; float4 c1 [[color(1)]]; float4 c2 [[color(2)]]; };\n"
+                "fragment O hla() { float4 c = float4(%u.0 / 255.0, %u.0 / 255.0, %u.0 / 255.0, 1); return {c, c, c}; }\n", r, g, b];
+            NSError *e = nil; id<MTLLibrary> l = [g_dev newLibraryWithSource:src options:nil error:&e];
+            if (l) { d.fragmentFunction = [l newFunctionWithName:@"hla"]; MLOG("[hilite] %s rgb=%u,%u,%u", fs->key, r, g, b); }
+        } }
     /* TOTK diagnostic TOTK_GPU_HILITE1=<fragment shader key prefix>,...: draws of these fragment shaders write a solid
        colour to colour attachment 0 only (green / cyan / yellow / blue), to tell whether their geometry rasterises at all. */
     int hilited = 0;
@@ -11473,9 +11491,9 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (!S.prog) { RED_ONCE(18, "绘制前没有绑定程序"); g_draw_skip[0]++; return; }
     g_prog_for_draw = 1; __unsafe_unretained NvProg *pr = prog_get(S.prog); g_prog_for_draw = 0;
     if (pr && pr->missing && async_shaders()) { shader_predict_maybe(); prog_resolve(pr, draw_may_skip(pr)); }
-    if (pr && pr->missing) { draw_skipped(); return; }   // TOTK (iOS): a stage is not translated yet; Mac (async shaders): still in the background
+    if (pr && pr->missing) { draw_skipped(); PD("S shader-missing (program) vs=%.24s fs=%.24s", pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-"); return; }   // TOTK (iOS): a stage is not translated yet; Mac (async shaders): still in the background
     if (g_nupd) upd_guard_draw(pr, di);   // TOTK: before any encoder or texture preparation of this draw
-    { int fit = pr ? prog_fit(pr) : 0; if (fit < 0) { draw_skipped(); return; } if (fit) g_pso_dirty = 1; }
+    { int fit = pr ? prog_fit(pr) : 0; if (fit < 0) { draw_skipped(); PD("S shader-missing (variant) vs=%.24s fs=%.24s", pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-"); return; } if (fit) g_pso_dirty = 1; }
     if (skv_on()) { g_skv_draws++; if (skv_check((__bridge const void *)pr, dw, di)) return; }   // measurement experiment: skip draws invisible in the last frames
     geometry_dump(pr, dw, di);
     if (di && di->itype == 0 && di->count && pend_hits(di->ibuf, (uint64_t)di->count)) widen_indices_gpu(di);
@@ -11626,7 +11644,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
         NSUInteger tw0 = 0, th0 = 0; rt_dims(&tw0, &th0);
         long x0 = R.sc.x < 0 ? 0 : R.sc.x, y0 = R.sc.y < 0 ? 0 : R.sc.y, x1 = (long)R.sc.x + R.sc.w, y1 = (long)R.sc.y + R.sc.h;
         if (x1 > (long)tw0) x1 = tw0; if (y1 > (long)th0) y1 = th0;
-        if (x1 <= x0 || y1 <= y0) { g_draw_skip[6]++; return; }
+        if (x1 <= x0 || y1 <= y0) { g_draw_skip[6]++; PD("S scissor-empty sc=%d,%d,%d,%d tgt=%lux%lu fs=%.12s", R.sc.x, R.sc.y, R.sc.w, R.sc.h, (unsigned long)tw0, (unsigned long)th0, pr && pr->sh[1] ? pr->sh[1]->key : "-"); return; }
     }
 
 #ifdef NVN_RT_RANGE_TEST
@@ -12042,6 +12060,9 @@ static void dispatch(const p_dispatch *dp) {
     if (cpr->missing && async_shaders()) { shader_predict_maybe(); prog_resolve(cpr, 0); }   // Mac: a dispatch waits for its urgent job, never skipped
     if (cpr->missing) { static uint64_t n; if (!n++) MLOG("[shader-miss] 计算着色器还没翻译：跳过这个派发（以后同类不再提示）"); return; }
     NvShader *cs = cpr->sh[5];
+    { static const char *lc; static int lci; if (!lci) { lci = 1; lc = getenv("TOTK_LOG_CS"); }   // diagnostic: storage buffers of these compute shaders, per frame
+      if (lc && cs && !strncmp(cs->key, lc, strlen(lc))) { static int nl; if (nl++ < 400) MLOG("[cs-log] frame %llu cs %.16s ssbo0 %#llx+%llu ssbo1 %#llx", (unsigned long long)atomic_load(&g_cur_frame), cs->key,
+          (unsigned long long)S.ssbo[5][0].addr, (unsigned long long)S.ssbo[5][0].size, (unsigned long long)S.ssbo[5][1].addr); } }
     if (!cs) { RED_ONCE(28, "派发的程序没有计算着色器（或未映射）"); return; }
     const void *k = (__bridge const void *)cs;
     id<MTLComputePipelineState> ps = hm_get_id(&g_cps, &k);
