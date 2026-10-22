@@ -1158,12 +1158,45 @@ static int bar_end_on(void) { static int v = -1; if (v < 0) { const char *e = ge
 static int bar_start_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_BARRIER_START"); v = !(e && !strcmp(e, "0")); if (!v) fprintf(stderr, "[dm] [nvn-mtl] 【实验】TOTK_BARRIER_START=0：回放编码器开头不设消费者屏障（有数据竞争，只供测量）\n"); } return v; }
 static MTL4VisibilityOptions bar_vis(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_BARRIER_VIS"); v = !(e && !strcmp(e, "0")); if (!v) fprintf(stderr, "[dm] [nvn-mtl] 【实验】TOTK_BARRIER_VIS=0：回放编码器开头屏障不带缓存可见性\n"); } return v ? MTL4VisibilityOptionDevice : MTL4VisibilityOptionNone; }
 static MTL4VisibilityOptions blit_vis(void) { return bar_vis() | (g_blit_alias ? MTL4VisibilityOptionResourceAlias : 0); }
+/* TOTK_HZ (2026-10-22): render passes ordered by their actual dependencies instead of a full barrier at both ends of
+   every encoder. Every encoder other than a replayed render pass keeps its full barriers (start: after all earlier work;
+   end: all later work after it), so only replayed render passes run without them, and their hazards are tracked here:
+     - W / R: what render passes since the last full barrier wrote (attachments, storage images) and read (sampled
+       textures, loaded attachments), as guest memory ranges (the game's identity; views and aliases overlap) plus, for
+       attachments, the root Metal texture (internal targets such as the MetalFX layers);
+     - a pass starts with a barrier when an attachment overlaps W or R (read after write, write after write, write after
+       read), or something unknown is pending (a storage write, a list overflow);
+     - a draw that samples (or writes an image over) something in W / R gets a barrier just before it (Metal 4 consumer
+       barrier inside the pass); a draw with a writable storage buffer fences before it and leaves "unknown" pending;
+     - a full barrier anywhere clears W and R. */
+typedef struct { uintptr_t lo, hi; } hz_rng;
+enum { HZ_MAX = 4096, HZ_TC = 1 << 14 };
+static hz_rng g_hz_w[HZ_MAX], g_hz_r[HZ_MAX], g_hz_cw[HZ_MAX], g_hz_cr[HZ_MAX];
+static int g_hz_nw, g_hz_nr, g_hz_ncw, g_hz_ncr, g_hz_cunknown, g_hz_cur, g_hz_next, g_hz_natt_unknown;
+static hz_rng g_hz_natt[16]; static int g_hz_nnatt;
+static uint32_t g_hz_wgen = 1, g_hz_pgen = 1;   // wgen: W or the fence changed; pgen: a new pass
+static struct { uintptr_t lo; uint32_t tid, wgen, pgen; } g_hz_tc[HZ_TC];   // per texture id: checked clean against W at wgen; added to this pass's reads at pgen
+static uint64_t g_hz_passes, g_hz_skipped, g_hz_mid, g_hz_mid_rw;
+static int g_hz_v = -1;
+static int hz_on(void) { if (g_hz_v < 0) { const char *e = getenv("TOTK_HZ"); g_hz_v = e && atoi(e) > 0 ? atoi(e) : 0; if (g_hz_v) MLOG("TOTK_HZ: render passes ordered by tracked dependencies"); } return g_hz_v; }
+static int g_hz_unknown;
+void hz_set(int v) { g_hz_unknown = 1; g_hz_v = v != 0; MLOG("[flag] hz = %d (next render pass)", v != 0); }
+static inline void hz_fence(void) { if (g_hz_nw || g_hz_nr || g_hz_unknown) g_hz_wgen++; g_hz_nw = g_hz_nr = 0; g_hz_unknown = 0; }
+static inline int hz_hit(const hz_rng *l, int n, uintptr_t lo, uintptr_t hi) { for (int i = 0; i < n; i++) if (lo < l[i].hi && l[i].lo < hi) return 1; return 0; }
+static inline void hz_add(hz_rng *l, int *n, int *over, uintptr_t lo, uintptr_t hi) {
+    if (lo >= hi) return;
+    for (int i = *n - 1; i >= 0 && i >= *n - 8; i--) if (l[i].lo == lo && l[i].hi == hi) return;   // recent duplicates
+    if (*n >= HZ_MAX) { *over = 1; return; }
+    l[(*n)++] = (hz_rng){lo, hi};
+}
+static inline hz_rng hz_tex_rng(const tex_t *t) { return t && t->mem && t->L.size ? (hz_rng){(uintptr_t)t->mem, (uintptr_t)t->mem + t->L.size} : (hz_rng){0, 0}; }
 static inline void m4_end(id e) {
     if (e == g_blit && g_blit_alias) {
         [g_blit barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionResourceAlias];
         g_blit_alias = 0;
     }
-    if (bar_end_on() && [e conformsToProtocol:@protocol(MTL4CommandEncoder)]) [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+    if (bar_end_on() && [e conformsToProtocol:@protocol(MTL4CommandEncoder)]) { [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; hz_fence(); }
+    else g_hz_unknown = 1;   // TOTK_HZ: an encoder without the end barrier: whatever comes next must fence
     [e endEncoding];
 }
 /* TOTK_BARRIER_NARROW (2026-10-16): 2 = between render passes order only what the next pass can actually depend on: copies and
@@ -1286,15 +1319,40 @@ static inline void es_begin(id e);   // render state cache, defined with the sta
 static inline void blit_close(void) { if (g_blit) { m4_end(g_blit); g_blit = nil; } }
 #include "nvn_render_stream.h"
 static inline id<MTL4RenderCommandEncoder> enc_r_begin(MTL4RenderPassDescriptor *d) { blit_close();
-    if (rs_stream_pass()) { id e = rs_pass_begin(d, g_vt, g_ft, g_cb, bar_start_mode(), (uint64_t)bar_vis()); es_begin(e); return e; }   // TOTK: encode stage (nvn_render_stream.h)
+    int bm = bar_start_mode();
+    if (hz_on() && g_hz_next && bm == 1) {   // TOTK_HZ: a replayed pass (rp_begin_ex described its attachments)
+        int need = g_hz_unknown || g_hz_natt_unknown || g_hz_v == 3, full = need;   // TOTK_HZ=3: every pass still starts with a full barrier (diagnostic: only the end barriers are gone)
+        for (int i = 0; !need && i < g_hz_nnatt; i++) need = hz_hit(g_hz_w, g_hz_nw, g_hz_natt[i].lo, g_hz_natt[i].hi) || hz_hit(g_hz_r, g_hz_nr, g_hz_natt[i].lo, g_hz_natt[i].hi);
+        if (!(++g_hz_passes % 30000)) MLOG("TOTK_HZ: %llu tracked passes, %llu started without a barrier, %llu barriers inside a pass (%llu for storage writes)",
+            (unsigned long long)g_hz_passes, (unsigned long long)g_hz_skipped, (unsigned long long)g_hz_mid, (unsigned long long)g_hz_mid_rw);
+        /* only render passes are pending (everything else ends with a full barrier) and an attachment is written / loaded
+           in the fragment stage: the fragment stage waits for their vertex and fragment work, the vertex stage runs on */
+        if (need) { hz_fence(); if (!full && g_hz_v == 1) bm = 3; } else { bm = 0; g_hz_skipped++; }
+        g_hz_cur = 1; g_hz_ncw = g_hz_ncr = 0; g_hz_cunknown = g_hz_natt_unknown; g_hz_pgen++;
+        for (int i = 0; i < g_hz_nnatt; i++) hz_add(g_hz_cw, &g_hz_ncw, &g_hz_cunknown, g_hz_natt[i].lo, g_hz_natt[i].hi);
+    } else { g_hz_cur = 0; if (bm) hz_fence(); }
+    g_hz_next = 0;
+    if (rs_stream_pass()) { id e = rs_pass_begin(d, g_vt, g_ft, g_cb, bm, (uint64_t)bar_vis()); es_begin(e); return e; }   // TOTK: encode stage (nvn_render_stream.h)
     rs_sync();   // a pass encoded by A itself (stream off, or a diagnostic frame): B must have finished the previous pass on this command buffer
     pt_mark(g_cb, 'R', d); id<MTL4RenderCommandEncoder> e = [g_cb renderCommandEncoderWithDescriptor:d]; es_begin(e);
-    { int m = bar_start_mode();
+    { int m = bm;
       if (m == 2) { [e barrierAfterQueueStages:MTLStageBlit | MTLStageDispatch beforeStages:MTLStageVertex | MTLStageFragment visibilityOptions:bar_vis()];
                     [e barrierAfterQueueStages:MTLStageVertex | MTLStageFragment beforeStages:MTLStageFragment visibilityOptions:bar_vis()]; }
+      else if (m == 3) [e barrierAfterQueueStages:MTLStageVertex | MTLStageFragment beforeStages:MTLStageFragment visibilityOptions:bar_vis()];   /* TOTK_HZ: attachments after earlier render passes */
       else if (m) [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:bar_vis()]; }
     [e setArgumentTable:g_vt atStages:MTLRenderStageVertex]; [e setArgumentTable:g_ft atStages:MTLRenderStageFragment]; return e; }
-static inline void enc_r_end(id e) { if (rs_using(e)) rs_pass_end(e, bar_end_mode(), (uint64_t)MTL4VisibilityOptionDevice); else m4_end_render(e); }
+static inline void enc_r_end(id e) {
+    int em = bar_end_mode();
+    if (g_hz_cur) {   // TOTK_HZ: no barrier at the end; what the pass wrote / read joins the pending sets
+        em = 0; g_hz_cur = 0; g_hz_wgen++;
+        for (int i = 0; i < g_hz_ncw; i++) hz_add(g_hz_w, &g_hz_nw, &g_hz_unknown, g_hz_cw[i].lo, g_hz_cw[i].hi);
+        for (int i = 0; i < g_hz_ncr; i++) hz_add(g_hz_r, &g_hz_nr, &g_hz_unknown, g_hz_cr[i].lo, g_hz_cr[i].hi);
+        if (g_hz_cunknown) g_hz_unknown = 1;
+    } else if (em) hz_fence();
+    if (rs_using(e)) rs_pass_end(e, em, (uint64_t)MTL4VisibilityOptionDevice);
+    else if (em) m4_end_render(e);
+    else [e endEncoding];
+}
 static inline void enc_r_pso(id<MTL4RenderCommandEncoder> e, id<MTLRenderPipelineState> p) { if (rs_using(e)) rs_object(RS_PSO, p); else [e setRenderPipelineState:p]; }
 static inline void enc_r_dss(id<MTL4RenderCommandEncoder> e, id<MTLDepthStencilState> s) { if (rs_using(e)) rs_object(RS_DSS, s); else [e setDepthStencilState:s]; }
 /* TOTK: render state already set on the current encoder. The replay sets viewport, scissor, cull, winding, fill, depth bias,
@@ -2493,6 +2551,7 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "tex_slots")) { (void)tex_slots_on(); atomic_store(&g_tex_slots_on, v != 0); MLOG("[flag] tex_slots = %d", v != 0); return; }
     if (!strcmp(name, "tex_slots_check")) { (void)tex_slots_on(); atomic_store(&g_tex_slots_check, v != 0); MLOG("[flag] tex_slots_check = %d verified=%llu hits=%llu", v != 0, (unsigned long long)atomic_load(&g_tex_slots_verified), (unsigned long long)atomic_load(&g_tex_slots_hits)); return; }
     if (!strcmp(name, "gpucap")) { gpucap_request(v); return; }   // Metal GPU capture of the next v submissions (MTL_CAPTURE_ENABLED=1)
+    if (!strcmp(name, "hz")) { hz_set(v); return; }   // TOTK_HZ from the next render pass
     if (!strcmp(name, "render_stream")) { atomic_store(&g_rs_on, v != 0); MLOG("[flag] render_stream = %d (next render pass)", v != 0); return; }
     if (!strcmp(name, "cube_merge")) { atomic_store(&g_cg_on, v != 0); MLOG("[flag] cube_merge = %d", v != 0); return; }
     if (!strcmp(name, "skip_invisible")) { skv_set(v); return; }
@@ -4762,6 +4821,13 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
     if (taa_pass(pd) == 2) g_mfx.want_cam = 1;   // TOTK_TAA: the G-buffer pass found; its first draw gives the camera
     if (mfx_enabled()) mfx_pass_setup(pd);   // TOTK: MetalFX scene / UI attachments, G-buffer depth
     else if (uw_ratio()) canvas_learn(pd);   // key 4: the canvas the UI is squeezed in
+    if (hz_on()) {   // TOTK_HZ: the guest memory this pass writes (an internal attachment without guest memory: unknown, fence around it)
+        g_hz_nnatt = 0; g_hz_natt_unknown = 0;
+        for (int i = 0; i < 8; i++) if (pd.colorAttachments[i].texture) {   // beyond R.rt.n: internal attachments (MetalFX layers)
+            hz_rng r = i < R.rt.n ? hz_tex_rng(R.rt.color[i]) : (hz_rng){0, 0}; if (r.lo < r.hi) g_hz_natt[g_hz_nnatt++] = r; else g_hz_natt_unknown = 1; }
+        if (pd.depthAttachment.texture || pd.stencilAttachment.texture) { hz_rng r = hz_tex_rng(R.rt.depth); if (r.lo < r.hi) g_hz_natt[g_hz_nnatt++] = r; else g_hz_natt_unknown = 1; }
+        g_hz_next = 1;
+    }
     g_enc = enc_r_begin(pd);
     args_dirty_all();
     g_stat_pass++;
@@ -10351,6 +10417,42 @@ static void clear_ds_quad(const p_clear_ds *c) {
         if (x1 <= x0 || y1 <= y0) return; sc = (MTLScissorRect){x0, y0, x1 - x0, y1 - y0}; }
     clear_ds_core(en, g_pass.cfmt, g_pass.hd ? g_pass.dfmt : 0, g_pass.hs ? g_pass.sfmt : 0, g_pass.samples, tw, th, c, sc);
 }
+/* TOTK_HZ: what one draw of a tracked pass reads and writes; a barrier in the pass right before it when it depends on
+   work of an earlier pass that has not been ordered yet. */
+static void hz_qbar(int kind) {   // 0: after everything earlier; 1: our fragment stage after earlier render passes; 2: our vertex and fragment stages after them
+    if (rs_using(g_enc)) rs_put((nvn_encode_packet){.op = RS_QBAR, .u = {(uint64_t)kind}}, 0);
+    else [(id<MTL4RenderCommandEncoder>)g_enc barrierAfterQueueStages:kind ? MTLStageVertex | MTLStageFragment : MTLStageAll beforeStages:kind == 1 ? MTLStageFragment : MTLStageVertex | MTLStageFragment visibilityOptions:MTL4VisibilityOptionDevice];
+    hz_fence(); g_hz_mid++;
+}
+static void hz_draw(NvProg *pr) {
+    int need = 0, rw = 0, vs = 0;   // need: a dependency; vs: one the vertex stage has
+    registry_lock();
+    for (int st = 0; st < 2; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh) continue;
+        for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; uint64_t h; int img = 0;
+            if ((b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) && b->reg < 128) h = S.tex[st][b->reg];
+            else if (b->kind == NVN_RB_IMG && b->reg < 32) { h = S.img[st][b->reg]; img = 1; }
+            else { if ((b->kind == NVN_RB_SBUFP || b->kind == NVN_RB_SBUFU) && b->rw) rw = 1; continue; }
+            uint32_t tid = (uint32_t)(h & 0xfffff); if (!tid) continue;
+            const treg_t *t = bound_tex(h); if (!t) continue;
+            hz_rng r = hz_tex_rng(&t->t);
+            if (r.lo >= r.hi) { need = 1; vs |= st == 0; continue; }
+            __typeof__(g_hz_tc[0]) *c = &g_hz_tc[(tid * 2654435761u) >> 18];
+            if (c->tid != tid || c->lo != r.lo) { c->tid = tid; c->lo = r.lo; c->wgen = c->pgen = 0; }
+            if (img) {   // a storage image: written as well as read
+                if (hz_hit(g_hz_w, g_hz_nw, r.lo, r.hi) || hz_hit(g_hz_r, g_hz_nr, r.lo, r.hi)) { need = 1; vs |= st == 0; }
+                hz_add(g_hz_cw, &g_hz_ncw, &g_hz_cunknown, r.lo, r.hi);
+            } else if (c->wgen != g_hz_wgen) {
+                if (hz_hit(g_hz_w, g_hz_nw, r.lo, r.hi)) { need = 1; vs |= st == 0; } else c->wgen = g_hz_wgen;
+            }
+            if (c->pgen != g_hz_pgen) { c->pgen = g_hz_pgen; hz_add(g_hz_cr, &g_hz_ncr, &g_hz_cunknown, r.lo, r.hi); }
+        }
+    }
+    registry_unlock();
+    int full = 0;
+    if (rw) { if (g_hz_nw || g_hz_nr || g_hz_unknown) need = full = 1; g_hz_cunknown = 1; g_hz_mid_rw += need; }   // a storage write: whatever reads memory next fences
+    if (g_hz_unknown) need = full = 1;
+    if (need) hz_qbar(full || g_hz_v != 1 ? 0 : vs ? 2 : 1);   // TOTK_HZ=2: full barriers where a dependency is (diagnostic)
+}
 static void prepare_draw_textures(NvProg *pr) {
     if (!pr) return;
     int planned = texture_plan_on();
@@ -10914,6 +11016,7 @@ static int mfxup_dock(__unsafe_unretained NvShader *fs) {
     if (!mfxup_prepare(MFXUP_DOCKED, src, dst, dst.width, dst.height, color_mode)) { g_mfxup_dock_no[0]++; return 0; }   // scaler still being built (background): the game's own upscale this frame
     rp_end(); blit_close(); rs_sync();   // MetalFX encodes on the command buffer itself: the encode thread must be idle first
     pt_mark(g_cb, 'X', nil);   // TOTK_PASS_GPU: the MetalFX upscale as its own entry
+    g_hz_unknown = 1;   // TOTK_HZ: MetalFX ends without a barrier (the next encoder's start barrier orders what follows)
     if (!mfxup_encode_ex(MFXUP_DOCKED, g_cb, src, cw, ch, dst, dst.width, dst.height, color_mode)) { g_mfxup_dock_no[0]++; return 0; }
     mfxup_queue_residency();
     R.clear_c[0] = 0;   // MetalFX wrote every pixel of the canvas: a clear still pending for it would wipe the picture when the UI opens the pass
@@ -10938,6 +11041,7 @@ static int mfxup_draw(NvProg *pr) {
         id<MTLTexture> src = tid > 0 ? (__bridge id<MTLTexture>)tex_fast(tid) : nil;
         if (src) {
             rp_end(); blit_close(); rs_sync();
+            g_hz_unknown = 1;   // TOTK_HZ: the temporal scaler ends without a barrier (as MetalFX below)
             taa_out = taa_encode(g_cb, src);
             if (taa_out) {
                 static int added; if (!added && taa_residency()) { [g_q4 addResidencySet:taa_residency()]; added = 1; }
@@ -10961,6 +11065,7 @@ static int mfxup_draw(NvProg *pr) {
     if (!src || !dst || src.width >= dst.width || src.height >= dst.height) return 0;
     rp_end(); blit_close(); rs_sync();
     pt_mark(g_cb, 'X', nil);   // TOTK_PASS_GPU: the MetalFX upscale as its own entry
+    g_hz_unknown = 1;   // TOTK_HZ: MetalFX ends without a barrier (the next encoder's start barrier orders what follows)
     id<MTLTexture> out = mfxup_encode(g_cb, taa_out ? taa_out : src, dst.width, dst.height);
     if (!out) return 0;   // the anti-aliased scene, if any, stays bound (g_mfxup_out)
     mfxup_queue_residency();
@@ -11154,6 +11259,7 @@ frz_plain:;
     id<MTLRenderCommandEncoder> en = rp_begin_ex(mode);
     g_fd_dw = NULL; g_fd_di = NULL;
     if (!en) { g_draw_skip[8]++; return; }
+    if (g_hz_cur && pr) hz_draw(pr);
     if (g_pass.mfx || g_mfx.role) {   // TOTK_MFX: every draw into the canvas after the scene copy goes to the UI layer too
         int r = 0;
         if (g_pass.mfx) {
