@@ -1462,11 +1462,11 @@ static int usnap_cmp(const void *x, const void *y) { const usnap_rng *a = x, *b 
 /* TOTK: sort ranges by start. A frame binds a few thousand uniform ranges; qsort with a compare callback took about 5% of
    the replay (0.4 ms a frame on the M4). LSD radix sort on the 64-bit start, 8 bits per pass, skipping bytes every key
    shares (guest addresses differ only in their low few bytes); stable, so equal starts keep their order. */
-static void rng_sort(usnap_rng *a, int n) {
+static void rng_sort_x(usnap_rng *a, int n, usnap_rng **tmpp, int *capp) {   // tmpp / capp: the caller's scratch (one per thread that sorts)
     if (n < 2) return;
     if (n <= 32) { qsort(a, (size_t)n, sizeof *a, usnap_cmp); return; }
-    static usnap_rng *tmp; static int cap;
-    if (n > cap) { cap = n + n / 2; tmp = realloc(tmp, (size_t)cap * sizeof *tmp); if (!tmp) MDIE("range sort"); }
+    if (n > *capp) { *capp = n + n / 2; *tmpp = realloc(*tmpp, (size_t)*capp * sizeof **tmpp); if (!*tmpp) MDIE("range sort"); }
+    usnap_rng *tmp = *tmpp;
     uint64_t lo_or = 0, lo_and = ~0ull;
     for (int i = 0; i < n; i++) { lo_or |= a[i].lo; lo_and &= a[i].lo; }
     uint64_t vary = lo_or ^ lo_and;
@@ -1481,6 +1481,7 @@ static void rng_sort(usnap_rng *a, int n) {
     }
     if (src != a) memcpy(a, src, (size_t)n * sizeof *a);
 }
+static void rng_sort(usnap_rng *a, int n) { static usnap_rng *tmp; static int cap; rng_sort_x(a, n, &tmp, &cap); }   // the replay / submit thread's scratch
 static int gw_cmp(const void *x, const void *y) { const gw_t *a = x, *b = y; return a->lo < b->lo ? -1 : a->lo > b->lo; }
 /* With the translation thread (TOTK_ASYNC_REPLAY=1) nvnQueueSubmitCommands returns before the replay, as on the console,
    and the game rebuilds its constant pools right away: the uniform bytes are captured in the submit call (game thread)
@@ -1504,71 +1505,163 @@ static void ucap_bytes_put(uint8_t *b, size_t cap) {
     os_unfair_lock_unlock(&g_ucap_pool_lk); free(b);
 }
 static _Atomic uint64_t g_ucap_ns, g_ucap_bytes, g_ucap_t[4];   // g_ucap_t: collect / sort / merge / copy (diagnostic)
-void *mtl_sub_capture_ubos(const uint64_t *h, int n) {
+static int ucap_on(void) {
     static int on = -1;   // TOTK_UBO_CAPTURE=0 (A/B only): the translation thread copies at the start of the replay instead
     if (on < 0) { const char *e = getenv("TOTK_UBO_CAPTURE"); on = !(e && !strcmp(e, "0")); if (!on) MLOG("TOTK_UBO_CAPTURE=0：翻译线程模式下 uniform 在回放开始时才拷（对照用）"); }
-    if (!on || !usnap_on()) return NULL;
+    return on;
+}
+/* Exact-duplicate filter of the capture: one table per thread that builds capture ranges (the game's submit thread, and the
+   early plan of TOTK_EARLY_PREP on the thread that waits for the frame, under g_plan_mu). */
+enum { UCAP_DH = 1 << 14 };
+typedef struct { uint64_t klo[UCAP_DH], khi[UCAP_DH]; uint32_t stamp[UCAP_DH]; uint32_t gen; usnap_rng *tmp; int tmpcap; } ucap_scratch;
+static ucap_scratch g_ucap_sub_scratch;   // the game's submit thread only
+/* Bindings collected from the recordings -> the capture's ranges: exact duplicates dropped, sorted by start, overlapping /
+   touching bindings in one memory pool merged, bindings outside every pool dropped. Returns the range count (v->r[0..n)).
+   t[0..1]: time of dedupe+sort / merge (ns). Depends on the recordings and on the registered pools only (g_pool_gen). */
+static int ucap_ranges(usnap_rngs *v, ucap_scratch *sc, uint64_t t[2]) {
+    uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    {   /* the same uniform blocks are bound again and again (per-frame / per-material blocks): exact duplicates go
+           before the sort, through a small open-addressing table of the ranges already kept */
+        if (++sc->gen == 0) { memset(sc->stamp, 0, sizeof sc->stamp); sc->gen = 1; }
+        int m = 0;
+        for (int i = 0; i < v->n; i++) {
+            uint64_t kk = v->r[i].lo ^ (v->r[i].hi << 1); uint32_t h = (uint32_t)((kk * 0x9E3779B97F4A7C15ull) >> 50) & (UCAP_DH - 1); int dup = 0;
+            for (int probe = 0; probe < 8; probe++, h = (h + 1) & (UCAP_DH - 1)) {   // a full neighbourhood keeps the range (no false duplicate)
+                if (sc->stamp[h] != sc->gen) { sc->stamp[h] = sc->gen; sc->klo[h] = v->r[i].lo; sc->khi[h] = v->r[i].hi; break; }
+                if (sc->klo[h] == v->r[i].lo && sc->khi[h] == v->r[i].hi) { dup = 1; break; }
+            }
+            if (!dup) v->r[m++] = v->r[i];
+        }
+        v->n = m;
+    }
+    rng_sort_x(v->r, v->n, &sc->tmp, &sc->tmpcap);
+    uint64_t t2 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); t[0] = t2 - t1;
+    int k = -1;   // merge overlapping / touching bindings that lie in one memory pool; drop bindings outside every pool
+    uintptr_t plo = 1, phi = 0;   // the pool of the last lookup: ranges inside it need no new lookup (sorted input: mostly the same pool)
+    for (int i = 0; i < v->n; i++) {
+        uintptr_t lo2, hi2;
+        if (k >= 0 && v->r[i].lo <= v->r[k].hi) {
+            if (v->r[i].hi <= v->r[k].hi) continue;
+            if (v->r[k].lo >= plo && v->r[i].hi <= phi) { v->r[k].hi = v->r[i].hi; continue; }
+            if (mtl_addr_range(v->r[k].lo, v->r[i].hi - v->r[k].lo, &lo2, &hi2)) { plo = lo2; phi = hi2; v->r[k].hi = v->r[i].hi; continue; }
+        }
+        if (!(v->r[i].lo >= plo && v->r[i].hi <= phi)) {
+            if (!mtl_addr_range(v->r[i].lo, v->r[i].hi - v->r[i].lo, &lo2, &hi2)) continue;
+            plo = lo2; phi = hi2;
+        }
+        v->r[++k] = v->r[i];
+    }
+    t[1] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t2;
+    return k + 1;
+}
+static size_t ucap_layout(usnap_cap *c) {   // c->n, c->r set: offsets of each range in the byte buffer; returns the total
+    size_t total = 0;
+    c->off = malloc(sizeof *c->off * (size_t)(c->n ? c->n : 1)); if (!c->off) MDIE("uniform capture");
+    for (int i = 0; i < c->n; i++) { c->off[i] = total; total += (size_t)(c->r[i].hi - c->r[i].lo); }
+    return total;
+}
+static void ucap_fill(usnap_cap *c, size_t total) {   // c->n / r / off set: the bytes, now
+    uint64_t t3 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    c->bytes = ucap_bytes_get(total ? total : 1, &c->cap);
+    /* Large captures are copied by four threads in contiguous slices of the ranges: about 1,200 scattered ranges of
+       memory other cores just wrote copied at ~10 GB/s on one thread (0.19 ms of the game's submit call for 1.8 MB). */
+    if (total >= (512u << 10) && c->n >= 64) {
+        uint8_t *dst = c->bytes; const size_t *off = c->off; const usnap_rng *rr = c->r; int nr = c->n;
+        dispatch_apply(4, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t k) {
+            int a = (int)((size_t)nr * k / 4), b = (int)((size_t)nr * (k + 1) / 4);
+            for (int i = a; i < b; i++) memcpy(dst + off[i], (const void *)(uintptr_t)rr[i].lo, (size_t)(rr[i].hi - rr[i].lo));
+        });
+    } else
+    for (int i = 0; i < c->n; i++) memcpy(c->bytes + c->off[i], (const void *)(uintptr_t)c->r[i].lo, (size_t)(c->r[i].hi - c->r[i].lo));
+    atomic_fetch_add(&g_ucap_bytes, total); atomic_fetch_add(&g_ucap_t[3], clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t3);
+}
+void *mtl_sub_capture_ubos(const uint64_t *h, int n) {
+    if (!ucap_on() || !usnap_on()) return NULL;
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     usnap_cap *c = calloc(1, sizeof *c); if (!c) MDIE("uniform capture");
     c->done = __atomic_load_n(&g_done, __ATOMIC_ACQUIRE);   // before the bytes: a write completing meanwhile only makes this conservative
     usnap_rngs v = {0};
     for (int i = 0; i < n; i++) usnap_collect(&v, (const uint8_t *)(uintptr_t)h[i], 0);
-    uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), t2 = t1, t3 = t1; atomic_fetch_add(&g_ucap_t[0], t1 - t0);
+    uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); atomic_fetch_add(&g_ucap_t[0], t1 - t0);
     if (v.n) {
-        {   /* the same uniform blocks are bound again and again (per-frame / per-material blocks): exact duplicates go
-               before the sort, through a small open-addressing table of the ranges already kept */
-            enum { DH = 1 << 14 }; static uint64_t klo[DH], khi[DH]; static uint32_t stamp[DH]; static uint32_t gen;   // the game's submit thread only
-            if (++gen == 0) { memset(stamp, 0, sizeof stamp); gen = 1; }
-            int m = 0;
-            for (int i = 0; i < v.n; i++) {
-                uint64_t kk = v.r[i].lo ^ (v.r[i].hi << 1); uint32_t h = (uint32_t)((kk * 0x9E3779B97F4A7C15ull) >> 50) & (DH - 1); int dup = 0;
-                for (int probe = 0; probe < 8; probe++, h = (h + 1) & (DH - 1)) {   // a full neighbourhood keeps the range (no false duplicate)
-                    if (stamp[h] != gen) { stamp[h] = gen; klo[h] = v.r[i].lo; khi[h] = v.r[i].hi; break; }
-                    if (klo[h] == v.r[i].lo && khi[h] == v.r[i].hi) { dup = 1; break; }
-                }
-                if (!dup) v.r[m++] = v.r[i];
-            }
-            v.n = m;
-        }
-        rng_sort(v.r, v.n);
-        t2 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); atomic_fetch_add(&g_ucap_t[1], t2 - t1);
-        int k = -1;   // merge overlapping / touching bindings that lie in one memory pool; drop bindings outside every pool
-        uintptr_t plo = 1, phi = 0;   // the pool of the last lookup: ranges inside it need no new lookup (sorted input: mostly the same pool)
-        for (int i = 0; i < v.n; i++) {
-            uintptr_t lo2, hi2;
-            if (k >= 0 && v.r[i].lo <= v.r[k].hi) {
-                if (v.r[i].hi <= v.r[k].hi) continue;
-                if (v.r[k].lo >= plo && v.r[i].hi <= phi) { v.r[k].hi = v.r[i].hi; continue; }
-                if (mtl_addr_range(v.r[k].lo, v.r[i].hi - v.r[k].lo, &lo2, &hi2)) { plo = lo2; phi = hi2; v.r[k].hi = v.r[i].hi; continue; }
-            }
-            if (!(v.r[i].lo >= plo && v.r[i].hi <= phi)) {
-                if (!mtl_addr_range(v.r[i].lo, v.r[i].hi - v.r[i].lo, &lo2, &hi2)) continue;
-                plo = lo2; phi = hi2;
-            }
-            v.r[++k] = v.r[i];
-        }
-        c->n = k + 1;
-        size_t total = 0;
-        c->off = malloc(sizeof *c->off * (size_t)(c->n ? c->n : 1)); if (!c->off) MDIE("uniform capture");
-        for (int i = 0; i < c->n; i++) { c->off[i] = total; total += (size_t)(v.r[i].hi - v.r[i].lo); }
-        t3 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); atomic_fetch_add(&g_ucap_t[2], t3 - t2);
-        c->bytes = ucap_bytes_get(total ? total : 1, &c->cap);
-        /* Large captures are copied by four threads in contiguous slices of the ranges: about 1,200 scattered ranges of
-           memory other cores just wrote copied at ~10 GB/s on one thread (0.19 ms of the game's submit call for 1.8 MB). */
-        if (total >= (512u << 10) && c->n >= 64) {
-            uint8_t *dst = c->bytes; const size_t *off = c->off; const usnap_rng *rr = v.r; int nr = c->n;
-            dispatch_apply(4, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t k) {
-                int a = (int)((size_t)nr * k / 4), b = (int)((size_t)nr * (k + 1) / 4);
-                for (int i = a; i < b; i++) memcpy(dst + off[i], (const void *)(uintptr_t)rr[i].lo, (size_t)(rr[i].hi - rr[i].lo));
-            });
-        } else
-        for (int i = 0; i < c->n; i++) memcpy(c->bytes + c->off[i], (const void *)(uintptr_t)v.r[i].lo, (size_t)(v.r[i].hi - v.r[i].lo));
+        uint64_t tt[2]; c->n = ucap_ranges(&v, &g_ucap_sub_scratch, tt);
+        atomic_fetch_add(&g_ucap_t[1], tt[0]); atomic_fetch_add(&g_ucap_t[2], tt[1]);
         c->r = v.r; v.r = NULL;
-        atomic_fetch_add(&g_ucap_bytes, total); atomic_fetch_add(&g_ucap_t[3], clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t3);
+        ucap_fill(c, ucap_layout(c));
     }
     free(v.r);
     c->ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0; atomic_fetch_add(&g_ucap_ns, c->ns);
     return c;
+}
+/* TOTK_EARLY_PREP (hle_nvn.c early_*): the capture's ranges worked out before the submit call, while the game waits for the
+   previous frame, from the recordings it is predicted to submit. The submit call then only copies the bytes. The ranges
+   are a function of the recordings (immutable after EndRecording; the handles are compared at the submit) and of the
+   registered memory pools (g_pool_gen, compared at the submit): if either differs the submit captures as before. */
+typedef struct { int n; usnap_rng *r; uint64_t pool_gen, ns, bytes; } ucap_plan;
+static pthread_mutex_t g_plan_mu = PTHREAD_MUTEX_INITIALIZER; static ucap_scratch g_plan_scratch;   // plans are built one at a time
+static _Atomic uint64_t g_plan_built, g_plan_used, g_plan_stale, g_plan_build_ns;
+void *mtl_sub_capture_plan(const uint64_t *h, int n) {
+    if (!ucap_on() || !usnap_on()) return NULL;
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    ucap_plan *p = calloc(1, sizeof *p); if (!p) MDIE("uniform capture plan");
+    p->pool_gen = atomic_load_explicit(&g_pool_gen, memory_order_acquire);   // before the pool lookups: a change meanwhile makes the plan stale
+    pthread_mutex_lock(&g_plan_mu);
+    usnap_rngs v = {0};
+    for (int i = 0; i < n; i++) usnap_collect(&v, (const uint8_t *)(uintptr_t)h[i], 0);
+    if (v.n) { uint64_t tt[2]; p->n = ucap_ranges(&v, &g_plan_scratch, tt); p->r = v.r; v.r = NULL; }
+    pthread_mutex_unlock(&g_plan_mu);
+    free(v.r);
+    for (int i = 0; i < p->n; i++) p->bytes += p->r[i].hi - p->r[i].lo;
+    p->ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+    atomic_fetch_add(&g_plan_built, 1); atomic_fetch_add(&g_plan_build_ns, p->ns);
+    return p;
+}
+void mtl_sub_capture_plan_free(void *pv) { ucap_plan *p = pv; if (p) { free(p->r); free(p); } }
+int mtl_sub_capture_plan_count(const void *pv) { const ucap_plan *p = pv; return p ? p->n : 0; }
+uint64_t mtl_sub_capture_plan_bytes(const void *pv) { const ucap_plan *p = pv; return p ? p->bytes : 0; }
+/* The submit call with a plan (consumed): the bytes now, as mtl_sub_capture_ubos would copy them. A plan made against other
+   memory pools is dropped and the capture is built from the handles as before. */
+void *mtl_sub_capture_ubos_planned(void *pv, const uint64_t *h, int n) {
+    ucap_plan *p = pv;
+    if (!p) return mtl_sub_capture_ubos(h, n);
+    if (!ucap_on() || !usnap_on() || p->pool_gen != atomic_load_explicit(&g_pool_gen, memory_order_acquire)) {
+        atomic_fetch_add(&g_plan_stale, 1); mtl_sub_capture_plan_free(p); return mtl_sub_capture_ubos(h, n);
+    }
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    usnap_cap *c = calloc(1, sizeof *c); if (!c) MDIE("uniform capture");
+    c->done = __atomic_load_n(&g_done, __ATOMIC_ACQUIRE);   // before the bytes, as in mtl_sub_capture_ubos
+    if (p->n) { c->n = p->n; c->r = p->r; p->r = NULL; ucap_fill(c, ucap_layout(c)); }
+    mtl_sub_capture_plan_free(p);
+    c->ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0; atomic_fetch_add(&g_ucap_ns, c->ns);
+    uint64_t used = atomic_fetch_add(&g_plan_used, 1) + 1;
+    if (used % 1800 == 0) {
+        uint64_t b = atomic_load(&g_plan_built), s = atomic_load(&g_plan_stale);
+        MLOG("[early] uniform capture plans: %llu built (%.3f ms each, off the submit call), %llu used, %llu stale (memory pools changed)",
+             (unsigned long long)b, b ? atomic_load(&g_plan_build_ns) / 1e6 / (double)b : 0.0, (unsigned long long)used, (unsigned long long)s);
+    }
+    return c;
+}
+/* TOTK_EARLY_PROBE: a hash of each planned range's bytes now (out[0..n)); -1 when a read faulted (a pool went away). */
+int mtl_sub_capture_plan_hash(const void *pv, uint64_t *out, int max) {
+    const ucap_plan *p = pv; if (!p || p->n > max) return -1;
+    sigjmp_buf jb;
+    if (sigsetjmp(jb, 1) != 0) { runtime_fault_guard = NULL; return -1; }
+    runtime_fault_guard = &jb;
+    for (int i = 0; i < p->n; i++) {
+        const uint8_t *q = (const uint8_t *)(uintptr_t)p->r[i].lo; size_t len = (size_t)(p->r[i].hi - p->r[i].lo), j = 0;
+        uint64_t l[4] = {0x9E3779B97F4A7C15ull, 0xC2B2AE3D27D4EB4Full, 0x165667B19E3779F9ull, 0x27D4EB2F165667C5ull};
+        for (; j + 32 <= len; j += 32) for (int k = 0; k < 4; k++) { uint64_t w; memcpy(&w, q + j + 8 * k, 8); l[k] = (l[k] ^ w) * 0x100000001B3ull; l[k] ^= l[k] >> 29; }
+        for (; j < len; j++) l[0] = (l[0] ^ q[j]) * 0x100000001B3ull;
+        out[i] = l[0] ^ (l[1] * 3) ^ (l[2] * 5) ^ (l[3] * 7) ^ len;
+    }
+    runtime_fault_guard = NULL;
+    return p->n;
+}
+int mtl_sub_capture_plan_find(const void *pv, uint64_t a) {   // the planned range holding address a, or -1
+    const ucap_plan *p = pv; if (!p) return -1;
+    int lo = 0, hi = p->n;
+    while (lo < hi) { int m = (lo + hi) / 2; if (p->r[m].hi <= a) lo = m + 1; else hi = m; }
+    return lo < p->n && p->r[lo].lo <= a ? lo : -1;
 }
 static void ucap_free(usnap_cap *c) { if (c) { free(c->r); free(c->off); ucap_bytes_put(c->bytes, c->cap); free(c); } }
 /* The bytes of [a, a+n) as captured: memory at the capture where a captured range covers them (they are memory now
@@ -1957,6 +2050,11 @@ static int cond_eval(const void *payload, const void *op) {
     *ce = (cond_cache_ent){op, frame, enabled};
     return enabled;
 }
+/* TOTK_EARLY_PROBE (hle_nvn.c): inputs of a replay that can change between the game's frame wait and its submit call. */
+int mtl_cond_pending(uint64_t addr, uint64_t *val) { return cpend_lookup(addr, val); }   // 1 a pending report with a known value (*val), 0 pending unknown, -1 none (memory)
+uint64_t mtl_reg_gen_now(void) { return atomic_load(&g_reg_gen); }
+uint64_t mtl_pool_gen_now(void) { return atomic_load_explicit(&g_pool_gen, memory_order_acquire); }
+uint64_t mtl_done_fence(void) { return __atomic_load_n(&g_done, __ATOMIC_ACQUIRE); }
 void mtl_counter_stats(uint64_t rep[32], uint64_t rst[32]) { memcpy(rep, g_cnt_report, sizeof g_cnt_report); memcpy(rst, g_cnt_reset, sizeof g_cnt_reset); }
 
 /* TOTK: counter timestamps in the Tegra 19.2 MHz tick base of nn::os::GetSystemTick (runtime_dispatch: mach_absolute_time

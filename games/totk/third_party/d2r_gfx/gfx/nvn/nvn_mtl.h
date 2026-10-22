@@ -35,6 +35,19 @@ void mtl_sub_begin(void);
    NULL: copy from memory now) and frees cap. */
 void *mtl_sub_capture_ubos(const uint64_t *h, int n);
 void mtl_sub_snapshot_ubos_cap(const uint64_t *h, int n, void *cap);
+/* TOTK_EARLY_PREP / TOTK_EARLY_PROBE (hle_nvn.c early_*): the capture's ranges worked out ahead of the submit call (any
+   thread; NULL when the capture is off), used by the submit call (consumed; stale against the memory pools -> full capture). */
+void *mtl_sub_capture_plan(const uint64_t *h, int n);
+void *mtl_sub_capture_ubos_planned(void *plan, const uint64_t *h, int n);
+void mtl_sub_capture_plan_free(void *plan);
+int mtl_sub_capture_plan_count(const void *plan);
+uint64_t mtl_sub_capture_plan_bytes(const void *plan);
+int mtl_sub_capture_plan_hash(const void *plan, uint64_t *out, int max);   // per range hash of the bytes now; -1 on a fault
+int mtl_sub_capture_plan_find(const void *plan, uint64_t addr);            // range index holding addr, -1 none
+int mtl_cond_pending(uint64_t addr, uint64_t *val);                        // conditional-render counter: 1 pending with known *val, 0 pending unknown, -1 memory
+uint64_t mtl_reg_gen_now(void);                                            // pool / texture / sampler registration generation
+uint64_t mtl_pool_gen_now(void);                                           // memory pool add / remove generation
+uint64_t mtl_done_fence(void);                                             // highest completed fence
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n);               // GPU 时序上的缓冲拷贝 | Buffer copy in GPU ordering
 void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v);   // 完成后写事件值（0 写 / 1 加） | Write the event value after completion (0 write / 1 add)
 void mtl_sub_counter(uint64_t addr, uint32_t type);                       // 完成后写计数器记录 | Write the counter record after completion
