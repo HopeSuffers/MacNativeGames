@@ -7891,7 +7891,7 @@ static void driver_cache_check_set(int v) { atomic_store(&g_driver_cache_check, 
 static void driver_cache_set(int v) { atomic_store(&g_driver_cache_on, v != 0); MLOG("[flag] drv_cache = %d", v != 0); }
 static int driver_cache_on(void) {
     int v = atomic_load(&g_driver_cache_on);
-    if (v < 0) { const char *e = getenv("TOTK_DRV_CACHE"); v = e && !strcmp(e, "1"); atomic_store(&g_driver_cache_on, v); }
+    if (v < 0) { const char *e = getenv("TOTK_DRV_CACHE"); v = !(e && !strcmp(e, "0")); atomic_store(&g_driver_cache_on, v); }   // default on since 2026-10-21 (self-checked over the full benchmark); TOTK_DRV_CACHE=0 off
     return v;
 }
 static void driver_bank_fill(uint8_t *d, int bank, int stage) {
