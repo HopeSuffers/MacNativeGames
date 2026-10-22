@@ -130,6 +130,7 @@ void mtl_args_stats(uint64_t *enc, uint64_t *reuse);
 // TOTK translation thread (see "translation thread" below)
 static uint64_t fence_now(int *token);
 static int fence_wait(uint64_t k, uint64_t timeout_ns);
+static int fence_wait_x(uint64_t k, uint64_t timeout_ns, int frame);
 static void x_drain(void);
 static int async_replay(void);
 static int call_stats_on(void);
@@ -629,12 +630,14 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     int k = (o->fenced & 2) != 0, lg = synclog_env();
     if (lg) { atomic_fetch_add(&g_sw_calls[k], 1); if (o->fence == mtl_last_fence()) atomic_fetch_add(&g_sw_newest[k], 1); }
     int tok = (o->fenced & 4) != 0;
-    if (tok ? fence_wait(o->fence, 0) : mtl_wait(o->fence, 0)) { survey_after_wait(s); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
+    int frame = !k;   // TOTK_OVERLAP: a queue fence may be released early (mtl_wait_frame); window-acquire syncs never are
+    if (tok ? fence_wait_x(o->fence, 0, frame) : frame ? mtl_wait_frame(o->fence, 0) : mtl_wait(o->fence, 0)) { mtl_overlap_publish(); survey_after_wait(s); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
     uint64_t t0 = lg ? now_ns() : 0;
     totk_tl(TL_WAIT_IN, o->fence, o->fence == mtl_last_fence());
     { static int said; extern uint32_t runtime_thread_current_handle(void); if (getenv("TOTK_CORE_LOG") && said++ < 3) LOG("[core-wait] frame-wait thread %#x", runtime_thread_current_handle()); }
     if (sync_chain_left(1)) { char w[96]; snprintf(w, sizeof w, "SyncWait sync=%p fence=%llu newest=%d", (const void *)s, (unsigned long long)o->fence, o->fence == mtl_last_fence()); guest_chain(w); }
-    int ok = tok ? fence_wait(o->fence, timeout) : mtl_wait(o->fence, timeout);
+    int ok = tok ? fence_wait_x(o->fence, timeout, frame) : frame ? mtl_wait_frame(o->fence, timeout) : mtl_wait(o->fence, timeout);
+    if (ok) mtl_overlap_publish();   // TOTK_OVERLAP: the newest completed snapshot copies (depth statistics) into guest memory
     totk_tl(TL_WAIT_OUT, o->fence, ok);
     if (lg) { atomic_fetch_add(&g_sw_blocked[k], 1); atomic_fetch_add(&g_sw_ns[k], now_ns() - t0); }
     if (ok) survey_after_wait(s);
@@ -846,6 +849,9 @@ static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
 static void hw_fix(cmd_t *o, size_t bytes) { o->hw_used += bytes; o->hw_used -= o->last_rec; o->last_rec = bytes; }
 static int reclog_limit(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_RECLOG"); v = e ? atoi(e) : 0; } return v; }
 NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
+    /* TOTK_OVERLAP (TOTK_OVERLAP_GATE=0 turns it off): the game builds its next frame only once an early-released
+       submission has really completed, so what it writes while recording cannot reach memory that submission still reads */
+    if (mtl_overlap_gate_needed() && mtl_overlap_gate_enabled()) { NVN_BLOCKING(); mtl_overlap_gate(); }
     cmd_t *o = CB(c);
     if (o->recording) LOG("【红】BeginRecording 重入");
     o->recording = 1; o->cur = o->seg;   /* the previous recording was copied at EndRecording */
@@ -2125,7 +2131,9 @@ static void x_wait_job(uint64_t job) {
     pthread_mutex_lock(&g_xq_mu); while (g_xq_done < job) pthread_cond_wait(&g_xq_cv, &g_xq_mu); pthread_mutex_unlock(&g_xq_mu);
 }
 static void x_drain(void) {   // everything queued so far has run (no-op when synchronous or idle)
-    if (!async_replay() || t_on_x_thread) return;   // on the translation thread everything queued before this job has run
+    if (t_on_x_thread) return;   // on the translation thread everything queued before this job has run
+    if (mtl_overlap_gate_needed()) { NVN_BLOCKING(); mtl_overlap_gate(); }   // TOTK_OVERLAP: what is destroyed / read back next may still be used by an early-released submission
+    if (!async_replay()) return;
     NVN_BLOCKING();   // a guest thread gives its virtual core back while it waits (TOTK has three)
     pthread_mutex_lock(&g_xq_mu); uint64_t want = g_xq_in, have = g_xq_done; pthread_mutex_unlock(&g_xq_mu);
     if (have >= want) return;
@@ -2139,7 +2147,8 @@ static uint64_t fence_now(int *token) {
     pthread_mutex_lock(&g_xq_mu); uint64_t k = g_xsub_in; pthread_mutex_unlock(&g_xq_mu); *token = 1; return k;
 }
 // Waits for a token: the submit has been translated, then the Metal fence it ended with. 1 = reached.
-static int fence_wait(uint64_t k, uint64_t timeout_ns) {
+// frame (TOTK_OVERLAP, the game's own nvnSyncWait): the Metal part may also be an early release (mtl_wait_frame).
+static int fence_wait_x(uint64_t k, uint64_t timeout_ns, int frame) {
     uint64_t t0 = now_ns();
     pthread_mutex_lock(&g_xq_mu);
     if (g_xsub_done < k) {
@@ -2153,8 +2162,9 @@ static int fence_wait(uint64_t k, uint64_t timeout_ns) {
     pthread_mutex_unlock(&g_xq_mu);
     if (!ok) return 0;
     uint64_t used = now_ns() - t0;
-    return mtl_wait(f, timeout_ns > used ? timeout_ns - used : 0);
+    return (frame ? mtl_wait_frame : mtl_wait)(f, timeout_ns > used ? timeout_ns - used : 0);
 }
+static int fence_wait(uint64_t k, uint64_t timeout_ns) { return fence_wait_x(k, timeout_ns, 0); }
 
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
     NVN_BLOCKING();

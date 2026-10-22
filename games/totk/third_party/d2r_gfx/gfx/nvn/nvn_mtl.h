@@ -69,6 +69,14 @@ int mtl_probe_tile(void);
 
 uint64_t mtl_last_fence(void);                       // 最近一次提交的栅栏值（0 = 从未提交） | Fence value of the most recent submit (0 = never submitted)
 int mtl_wait(uint64_t fence, uint64_t timeout_ns);   // GPU 完成到 fence 返回 1，超时 0 | Returns 1 when the GPU has completed up to fence, 0 on timeout
+/* TOTK_OVERLAP (totk_overlap.h): the game's frame wait is also satisfied when the fence was released early (only the
+   last command buffer of that submission still runs); the gate waits until such a submission has really completed; publish
+   writes the newest completed snapshot copies into guest memory (call when a frame wait returns). */
+int mtl_wait_frame(uint64_t fence, uint64_t timeout_ns);
+void mtl_overlap_gate(void);
+int mtl_overlap_gate_needed(void);    // racy test: an early-released submission is still running
+int mtl_overlap_gate_enabled(void);   // TOTK_OVERLAP=1 and TOTK_OVERLAP_GATE not 0
+void mtl_overlap_publish(void);
 void mtl_finish(void);                               // 等所有已提交的命令完成 | Wait for all submitted commands to complete
 void mtl_drain(void);                                // 等队列上全部命令（含出图）完成：提交空命令缓冲并等它 | Wait for all commands on the queue (including presents) to complete: submit an empty command buffer and wait for it
 void mtl_xv_window_tex(uint64_t serial);   // 登记窗口（交换链）贴图：跨提交有效性账本永不收它 | Register a window (swapchain) texture: the cross-submit validity ledger never collects it
