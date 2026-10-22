@@ -5134,8 +5134,27 @@ static MTLCompileOptions *totk_precise_opts(void) {
    memory pressure in the middle of a compile (iPad, 2026-10-18: "Compilation failed due to an interrupted connection:
    XPC_ERROR_CONNECTION_INTERRUPTED" while the shader warm-up was running); it restarts on the next request, so such a
    failure is retried instead of being taken as a broken shader. */
-static id<MTLLibrary> totk_msl_library(NSString *src, NSError **err) {
+/* SPIRV-Cross lowers textureGatherOffsets (four gathers at constant offsets) to spvGatherConstOffsets, which always passes a
+   component; Metal's depth2d::gather takes none, so a shader that does it on a depth texture did not compile and its draws
+   were never made (4 TotK shaders, 2026-10-20). Overloads for depth2d, with the generic helper's result (.w of each).
+   The source is patched only for Metal: libraries keep the name of the unpatched source (shader_lib_prebuilt). */
+static NSString *msl_fix_depth_gather(NSString *src) {
+    if (![src containsString:@"spvGatherConstOffsets"] || ![src containsString:@"depth2d<"]) return src;
+    static NSString *fix =
+        @"\n// TOTK: depth textures gather without a component\n"
+        "#define TOTK_DEPTH_GATHER(SPACE) \\\n"
+        "template<typename Toff, typename... Tp> inline float4 spvGatherConstOffsets(const SPACE depth2d<float>& t, sampler s, Toff coffsets, component, Tp... params) \\\n"
+        "{ return float4(t.gather(s, params..., coffsets[0]).w, t.gather(s, params..., coffsets[1]).w, t.gather(s, params..., coffsets[2]).w, t.gather(s, params..., coffsets[3]).w); }\n"
+        "TOTK_DEPTH_GATHER(device)\nTOTK_DEPTH_GATHER(constant)\nTOTK_DEPTH_GATHER(thread)\n#undef TOTK_DEPTH_GATHER\n\n";
+    for (NSString *entry in @[@"\nfragment ", @"\nvertex ", @"\nkernel "]) {
+        NSRange r = [src rangeOfString:entry];
+        if (r.location != NSNotFound) return [src stringByReplacingCharactersInRange:NSMakeRange(r.location, 0) withString:fix];
+    }
+    return src;
+}
+static id<MTLLibrary> totk_msl_library(NSString *source, NSError **err) {
     NSError *e = nil;
+    NSString *src = msl_fix_depth_gather(source);
     for (int attempt = 1;; attempt++) {
         id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:totk_precise_opts() error:&e];
         BOOL interrupted = !lib && [e.localizedDescription containsString:@"XPC_ERROR_CONNECTION_INTERRUPTED"];
