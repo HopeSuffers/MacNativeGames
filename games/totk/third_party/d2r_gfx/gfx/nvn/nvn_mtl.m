@@ -10766,7 +10766,31 @@ static void skv_done(skv_item *l, int n, uint32_t frame) {   /* submission compl
     for (int j = 0; j < n; j++) { skv_ent *e = &g_skv[l[j].idx]; if (e->last_frame != frame) { e->last_frame = frame; if (e->nonzero_frame == frame) { if (e->streak >= SKV_STREAK) { g_skv_revived++; e->stable_after = frame + SKV_HOLD; } e->streak = 0; } else if (e->streak < 1000) e->streak++; } CFRelease(l[j].buf); }
     free(l);
 }
-static void draw(const p_draw *dw, const p_draw_idx *di) { g_draw_depth++; draw_inner(dw, di); if (g_draw_depth == 1) nan_draw_probe(dw, di); g_draw_depth--; }
+/* TOTK_SPLIT_FIRST=<draws> (experiment, off by default): the frame's first long render pass is ended after that many
+   draws and its command buffer committed, so the GPU starts on it while the replay encodes the rest (the next draw
+   reopens the pass with its contents loaded). Timeline at Kakariko: a 1443-draw pass took 1.3 ms to encode before its
+   command buffer could be committed and the GPU sat idle ~1 ms meanwhile. Only early in the submission (first
+   TOTK_SPLIT_CHUNKS command buffers, default 3) and only for passes whose attachments total at most TOTK_SPLIT_MAXMB
+   (default 16 MB): reloading a 1080p G-buffer would cost more GPU time than it frees. */
+static int g_split_first = -1, g_split_chunks, g_split_maxmb; static uint64_t g_split_n;
+static void split_first_check(void) {
+    if (g_split_first < 0) {
+        const char *e = getenv("TOTK_SPLIT_FIRST"), *c = getenv("TOTK_SPLIT_CHUNKS"), *m = getenv("TOTK_SPLIT_MAXMB");
+        g_split_first = e ? atoi(e) : 0; g_split_chunks = c ? atoi(c) : 3; g_split_maxmb = m ? atoi(m) : 16;
+        if (g_split_first > 0) MLOG("TOTK_SPLIT_FIRST=%d: long passes in the first %d command buffers are split (attachments up to %d MB)", g_split_first, g_split_chunks, g_split_maxmb);
+    }
+    if (g_split_first <= 0 || !g_enc || !g_cb || g_sub_chunks >= g_split_chunks || g_frz_on || tbdr_on() || pt_active() || g_lay.active || g_rt_merged) return;
+    if (g_stat_draw - g_pass_draw0 < (uint64_t)g_split_first) return;
+    uint64_t bytes = 0;
+    for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i]) bytes += R.rt.color[i]->L.size;
+    if (R.rt.depth) bytes += R.rt.depth->L.size;
+    if (bytes > ((uint64_t)g_split_maxmb << 20)) return;
+    rp_end();
+    if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+    mtl_sub_split();
+    if (++g_split_n <= 4 || g_split_n % 3000 == 0) MLOG("[split-first] %llu splits (this one after %llu draws, attachments %.1f MB)", (unsigned long long)g_split_n, (unsigned long long)(g_stat_draw - g_pass_draw0), bytes / 1048576.0);
+}
+static void draw(const p_draw *dw, const p_draw_idx *di) { g_draw_depth++; draw_inner(dw, di); if (g_draw_depth == 1) { nan_draw_probe(dw, di); split_first_check(); } g_draw_depth--; }
 // TOTK: an update makes the argument buffers of the stages whose bound uniform ranges overlap it stale.
 static void upd_dirty_stages(uint64_t lo, uint64_t hi) {
     for (int st = 0; st < 6; st++) for (int r = 0; r < 16; r++) {
