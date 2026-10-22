@@ -134,6 +134,12 @@ static void x_drain(void);
 static int async_replay(void);
 static int call_stats_on(void);
 static void call_stats_end(const void *cb, const uint8_t *copy);
+#ifndef GAME_BOTW
+static int early_on(void);                                     /* TOTK_EARLY_PREP / TOTK_EARLY_PROBE (see the early_* section) */
+static void early_at_wait(void);                               /* a frame wait is about to block */
+static void early_note_end(const void *cb, const uint8_t *copy);   /* EndRecording, g_copy_mu held */
+static void early_note_drop(const uint8_t *copy);              /* a recording copy is freed, g_copy_mu held */
+#endif
 NVN(nvnDeviceBuilderSetDefaults, void, NVNdeviceBuilder *b) { memset(b, 0, sizeof(dev_builder_t)); }
 NVN(nvnDeviceBuilderSetFlags, void, NVNdeviceBuilder *b, int f) { ((dev_builder_t *)b)->flags = f; }
 NVN(nvnDeviceInitialize, NVNboolean, NVNdevice *d, const NVNdeviceBuilder *b) {
@@ -630,6 +636,9 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     if (lg) { atomic_fetch_add(&g_sw_calls[k], 1); if (o->fence == mtl_last_fence()) atomic_fetch_add(&g_sw_newest[k], 1); }
     int tok = (o->fenced & 4) != 0;
     if (tok ? fence_wait(o->fence, 0) : mtl_wait(o->fence, 0)) { survey_after_wait(s); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
+#ifndef GAME_BOTW
+    if (!k && early_on()) early_at_wait();   /* TOTK_EARLY_*: the next frame is recorded; the game now waits for the previous one */
+#endif
     uint64_t t0 = lg ? now_ns() : 0;
     totk_tl(TL_WAIT_IN, o->fence, o->fence == mtl_last_fence());
     { static int said; extern uint32_t runtime_thread_current_handle(void); if (getenv("TOTK_CORE_LOG") && said++ < 3) LOG("[core-wait] frame-wait thread %#x", runtime_thread_current_handle()); }
@@ -892,7 +901,7 @@ static pthread_mutex_t g_copy_mu = PTHREAD_MUTEX_INITIALIZER;
 #ifdef GAME_BOTW
 typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size; _Atomic uint32_t used; uint32_t pad_; } copy_prefix;   // used: called or submitted at least once (NVN 53 lifetime, release_copies)
 #else
-typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size; } copy_prefix;
+typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size; const void *cb; uint64_t serial; } copy_prefix;   // cb / serial (TOTK_EARLY_*): the command buffer that recorded it, a number no other copy gets (a freed copy's address can come back); 48 bytes keep the body 16-byte aligned
 #endif
 static _Atomic uint64_t g_copy_bytes;   /* live recording-copy bytes (logged with the copy count) */
 static copy_prefix *copy_of(NVNcommandHandle h) { copy_prefix *c = (copy_prefix *)(uintptr_t)h - 1; return c; }
@@ -915,6 +924,8 @@ static uint8_t *flatten_recording(const uint8_t *p) {
             copy_prefix *c = (copy_prefix *)out; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits;
 #ifdef GAME_BOTW
             c->used = 0;
+#else
+            { static _Atomic uint64_t serials; c->cb = NULL; c->serial = atomic_fetch_add_explicit(&serials, 1, memory_order_relaxed) + 1; }
 #endif
             size_t body = n >= sizeof(copy_prefix) + 16 ? n - sizeof(copy_prefix) - 16 : 0;
             c->body_bytes = bulk_ok && h.size == 8 && body <= UINT32_MAX ? (uint32_t)body : 0;
@@ -947,6 +958,9 @@ static void copy_drop(copy_bucket *b, uint32_t i, int by_token) {   /* g_copy_mu
     copy_prefix *pf = (copy_prefix *)(c->copy - sizeof(copy_prefix));
     if (cmdlog_env()) LOG("[cmd] free copy=%p%s", (void *)c->copy, by_token ? " (its mark in the control memory is gone)" : "");
     g_freed[g_nfreed++ % FREED_RING] = (typeof(g_freed[0])){(uintptr_t)c->copy, g_submits, c->stale_at, pf->used_at, pf->made_at, c->ctl_lo};
+#ifndef GAME_BOTW
+    if (early_on()) early_note_drop(c->copy);
+#endif
     pf->magic = 0; g_copy_bytes -= malloc_size(pf); free(pf); b->v[i] = b->v[--b->n]; g_ncopies--;
     if (by_token) g_copy_drop_token++; else g_copy_drop_readd++;
     if (!b->n && !b->empty) { b->empty = 1; g_cbk_empty++; }
@@ -1048,6 +1062,10 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
       if (b->empty) { b->empty = 0; g_cbk_empty--; }
       if (b->n == b->cap) { b->cap = b->cap ? b->cap * 2 : 8; b->v = realloc(b->v, b->cap * sizeof *b->v); if (!b->v) die("command copy table"); }
       b->v[b->n++] = (cmd_copy){lo, hi, copy, 0, (uint32_t)token}; g_ncopies++; }
+#ifndef GAME_BOTW
+    copy_of((NVNcommandHandle)(uintptr_t)copy)->cb = c;
+    if (early_on()) early_note_end(c, copy);
+#endif
     { static uint64_t made; if (++made % 20000 == 0)
         LOG("[cmd] recording copies: %llu made, %zu live, %.1f MiB, submit %llu; released %llu at a re-added control memory, %llu whose mark there was gone (%llu unmapped); index %zu buckets (%zu empty) of %zu, compacted %llu times",
             (unsigned long long)made, g_ncopies, g_copy_bytes / 1048576.0, (unsigned long long)g_submits, (unsigned long long)g_copy_drop_readd, (unsigned long long)g_copy_drop_token, (unsigned long long)g_copy_mark_faults,
@@ -1810,6 +1828,15 @@ void nvn_bind_handles_deferred(NVNcommandBuffer *c, int op, int st, int first, i
 static _Atomic int g_def_on = -1;                   // TOTK_DEFERRED_BINDS=0 / runtime flag "deferred 0": keep the record-time handles (A/B)
 static uint64_t g_def_n, g_def_changed, g_def_logged, g_def_ns;
 void nvn_set_deferred_binds(int on) { atomic_store(&g_def_on, on); LOG("[flag] deferred = %d", on); }
+static void resolve_one(p_bind_handles *b) {   // one deferred bind: the handles the game's array holds now
+    if (b->src && b->n > 0 && b->n <= 32) {
+        uint64_t cur[32]; memcpy(cur, (const void *)(uintptr_t)b->src, 8 * (size_t)b->n); g_def_n++;
+        if (memcmp(cur, b->h, 8 * (size_t)b->n)) {
+            if (g_def_logged++ < 6) LOG("[nvn] 延迟绑定在提交时读到新句柄：阶段 %d 槽 %d 起，录制时 %#llx → 提交时 %#llx", b->stage, b->first, (unsigned long long)b->h[0], (unsigned long long)cur[0]);
+            g_def_changed++; memcpy(b->h, cur, 8 * (size_t)b->n);
+        }
+    }
+}
 static void resolve_deferred(const uint8_t *p, int depth) {   // read the handles of every deferred bind in a submitted recording
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
@@ -1817,16 +1844,7 @@ static void resolve_deferred(const uint8_t *p, int depth) {   // read the handle
         if (h.op == OP_END) return;
         if (h.op == OP_JUMP) { memcpy(&p, p + 8, 8); continue; }
         if (h.op == OP_CALL) { uint64_t t; memcpy(&t, p + 8, 8); if (depth >= 16) die("deferred bind resolution: call depth over 16"); resolve_deferred((const uint8_t *)(uintptr_t)t, depth + 1); }
-        else if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) {
-            p_bind_handles *b = (p_bind_handles *)(uintptr_t)(p + 8);
-            if (b->src && b->n > 0 && b->n <= 32) {
-                uint64_t cur[32]; memcpy(cur, (const void *)(uintptr_t)b->src, 8 * (size_t)b->n); g_def_n++;
-                if (memcmp(cur, b->h, 8 * (size_t)b->n)) {
-                    if (g_def_logged++ < 6) LOG("[nvn] 延迟绑定在提交时读到新句柄：阶段 %d 槽 %d 起，录制时 %#llx → 提交时 %#llx", b->stage, b->first, (unsigned long long)b->h[0], (unsigned long long)cur[0]);
-                    g_def_changed++; memcpy(b->h, cur, 8 * (size_t)b->n);
-                }
-            }
-        }
+        else if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) resolve_one((p_bind_handles *)(uintptr_t)(p + 8));
         p += h.size;
     }
 }
@@ -2156,6 +2174,274 @@ static int fence_wait(uint64_t k, uint64_t timeout_ns) {
     return mtl_wait(f, timeout_ns > used ? timeout_ns - used : 0);
 }
 
+#ifndef GAME_BOTW
+/* ---------- TOTK: early submit preparation (TOTK_EARLY_PREP=1) and its measurement (TOTK_EARLY_PROBE=1) ----------
+   The game records a frame's command buffers before it waits (nvnSyncWait) for the previous frame, then submits them a few
+   milliseconds later; meanwhile the translation thread is idle. Replaying the submission early is NOT done here: what a
+   replay reads (uniform contents for SSBO pointers / the MetalFX camera / bloom threshold, deferred texture handles,
+   conditional-render counters, texture and pool registrations, CPU-written texture memory, shader readiness) is only final
+   at the submit call, and the replay's state (S / R, arenas, fences, pending-write tables, caches, pass merging) cannot be
+   rolled back if a check at the submit fails.
+   At a blocking fence wait (the first one after a submit that finds a prediction) the next submission is predicted from the command buffers the
+   last submits used (EndRecording keeps each command buffer's latest recording; a candidate must still be unused):
+     - PREP: the submit-call walks that depend only on the recordings are done ahead: the uniform capture's ranges (collect,
+       dedupe, sort, pool merge; mtl_sub_capture_plan) and the list of deferred binds. At the submit, if the handles are
+       exactly the predicted ones (same order) and the memory pools did not change, the submit call only reads the deferred
+       handle tables and copies the uniform bytes; otherwise it walks as before. Results are identical by construction.
+     - PROBE: what an early replay would have read at the wait is compared with the submit call: uniform bytes of each
+       captured range, deferred handle tables, conditional-render counters (and whether a report of the previous submission
+       was still pending), registration / pool generations, dirty-page faults. Logged every 300 submits, with the
+       draw index of the first op whose input changed (the prefix an early replay could have kept) and where the first
+       conditional render, the first samples-passed query and the first big pass (>= 300 draws) start.
+   Both run on the waiting thread, under g_copy_mu (the predicted copies stay alive while they are walked; a recording
+   named in g_ecb is live: copy_drop clears it under the same lock, through the command buffer kept in the copy's prefix). */
+enum { ECB_N = 1024, EH_N = 4, EH_MAX = 64 };
+typedef struct { const void *cb; uint64_t h; } ecb_ent;
+typedef struct { int n; const void *cb[EH_MAX]; } eh_list;
+static ecb_ent g_ecb[ECB_N]; static int g_ecb_n;   /* command buffer -> its latest recording (0 = freed); g_copy_mu */
+static eh_list g_eh[EH_N]; static unsigned g_eh_next;   /* command buffers of the last submits; g_copy_mu */
+static _Atomic int g_early_v = -1;           /* bit 0 prep, bit 1 probe */
+static int early_on(void) {
+    int v = atomic_load_explicit(&g_early_v, memory_order_relaxed);
+    if (v < 0) {
+        const char *a = getenv("TOTK_EARLY_PREP"), *b = getenv("TOTK_EARLY_PROBE");
+        v = (a && atoi(a) > 0 ? 1 : 0) | (b && atoi(b) > 0 ? 2 : 0);
+        if (v && !async_replay()) { LOG("[early] TOTK_EARLY_PREP / TOTK_EARLY_PROBE need the translation thread (TOTK_ASYNC_REPLAY): off"); v = 0; }
+        if (v) LOG("[early] next submission predicted at the frame wait:%s%s", v & 1 ? " submit-call walks prepared ahead (TOTK_EARLY_PREP)" : "", v & 2 ? " inputs compared with the submit call (TOTK_EARLY_PROBE, adds work to both)" : "");
+        int want = -1; atomic_compare_exchange_strong(&g_early_v, &want, v); v = atomic_load(&g_early_v);
+    }
+    return v;
+}
+static unsigned ecb_slot(const void *cb) { return (unsigned)((((uintptr_t)cb >> 4) * 0x9E3779B97F4A7C15ull) >> 40) & (ECB_N - 1); }
+static void early_note_end(const void *cb, const uint8_t *copy) {
+    unsigned i = ecb_slot(cb);
+    for (;; i = (i + 1) & (ECB_N - 1)) {
+        if (g_ecb[i].cb == cb) break;
+        if (!g_ecb[i].cb) {
+            /* command buffers the game finalized stay in the table: at 3/4 it starts over (live ones come back at their next recording) */
+            if (g_ecb_n >= ECB_N * 3 / 4) { memset(g_ecb, 0, sizeof g_ecb); g_ecb_n = 0; i = ecb_slot(cb); }
+            g_ecb[i].cb = cb; g_ecb_n++; break;
+        }
+    }
+    g_ecb[i].h = (uint64_t)(uintptr_t)copy;
+}
+static void early_note_drop(const uint8_t *copy) {   /* the copy is still allocated here (copy_drop frees it after) */
+    uint64_t h = (uint64_t)(uintptr_t)copy; const void *cb = copy_of(h)->cb;
+    if (!cb) return;
+    unsigned i = ecb_slot(cb);
+    for (int k = 0; k < ECB_N && g_ecb[i].cb; k++, i = (i + 1) & (ECB_N - 1)) if (g_ecb[i].cb == cb) { if (g_ecb[i].h == h) g_ecb[i].h = 0; break; }
+}
+static uint64_t ecb_last(const void *cb) {
+    unsigned i = ecb_slot(cb);
+    for (int k = 0; k < ECB_N && g_ecb[i].cb; k++, i = (i + 1) & (ECB_N - 1)) if (g_ecb[i].cb == cb) return g_ecb[i].h;
+    return 0;
+}
+/* Every recording a live ecb entry names is a live copy (early_note_drop clears it under the same lock). A candidate is the
+   latest recording of each command buffer of one of the last submits, not submitted or called yet (used_at 0). */
+static int early_predict(uint64_t *out, uint64_t *serial) {
+    for (unsigned j = 1; j <= EH_N && j <= g_eh_next; j++) {
+        const eh_list *l = &g_eh[(g_eh_next - j) % EH_N]; int ok = l->n > 0;
+        for (int i = 0; ok && i < l->n; i++) {
+            uint64_t h = ecb_last(l->cb[i]);
+            if (!h || copy_of(h)->magic != COPY_MAGIC || atomic_load(&copy_of(h)->used_at)) { ok = 0; break; }
+            for (int k = 0; k < i; k++) if (out[k] == h) ok = 0;
+            out[i] = h; serial[i] = copy_of(h)->serial;
+        }
+        if (ok) return l->n;
+    }
+    return 0;
+}
+typedef struct { const p_bind_handles *b; uint32_t draw, off; } edef;
+typedef struct { uint64_t addr, x, y; uint32_t draw; int8_t px, py; } econd;
+typedef struct { uint64_t addr; uint32_t draw; } eubo;
+typedef struct {
+    uint64_t tag;                                  /* g_submits at the wait: made for the submit that raises it to tag + 1 */
+    int n; uint64_t h[EH_MAX], serial[EH_MAX];   /* serial: the copies' numbers, checked with the handles at the submit */
+    void *plan;                                    /* uniform capture ranges (mtl_sub_capture_plan) */
+    int list_ok;                                   /* the deferred-bind list is complete (no OP_CALL in the recordings) */
+    p_bind_handles **def; int ndef, capdef;        /* deferred binds (prep) */
+    edef *pdef; int npdef, cappdef; uint64_t *dv; int ndv, capdv;   /* probe: deferred binds with their handles at the wait */
+    econd *cond; int ncond, capcond;
+    eubo *ubo; int nubo, capubo;
+    uint64_t *hash0; int nhash;
+    uint64_t t0, cost, reg_gen, pool_gen, faults;
+    int x_idle, gpu_idle, probe_ok;
+    uint32_t draws, first_cond, first_query, seg_lo, big_lo, big_hi;
+} early_slot;
+static early_slot *g_eslot; static pthread_mutex_t g_eslot_mu = PTHREAD_MUTEX_INITIALIZER;
+#define EPUSH(v, n, cap) do { if ((n) == (cap)) { (cap) = (cap) ? (cap) * 2 : 256; (v) = realloc((v), sizeof *(v) * (size_t)(cap)); if (!(v)) die("early submit tables"); } } while (0)
+static void early_free(early_slot *s) {
+    if (!s) return;
+    mtl_sub_capture_plan_free(s->plan); free(s->def); free(s->pdef); free(s->dv); free(s->cond); free(s->ubo); free(s->hash0); free(s);
+}
+static void early_read8(uint64_t a, uint64_t *v) { memcpy(v, (const void *)(uintptr_t)a, 8); }   /* guest memory: only under the fault guard */
+/* A conditional-render counter as cond_eval would see it now: a report still pending with a known value gives that value
+   (1), one pending with an unknown value (samples passed) cannot be known (0), otherwise memory (-1). */
+static int early_cond_value(uint64_t a, uint64_t *v) { int k = mtl_cond_pending(a, v); if (k < 0) early_read8(a, v); return k; }
+static int early_serials_differ(const early_slot *s, const uint64_t *h, int n) { for (int i = 0; i < n; i++) if (copy_of(h[i])->serial != s->serial[i]) return 1; return 0; }
+/* Walks one recording (g_copy_mu held; the guest reads of the probe run under the caller's fault guard). 0 = corrupt. */
+static int early_walk(early_slot *s, const uint8_t *p, int probe, int depth) {
+    for (uint32_t guard = 0; guard < 8000000; guard++) {
+        op_hdr h; memcpy(&h, p, sizeof h);
+        if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_) return 0;
+        const uint8_t *a = p + 8;
+        switch (h.op) {
+            case OP_END: return 1;
+            case OP_JUMP: memcpy(&p, a, 8); continue;
+            case OP_CALL: { uint64_t t; memcpy(&t, a, 8); s->list_ok = 0; if (depth >= 16 || !early_walk(s, (const uint8_t *)(uintptr_t)t, probe, depth + 1)) return 0; break; }
+            case OP_DRAW: case OP_DRAW_IDX: s->draws++; break;
+            case OP_SET_RT:
+                if (!s->big_hi && s->draws - s->seg_lo >= 300) { s->big_lo = s->seg_lo; s->big_hi = s->draws; }
+                s->seg_lo = s->draws; break;
+            case OP_BIND_TEX: case OP_BIND_IMG: case OP_BIND_SAMP: {
+                p_bind_handles *b = (p_bind_handles *)(uintptr_t)a;
+                if (!b->src || b->n <= 0 || b->n > 32) break;
+                EPUSH(s->def, s->ndef, s->capdef); s->def[s->ndef++] = b;
+                if (probe) {
+                    EPUSH(s->pdef, s->npdef, s->cappdef); s->pdef[s->npdef++] = (edef){b, s->draws, (uint32_t)s->ndv};
+                    for (int k = 0; k < b->n; k++) { EPUSH(s->dv, s->ndv, s->capdv); early_read8(b->src + 8 * (uint64_t)k, &s->dv[s->ndv++]); }
+                }
+                break; }
+            case OP_RENDER_COND:
+                if (s->first_cond == UINT32_MAX) s->first_cond = s->draws;
+                if (probe) { const p_render_cond *c = (const p_render_cond *)(const void *)a; econd e = {c->addr, 0, 0, s->draws, 0, 0};
+                    e.px = (int8_t)early_cond_value(c->addr, &e.x); e.py = (int8_t)early_cond_value(c->addr + 16, &e.y); EPUSH(s->cond, s->ncond, s->capcond); s->cond[s->ncond++] = e; }
+                break;
+            case OP_RESET_COUNTER: case OP_REPORT_COUNTER: { uint64_t t; memcpy(&t, a, 8); if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED && s->first_query == UINT32_MAX) s->first_query = s->draws; break; }
+            case OP_BIND_UBO: if (probe) { const p_bind_buf *b = (const p_bind_buf *)(const void *)a; if (b->addr && b->size) { EPUSH(s->ubo, s->nubo, s->capubo); s->ubo[s->nubo++] = (eubo){b->addr, s->draws}; } } break;
+            default: break;
+        }
+        p += h.size;
+    }
+    return 0;
+}
+static _Atomic uint64_t g_ew_calls, g_ew_pub, g_ew_nopred, g_ew_ns;   /* waits hooked / slots published / nothing predictable / time */
+static void early_at_wait(void) {
+    int v = early_on(), probe = (v & 2) != 0;
+    uint64_t tag = __atomic_load_n(&g_submits, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&g_eslot_mu); int have = g_eslot && g_eslot->tag == tag; pthread_mutex_unlock(&g_eslot_mu);
+    if (have) return;   /* already prepared for this submit (a later wait of the same frame) */
+    uint64_t t0 = now_ns(); atomic_fetch_add(&g_ew_calls, 1);
+    totk_tl(TL_EARLY_IN, 0, 0);
+    early_slot *s = calloc(1, sizeof *s); if (!s) die("early submit slot");
+    s->tag = tag; s->t0 = t0; s->list_ok = 1; s->first_cond = s->first_query = UINT32_MAX;
+    pthread_mutex_lock(&g_copy_mu);
+    s->n = early_predict(s->h, s->serial);
+    if (s->n) {
+        sigjmp_buf jb; volatile int ok = 1;
+        if (sigsetjmp(jb, 1) == 0) {
+            runtime_fault_guard = &jb;
+            for (int i = 0; i < s->n && ok; i++) ok = early_walk(s, (const uint8_t *)(uintptr_t)s->h[i], probe, 0);
+            runtime_fault_guard = NULL;
+            if (!s->big_hi && s->draws - s->seg_lo >= 300) { s->big_lo = s->seg_lo; s->big_hi = s->draws; }   /* the last pass runs to the end */
+        } else { runtime_fault_guard = NULL; ok = 0; }   /* a guest read of the probe faulted */
+        if (!ok) s->n = 0;
+        else s->plan = mtl_sub_capture_plan(s->h, s->n);   /* still under g_copy_mu: walks the same copies */
+    }
+    pthread_mutex_unlock(&g_copy_mu);
+    if (!s->n) { early_free(s); atomic_fetch_add(&g_ew_nopred, 1); totk_tl(TL_EARLY_OUT, 0, 0); return; }
+    if (probe) {
+        s->reg_gen = mtl_reg_gen_now(); s->pool_gen = mtl_pool_gen_now(); uint64_t pr; nvn_dirty_stats(&s->faults, &pr);
+        pthread_mutex_lock(&g_xq_mu); s->x_idle = g_xq_done == g_xq_in; pthread_mutex_unlock(&g_xq_mu);
+        s->gpu_idle = mtl_done_fence() >= mtl_last_fence();
+        int nr = mtl_sub_capture_plan_count(s->plan);
+        if (nr) { s->hash0 = malloc(sizeof *s->hash0 * (size_t)nr); if (!s->hash0) die("early submit hashes"); s->nhash = mtl_sub_capture_plan_hash(s->plan, s->hash0, nr); }
+        s->probe_ok = s->nhash >= 0;
+    }
+    s->cost = now_ns() - t0; atomic_fetch_add(&g_ew_ns, s->cost);
+    pthread_mutex_lock(&g_eslot_mu);
+    if (g_eslot && g_eslot->tag == tag) { pthread_mutex_unlock(&g_eslot_mu); early_free(s); totk_tl(TL_EARLY_OUT, 0, 0); return; }   /* another waiting thread was first */
+    int npred = s->n; early_slot *old = g_eslot; g_eslot = s;   /* s belongs to the submit call from here on */
+    pthread_mutex_unlock(&g_eslot_mu);
+    early_free(old); atomic_fetch_add(&g_ew_pub, 1);
+    totk_tl(TL_EARLY_OUT, (uint64_t)npred, 1);
+}
+/* Probe totals (submit thread). */
+static struct {
+    uint64_t subs, hit, miss, setmiss, stale, none, lead_ns, lead_min, cost_ns, x_idle, gpu_idle, probes;
+    uint64_t ub_ranges, ub_bytes, ub_chg_subs, ub_chg_ranges, ub_fault;
+    uint64_t def_n, def_chg_subs, def_chg, cond_n, cond_chg_subs, cond_chg, cond_pend;
+    uint64_t reg_chg, pool_chg, faults, draws, prefix, prefix_full, first_cond, first_query, big_lo, big_hi, big_n;
+} g_ep;
+static void early_probe(early_slot *s, uint64_t t1) {
+    uint32_t first = s->draws;   /* draw index of the first op whose input changed between the wait and the submit call */
+    sigjmp_buf jb;
+    if (sigsetjmp(jb, 1) != 0) { runtime_fault_guard = NULL; g_ep.ub_fault++; return; }
+    runtime_fault_guard = &jb;
+    uint64_t dchg = 0, cchg = 0, cpend = 0;
+    for (int i = 0; i < s->npdef; i++) {
+        const edef *e = &s->pdef[i]; int chg = 0;
+        for (int k = 0; k < e->b->n; k++) { uint64_t v; early_read8(e->b->src + 8 * (uint64_t)k, &v); chg |= v != s->dv[e->off + k]; }
+        if (chg) { dchg++; if (e->draw < first) first = e->draw; }
+    }
+    for (int i = 0; i < s->ncond; i++) {
+        const econd *e = &s->cond[i]; uint64_t x, y; int kx = early_cond_value(e->addr, &x), ky = early_cond_value(e->addr + 16, &y);
+        cpend += e->px >= 0 || e->py >= 0;
+        if (x != e->x || y != e->y || !e->px || !e->py || !kx || !ky) { cchg++; if (e->draw < first) first = e->draw; }   /* changed, or a samples-passed value nobody knew yet */
+    }
+    runtime_fault_guard = NULL;
+    int nr = mtl_sub_capture_plan_count(s->plan); uint64_t uchg = 0, ubytes = 0;
+    if (nr && s->probe_ok) {
+        uint64_t *h1 = malloc(sizeof *h1 * (size_t)nr); uint8_t *chg = calloc((size_t)nr, 1); if (!h1 || !chg) die("early submit hashes");
+        if (mtl_sub_capture_plan_hash(s->plan, h1, nr) == nr) {
+            for (int i = 0; i < nr; i++) if (h1[i] != s->hash0[i]) { chg[i] = 1; uchg++; }
+            if (uchg) for (int i = 0; i < s->nubo; i++) { int r = mtl_sub_capture_plan_find(s->plan, s->ubo[i].addr); if (r >= 0 && chg[r]) { if (s->ubo[i].draw < first) first = s->ubo[i].draw; break; } }
+        } else g_ep.ub_fault++;
+        free(h1); free(chg);
+        ubytes = mtl_sub_capture_plan_bytes(s->plan);
+    }
+    uint64_t f1, pr; nvn_dirty_stats(&f1, &pr);
+    int regc = mtl_reg_gen_now() != s->reg_gen, poolc = mtl_pool_gen_now() != s->pool_gen;
+    if (regc || poolc) first = 0;   /* a registration changed: any texture / pool resolution may differ */
+    g_ep.probes++; g_ep.ub_ranges += (uint64_t)nr; g_ep.ub_bytes += ubytes; g_ep.ub_chg_subs += uchg != 0; g_ep.ub_chg_ranges += uchg;
+    g_ep.def_n += (uint64_t)s->npdef; g_ep.def_chg_subs += dchg != 0; g_ep.def_chg += dchg;
+    g_ep.cond_n += (uint64_t)s->ncond; g_ep.cond_chg_subs += cchg != 0; g_ep.cond_chg += cchg; g_ep.cond_pend += cpend;
+    g_ep.reg_chg += regc; g_ep.pool_chg += poolc; g_ep.faults += f1 - s->faults;
+    g_ep.draws += s->draws; g_ep.prefix += first; g_ep.prefix_full += first == s->draws;
+    g_ep.first_cond += s->first_cond == UINT32_MAX ? s->draws : s->first_cond; g_ep.first_query += s->first_query == UINT32_MAX ? s->draws : s->first_query;
+    if (s->big_hi) { g_ep.big_lo += s->big_lo; g_ep.big_hi += s->big_hi; g_ep.big_n++; }
+    g_ep.x_idle += s->x_idle; g_ep.gpu_idle += s->gpu_idle; (void)t1;
+}
+/* The submit call: takes the slot made for it, if the handles are the predicted ones; records this submit's command buffers. */
+static early_slot *early_submit_begin(int n, const uint64_t *h) {
+    uint64_t t1 = now_ns(), tag = __atomic_load_n(&g_submits, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&g_copy_mu);
+    { eh_list *l = &g_eh[g_eh_next++ % EH_N]; l->n = 0;
+      if (n > 0 && n <= EH_MAX) { int ok = 1; for (int i = 0; i < n && ok; i++) { const void *cb = copy_of(h[i])->magic == COPY_MAGIC ? copy_of(h[i])->cb : NULL; if (!cb) ok = 0; else l->cb[i] = cb; } if (ok) l->n = n; } }   /* submitted handles are live (copy_touch) */
+    pthread_mutex_unlock(&g_copy_mu);
+    pthread_mutex_lock(&g_eslot_mu); early_slot *s = g_eslot; g_eslot = NULL; pthread_mutex_unlock(&g_eslot_mu);
+    g_ep.subs++;
+    if (!s) g_ep.none++;
+    else if (s->tag != tag) { g_ep.stale++; early_free(s); s = NULL; }
+    else if (s->n != n || memcmp(s->h, h, sizeof *h * (size_t)n) || early_serials_differ(s, h, n)) {   /* same addresses, other recordings: a miss */
+        int same = s->n == n; for (int i = 0; same && i < n; i++) { int f = 0; for (int k = 0; k < n; k++) f |= s->h[k] == h[i]; same = f; }
+        if (same) g_ep.setmiss++; else g_ep.miss++;
+        early_free(s); s = NULL;
+    } else {
+        g_ep.hit++; uint64_t lead = t1 - s->t0; g_ep.lead_ns += lead; if (!g_ep.lead_min || lead < g_ep.lead_min) g_ep.lead_min = lead; g_ep.cost_ns += s->cost;
+        if (early_on() & 2) early_probe(s, t1);
+    }
+    if (g_ep.subs % 300 == 0) {
+        double hn = g_ep.hit ? (double)g_ep.hit : 1, pn = g_ep.probes ? (double)g_ep.probes : 1;
+        LOG("[early] submits %llu: predicted %llu (handles differ %llu, same set other order %llu, made for an earlier submit %llu, none %llu); lead %.2f ms (min %.2f), preparation %.3f ms on the waiting thread",
+            (unsigned long long)g_ep.subs, (unsigned long long)g_ep.hit, (unsigned long long)g_ep.miss, (unsigned long long)g_ep.setmiss, (unsigned long long)g_ep.stale, (unsigned long long)g_ep.none,
+            g_ep.lead_ns / hn / 1e6, g_ep.lead_min / 1e6, g_ep.cost_ns / hn / 1e6);
+        if (g_ep.probes)
+            LOG("[early] probe %llu: at the wait the translation thread was idle %.0f%%, the GPU idle %.0f%%; uniforms %.0f ranges / %.0f KB, changed by the submit in %.0f%% (%.1f ranges); deferred binds %.0f, changed in %.0f%% (%.1f); "
+                "conditionals %.0f, changed or pending in %.0f%% (%.1f, %.1f pending at the wait); registrations changed %.0f%%, pools %.0f%%; dirty-page faults %.0f; draws %.0f, unchanged prefix %.0f draws (whole submission %.0f%%); "
+                "first conditional at draw %.0f, first samples-passed query at %.0f, first big pass %.0f-%.0f (%llu frames); hash faults %llu",
+                (unsigned long long)g_ep.probes, 100 * g_ep.x_idle / pn, 100 * g_ep.gpu_idle / pn, g_ep.ub_ranges / pn, g_ep.ub_bytes / pn / 1024, 100 * g_ep.ub_chg_subs / pn, g_ep.ub_chg_ranges / pn,
+                g_ep.def_n / pn, 100 * g_ep.def_chg_subs / pn, g_ep.def_chg / pn, g_ep.cond_n / pn, 100 * g_ep.cond_chg_subs / pn, g_ep.cond_chg / pn, g_ep.cond_pend / pn,
+                100 * g_ep.reg_chg / pn, 100 * g_ep.pool_chg / pn, g_ep.faults / pn, g_ep.draws / pn, g_ep.prefix / pn, 100 * g_ep.prefix_full / pn,
+                g_ep.first_cond / pn, g_ep.first_query / pn, g_ep.big_n ? g_ep.big_lo / (double)g_ep.big_n : 0.0, g_ep.big_n ? g_ep.big_hi / (double)g_ep.big_n : 0.0, (unsigned long long)g_ep.big_n, (unsigned long long)g_ep.ub_fault);
+        uint64_t c = atomic_load(&g_ew_calls);
+        LOG("[early] waits hooked %llu, slots published %llu, nothing predictable %llu, %.3f ms per hook", (unsigned long long)c, (unsigned long long)atomic_load(&g_ew_pub), (unsigned long long)atomic_load(&g_ew_nopred), c ? atomic_load(&g_ew_ns) / 1e6 / (double)c : 0.0);
+        memset(&g_ep, 0, sizeof g_ep);
+    }
+    return s;
+}
+#endif
+
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
     NVN_BLOCKING();
     { static int said; extern uint32_t runtime_thread_current_handle(void); if (getenv("TOTK_CORE_LOG") && said++ < 3) LOG("[core-wait] submit thread %#x", runtime_thread_current_handle()); }
@@ -2166,6 +2452,10 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
     h = hv;
 #endif
     totk_tl(TL_SUB_IN, (uint64_t)n, 0);
+#ifndef GAME_BOTW
+    early_slot *es = early_on() ? early_submit_begin(n, (const uint64_t *)h) : NULL;   /* TOTK_EARLY_*: before g_submits moves (the slot names the submit it was made for) */
+    int eprep = es && (early_on() & 1);
+#endif
     { uint64_t now = __atomic_add_fetch(&g_submits, 1, __ATOMIC_RELAXED); for (int i = 0; i < n; i++) copy_touch(h[i], now); }
     if (totk_life_on()) { int k = 0; for (int i = 0; i < n; i++) k += totk_life_handle_has(h[i]); totk_life_log("submit n=%d followed=%d", n, k); }
     ((queue_t *)q)->submits++;
@@ -2176,6 +2466,10 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
     if (atomic_load(&g_def_on) < 0) { const char *e = getenv("TOTK_DEFERRED_BINDS"); atomic_store(&g_def_on, !(e && !strcmp(e, "0"))); LOG("[nvn] 延迟绑定：%s", atomic_load(&g_def_on) ? "提交时读句柄" : "录制时读句柄（TOTK_DEFERRED_BINDS=0，旧行为）"); }
     if (atomic_load(&g_def_on)) {
         uint64_t r0 = now_ns();
+#ifndef GAME_BOTW
+        if (eprep && es->list_ok) for (int i = 0; i < es->ndef; i++) resolve_one(es->def[i]);   /* the same binds, found at the frame wait */
+        else
+#endif
         for (int i = 0; i < n; i++) resolve_deferred((const uint8_t *)h[i], 0);
         g_def_ns += now_ns() - r0;
         if (((queue_t *)q)->submits % 600 == 0) LOG("[nvn] 延迟绑定 至提交 %llu：提交时读句柄 %llu 次，其中与录制时不同 %llu 次；每次提交读句柄平均 %.3f ms", (unsigned long long)((queue_t *)q)->submits, (unsigned long long)g_def_n, (unsigned long long)g_def_changed, g_def_ns / 1e6 / (double)((queue_t *)q)->submits);
@@ -2184,14 +2478,23 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
         xjob j = {.kind = XJ_SUBMIT, .n = n, .h = malloc(sizeof(uint64_t) * (n > 0 ? n : 1))};
         if (!j.h) die("submit job");
         memcpy(j.h, h, sizeof(uint64_t) * (size_t)n);
+#ifndef GAME_BOTW
+        if (eprep) { j.ucap = mtl_sub_capture_ubos_planned(es->plan, (const uint64_t *)h, n); es->plan = NULL; }   /* only the bytes are copied here */
+        else
+#endif
         j.ucap = mtl_sub_capture_ubos((const uint64_t *)h, n);
         x_push(&j);
         totk_tl(TL_SUB_OUT, 1, 0);
 #ifdef GAME_BOTW
         free(heap);
+#else
+        early_free(es);
 #endif
         return;
     }
+#ifndef GAME_BOTW
+    early_free(es);
+#endif
     submit_exec(n, (const uint64_t *)h, NULL);
     totk_tl(TL_SUB_OUT, 0, 0);
 #ifdef GAME_BOTW
