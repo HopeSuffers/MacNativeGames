@@ -421,6 +421,21 @@ void nvn_dirty_gpu_write_end(void *tok) {
     free(t);
 }
 #endif
+/* Pages of [addr, addr+len) written after stamp (-1: not all of it tracked); the first / last such page, counted from
+   the page addr starts in, into *lo / *hi (-1: none). Diagnostic (TOTK_REUP_LOG). */
+int nvn_dirty_count_since(const void *addr, size_t len, uint64_t stamp, int *lo, int *hi) {
+    *lo = *hi = -1;
+    if (!len) return 0;
+    uintptr_t a = (uintptr_t)addr, e = a + len, first = a >> g_shift; int n = 0;
+    while (a < e) {
+        range_t *r = find(a); if (!r) return -1;
+        uintptr_t stop = e < r->end ? e : r->end;
+        for (uintptr_t i = (a - r->base) >> g_shift, q = (stop - 1 - r->base) >> g_shift; i <= q; i++)
+            if (atomic_load(&r->gen[i]) > stamp) { int k = (int)(((r->base >> g_shift) + i) - first); if (*lo < 0) *lo = k; *hi = k; n++; }
+        a = stop;
+    }
+    return n;
+}
 void nvn_dirty_slot_stats(int *live, int *used_slots, uint64_t *adds_total) {
     int n = atomic_load(&g_nr), active = 0;
     for (int i = 0; i < n; i++) active += atomic_load_explicit(&g_r[i].live, memory_order_acquire) != 0;
