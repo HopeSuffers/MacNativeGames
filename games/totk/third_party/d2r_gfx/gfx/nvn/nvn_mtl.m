@@ -11945,8 +11945,18 @@ frz_plain:;
             return;
         }
         use_rec("buf", di->ibuf, (uint64_t)di->count * (di->itype == 1 ? 2 : 4), 0, NULL);
+        /* Experiment TOTK_PROVOKE_LAST=1: flat varyings from the last vertex of each triangle (the GL / Maxwell convention)
+           instead of Metal's first: triangle lists drawn with each triangle's indices rotated (a,b,c) -> (c,a,b), same winding. */
+        { static int on = -1; if (on < 0) on = getenv("TOTK_PROVOKE_LAST") && atoi(getenv("TOTK_PROVOKE_LAST"));
+          if (on && mp == MTLPrimitiveTypeTriangle && di->count >= 3 && !pend_hits(di->ibuf, (uint64_t)di->count * (di->itype == 1 ? 2 : 4))) {
+              id<MTLBuffer> rot; size_t es = di->itype == 1 ? 2 : 4, roff = arena_alloc((size_t)di->count * es + 4, &rot), n = (size_t)di->count / 3 * 3;
+              const uint8_t *src = (const uint8_t *)[(__bridge id<MTLBuffer>)mb contents] + mo; uint8_t *dst = (uint8_t *)rot.contents + roff;
+              for (size_t t = 0; t < n; t += 3) { memcpy(dst + t * es, src + (t + 2) * es, es); memcpy(dst + (t + 1) * es, src + t * es, es); memcpy(dst + (t + 2) * es, src + (t + 1) * es, es); }
+              enc_r_draw_indexed(en, mp, n, es == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32, rot.gpuAddress + roff, n * es, di->instances ? di->instances : 1, di->base_vertex, di->base_instance);
+              goto drawn; } }
         if (di->count) enc_r_draw_indexed(en, mp, di->count, di->itype == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32, gpu, ((__bridge id<MTLBuffer>)mb).length - mo,
                 di->instances ? di->instances : 1, di->base_vertex, di->base_instance);
+        drawn:;
     }
     if (g_rt_range_pending) { PD("j rt_level_range pass=%llu vc=%u", g_stat_pass, (unsigned)(dw ? dw->count : di->count)); g_rt_range_pending=0; }
 }
