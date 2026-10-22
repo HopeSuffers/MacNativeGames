@@ -152,6 +152,12 @@ static void *input_file(void *arg) {
             /* "flag <name> <0|1>": switch a graphics behaviour while the game runs (A/B without restarting); rumble / gyro mute and unmute those */
             char name[64]; int v; if (sscanf(line + 5, "%63s %d", name, &v) != 2) runtime_fail("diagnostic flag needs <name> <0|1>");
             extern void dm_gfx_set_flag(const char *name, int v); if (!runtime_hid_feedback_flag(name, v)) dm_gfx_set_flag(name, v);
+        } else if (!strncmp(line, "renderres ", 10)) {   /* "renderres <w>x<h>": the scene render size from now on (TOTK_RENDER_RES runs) */
+            extern float *runtime_render_res_page; unsigned rw, rh;
+            if (runtime_render_res_page && sscanf(line + 10, "%ux%u", &rw, &rh) == 2 && rw >= 64 && rh >= 64 && rw <= 4096 && rh <= 4096) {
+                float v[2] = {(float)rw, (float)rh}; memcpy(runtime_render_res_page, v, sizeof v); fprintf(stderr, "[totk] render size now %ux%u\n", rw, rh); }
+        } else if (!strncmp(line, "vpoolcheck", 10)) {   /* "vpoolcheck": do virtual pools still alias their physical pages? */
+            extern void totk_vpool_verify(void); totk_vpool_verify();
         } else if (!strncmp(line, "texdump ", 8)) {
             extern void dm_gfx_texdump_next(const char *path);
             line[strcspn(line, "\r\n")] = 0; if (!line[8] || !strstr(line + 8, "%d")) runtime_fail("diagnostic texdump path needs %d");

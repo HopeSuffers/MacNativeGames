@@ -101,7 +101,72 @@ static void unprotect_page(range_t *r, uintptr_t p) {   // 调用方已把状态
     while (l < g && !atomic_compare_exchange_weak(&r->latest, &l, g)) {}
     atomic_store(&r->state[p], PG_NONE);
 }
+/* TOTK_EARLY_FENCE: pages the GPU is still writing for a frame the game has already been told is done (a storage buffer
+   the game reads back on the CPU). They are inaccessible to the CPU until that frame's fence completes: a guest or host
+   access faults, waits here for the GPU (signal-safe: atomic reads and sched_yield only, at most HOLD_WAIT_MS so a lock the
+   waiter holds can never deadlock it), then the hold ends and the access runs with the finished data. Ending a hold puts
+   every page back to what the dirty tracker says it is (read-only when PG_PROT, else read-write). */
+enum { MAX_HOLD = 64, HOLD_WAIT_MS = 100 };
+typedef struct { _Atomic uintptr_t lo, hi; _Atomic uint64_t fence, released; _Atomic int on; } hold_t;   // on: 0 free, 1 held, 2 being released, 3 being set up; released: mach time it ended
+static hold_t g_hold[MAX_HOLD];
+static _Atomic uint64_t g_hold_n, g_hold_faults, g_hold_timeouts;
+static uint64_t (*g_fence_done)(void);
+static void hold_restore(uintptr_t lo, uintptr_t hi) {
+    for (uintptr_t a = lo; a < hi; a += g_pg) {
+        range_t *r = find(a); int prot = PROT_READ | PROT_WRITE;
+        if (r) { uintptr_t p = (a - r->base) >> g_shift; if (atomic_load(&r->state[p]) == PG_PROT) prot = PROT_READ; }
+        mprotect((void *)a, g_pg, prot);
+    }
+}
+static void hold_release(hold_t *h) {
+    int on = 1;
+    if (!atomic_compare_exchange_strong(&h->on, &on, 2)) return;   // another thread is releasing it (or it is free)
+    hold_restore(atomic_load(&h->lo), atomic_load(&h->hi));
+    atomic_store(&h->released, mach_absolute_time());
+    atomic_store(&h->on, 0);
+}
+int nvn_hold_begin(const void *addr, size_t len, uint64_t fence, uint64_t (*done)(void)) {
+    if (!g_pg || !len) return 0;
+    g_fence_done = done;
+    uintptr_t lo = (uintptr_t)addr & ~(g_pg - 1), hi = ((uintptr_t)addr + len + g_pg - 1) & ~(g_pg - 1);
+    for (uintptr_t a = lo; a < hi; a += g_pg) { range_t *r = find(a); if (r && atomic_load(&r->state[(a - r->base) >> g_shift]) == PG_BUSY) return 0; }
+    for (int i = 0; i < MAX_HOLD; i++) {
+        int z = 0;
+        if (!atomic_compare_exchange_strong(&g_hold[i].on, &z, 3)) continue;   // 3: being set up
+        atomic_store(&g_hold[i].released, 0);
+        atomic_store(&g_hold[i].lo, lo); atomic_store(&g_hold[i].hi, hi); atomic_store(&g_hold[i].fence, fence);
+        if (mprotect((void *)lo, hi - lo, PROT_NONE)) { atomic_store(&g_hold[i].on, 0); return 0; }
+        atomic_store(&g_hold[i].on, 1); atomic_fetch_add(&g_hold_n, 1);
+        return 1;
+    }
+    return 0;
+}
+void nvn_hold_end(uint64_t done) {   // the GPU completed up to done: end every hold of those frames
+    for (int i = 0; i < MAX_HOLD; i++) if (atomic_load(&g_hold[i].on) == 1 && atomic_load(&g_hold[i].fence) <= done) hold_release(&g_hold[i]);
+}
+void nvn_hold_stats(uint64_t *holds, uint64_t *faults, uint64_t *timeouts) { *holds = atomic_load(&g_hold_n); *faults = atomic_load(&g_hold_faults); *timeouts = atomic_load(&g_hold_timeouts); }
+static int hold_fault(uintptr_t a) {
+    /* A fault can race with a hold being set up or ended: a range in transition is waited out and the access retried; an
+       access that faulted just before its hold ended (released within the last second) is simply retried. */
+    for (int i = 0; i < MAX_HOLD; i++) {
+        hold_t *h = &g_hold[i]; int on = atomic_load(&h->on);
+        if (a < atomic_load(&h->lo) || a >= atomic_load(&h->hi)) continue;
+        if (on == 3 || on == 2) { while ((on = atomic_load(&h->on)) == 3 || on == 2) sched_yield(); if (on == 0) return 1; }
+        if (on == 0) { uint64_t r = atomic_load(&h->released); if (r && (mach_absolute_time() - r) * g_tb.numer / g_tb.denom < 1000000000ull) return 1; continue; }
+        atomic_fetch_add(&g_hold_faults, 1);
+        uint64_t f = atomic_load(&h->fence), t0 = mach_absolute_time();
+        while (atomic_load(&h->on) == 1 && g_fence_done && g_fence_done() < f) {
+            if ((mach_absolute_time() - t0) * g_tb.numer / g_tb.denom > (uint64_t)HOLD_WAIT_MS * 1000000ull) { atomic_fetch_add(&g_hold_timeouts, 1); break; }
+            sched_yield();
+        }
+        hold_release(h);
+        while (atomic_load(&h->on) == 2) sched_yield();   // the other releaser restores the pages
+        return 1;
+    }
+    return 0;
+}
 static int on_fault(void *addr, int is_write, void *uc) {
+    if (atomic_load_explicit(&g_hold_n, memory_order_relaxed) && hold_fault((uintptr_t)addr)) return 1;
     (void)uc;
     range_t *r = is_write ? find((uintptr_t)addr) : NULL;
     if (!r) return 0;
@@ -240,6 +305,14 @@ int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp) {
     uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
     for (uintptr_t i = p; i <= q; i++) if (atomic_load(&r->gen[i]) > stamp) return 1;   // 上传前最后一次写的代号 ≤ 戳；之后的写必 > 戳 | The generation of the last write before upload is <= the stamp; any later write must be > the stamp
     return 0;
+}
+/* Pages of [addr, addr+len) written after stamp (-1: untracked); first / last such page index into *lo / *hi. */
+int nvn_dirty_count_since(const void *addr, size_t len, uint64_t stamp, int *lo, int *hi) {
+    if (!len || !nvn_dirty_tracked(addr, len)) return -1;
+    range_t *r = find((uintptr_t)addr);
+    uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift; int n = 0; *lo = -1; *hi = -1;
+    for (uintptr_t i = p; i <= q; i++) if (atomic_load(&r->gen[i]) > stamp) { if (*lo < 0) *lo = (int)(i - p); *hi = (int)(i - p); n++; }
+    return n;
 }
 void nvn_dirty_slot_stats(int *live, int *used_slots, uint64_t *adds_total) {
     int n = atomic_load(&g_nr), active = 0;

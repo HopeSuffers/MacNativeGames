@@ -105,6 +105,54 @@ static void patch_realtime(Module *m){
     frame_interval_data=(_Atomic uint32_t *)(void *)(m->base+data+8);frame_step_store(1.0f/60.0f);
     fprintf(stderr,"[totk] 1.4.3 real-time frame step: 7 guarded sites, producer veneer +%#llx; original half-step selector and ratio/inverse/seconds/FPS calculations retained\n",(unsigned long long)stub);
 }
+/* Benchmark camera (survey sessions only, 2026-10-20). The look-at camera update stores the frame's eye (doubles +0x60,
+   floats +0x38), target (doubles +0x78, floats +0x44) and normalised up (+0x50) into the camera in x20 at
+   main+0x6287b4..0x628824, then builds the view matrix from d1,d2,d0 / d3,d4,d5 / s7,s16,s17. The adrp at main+0x628828
+   (the point UltraCam's "Camera Controller Universal" signature finds) branches to a stub that, while the block at
+   data+0x100 is active, loads the benchmark camera into those registers and the camera's fields; the game's camera
+   controller keeps its own state, so the view returns to the player when the block goes inactive. Block: u32 active,
+   eye f64[3] +8, target f64[3] +32, up f32[3] +56, then the float copies of eye and target as at +0x38 (+72..+95), the
+   vertical FOV in radians +96 (stored into the controller's +0x13c, which main+0x628c3c copies to the projection's
+   fovy, as UltraCam's "Camera Controller Hook Fix 1.4.0+" does). UltraCam's time-of-day hook ("TimeHook") matches an
+   unrelated function in 1.4.3, so the benchmark sets no time: the save's time runs on as in citron. */
+#define BENCH_CAM_SITE 0x628828u
+#define BENCH_CAM_DATA 0x100u
+static void patch_bench_cam(Module *m){
+#if TARGET_OS_IPHONE
+    (void)m;
+#else
+    const char *survey=getenv("TOTK_SURVEY");if(!survey||strcmp(survey,"1"))return;
+    uint64_t data=(m->file_size+0x3fff)&~0x3fffULL,stub=((m->text_end+15)&~15ULL)+176;   /* after the aspect stubs */
+    static const uint32_t body[]={
+        0x91040129, /* add x9, x9, #0x100 */
+        0xb940012a, /* ldr w10, [x9]: active? */
+        0x3400028a, /* cbz w10, restore (20 instructions on) */
+        0x6d408921,0xfd400d20,0x6d421123,0xfd401925,   /* ldp d1,d2 / ldr d0 / ldp d3,d4 / ldr d5: eye and target */
+        0x2d474127,0xbd404131,                         /* ldp s7,s16 / ldr s17: up */
+        0x6d060a81,0x6d070e80,0x6d081684,              /* stp into the camera's doubles +0x60..+0x88 */
+        0x2d0a4287,0xbd005a91,                         /* stp s7,s16,[x20,#0x50] / str s17,[x20,#0x58] */
+        0xf940252a,0xf9001e8a,0xf940292a,0xf900228a,0xf9402d2a,0xf900268a,   /* float eye and target +0x38..+0x4f */
+        0xb940612a,0xb9013e6a,                         /* ldr w10, [x9, #96] / str w10, [x19, #0x13c]: FOV */
+        0xf84107ea}; /* restore: ldr x10, [sp], #16 */
+    enum { N = 2 + sizeof body / 4 + 2 };
+    uint32_t words[N];
+    words[0]=0xf81f0fea;   /* str x10, [sp, #-16]! */
+    words[1]=adrp(9,(uintptr_t)m->base+stub+4,(uintptr_t)m->base+data);
+    memcpy(words+2,body,sizeof body);
+    words[N-2]=adrp(9,(uintptr_t)m->base+stub+(N-2)*4,(uintptr_t)m->base+0x396f000);   /* the instruction it replaces */
+    words[N-1]=branch(stub+(N-1)*4,BENCH_CAM_SITE+4);
+    uint32_t got;memcpy(&got,m->base+BENCH_CAM_SITE,4);
+    if(got!=0xf0019a29)runtime_fail("1.4.3 benchmark camera: the camera code does not match");
+    if(stub+sizeof words>((m->text_end+0x3fff)&~0x3fffULL)||data+BENCH_CAM_DATA+112>m->size)runtime_fail("1.4.3 benchmark camera layout");
+    for(unsigned i=0;i<sizeof words;i++)if(m->base[stub+i])runtime_fail("1.4.3 benchmark camera padding not empty");
+    memset(m->base+data+BENCH_CAM_DATA,0,112);
+    memcpy(m->base+stub,words,sizeof words);
+    uint32_t jump=branch(BENCH_CAM_SITE,stub);memcpy(m->base+BENCH_CAM_SITE,&jump,4);
+    runtime_bench_cam=m->base+data+BENCH_CAM_DATA;
+    fprintf(stderr,"[totk] 1.4.3 benchmark camera: look-at and FOV override at main+%#x (HUD not hidden yet), stub +%#llx\n",
+            BENCH_CAM_SITE,(unsigned long long)stub);
+#endif
+}
 static void patch_output_res(Module *m);
 static void patch_render_res(Module *m);
 void runtime_game_patches(Module *m) {
@@ -116,6 +164,7 @@ void runtime_game_patches(Module *m) {
     { static const uint64_t sites[] = {0x628c74, 0xb43460, 0x1ff04f4, 0x253fbb0};   /* camera update and setup, viewport x2 */
       aspect_install(m, "1.4.3", sites, 4, ((m->text_end + 15) & ~15ULL) + 48,   /* after the two veneers above */
                      (m->file_size + 0x3fff) & ~0x3fffULL); }
+    patch_bench_cam(m);
     const char *enabled = getenv("TOTK_FPS60");
     if (enabled && !strcmp(enabled, "0")) {
         fprintf(stderr, "[totk] 1.4.3 shipping frame controller (TOTK_FPS60=0)\n");

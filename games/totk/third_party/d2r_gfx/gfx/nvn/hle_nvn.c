@@ -130,6 +130,8 @@ void mtl_args_stats(uint64_t *enc, uint64_t *reuse);
 // TOTK translation thread (see "translation thread" below)
 static uint64_t fence_now(int *token);
 static int fence_wait(uint64_t k, uint64_t timeout_ns);
+static int fence_wait_frame(uint64_t k, uint64_t timeout_ns);
+int mtl_wait_frame(uint64_t fence, uint64_t timeout_ns);
 static void x_drain(void);
 static int async_replay(void);
 static int call_stats_on(void);
@@ -594,8 +596,9 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     if (tok ? fence_wait(o->fence, 0) : mtl_wait(o->fence, 0)) { survey_after_wait(s); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
     uint64_t t0 = lg ? now_ns() : 0;
     totk_tl(TL_WAIT_IN, o->fence, o->fence == mtl_last_fence());
+    { static int said; extern uint32_t runtime_thread_current_handle(void); if (getenv("TOTK_CORE_LOG") && said++ < 3) LOG("[core-wait] frame-wait thread %#x", runtime_thread_current_handle()); }
     if (sync_chain_left(1)) { char w[96]; snprintf(w, sizeof w, "SyncWait sync=%p fence=%llu newest=%d", (const void *)s, (unsigned long long)o->fence, o->fence == mtl_last_fence()); guest_chain(w); }
-    int ok = tok ? fence_wait(o->fence, timeout) : mtl_wait(o->fence, timeout);
+    int ok = tok ? fence_wait_frame(o->fence, timeout) : mtl_wait(o->fence, timeout);
     totk_tl(TL_WAIT_OUT, o->fence, ok);
     if (lg) { atomic_fetch_add(&g_sw_blocked[k], 1); atomic_fetch_add(&g_sw_ns[k], now_ns() - t0); }
     if (ok) survey_after_wait(s);
@@ -743,7 +746,9 @@ static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
    BindVertexAttribState 1+n words, BindVertexStreamState 16+n words, BindVertexBuffer 6 words each (address + limit). */
 static void hw_fix(cmd_t *o, size_t bytes) { o->hw_used += bytes; o->hw_used -= o->last_rec; o->last_rec = bytes; }
 static int reclog_limit(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_RECLOG"); v = e ? atoi(e) : 0; } return v; }
+void mtl_early_gate(void);
 NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
+    mtl_early_gate();   // TOTK_EARLY_FENCE: a frame released early is really done before the next one is built
     cmd_t *o = CB(c);
     if (o->recording) LOG("【红】BeginRecording 重入");
     o->recording = 1; o->cur = o->seg;   /* the previous recording was copied at EndRecording */
@@ -966,7 +971,7 @@ static int inline_bulk_on(void) {
     int v = atomic_load_explicit(&g_inline_bulk_on, memory_order_relaxed);
     if (v < 0) {
         const char *e = getenv("TOTK_INLINE_BULK"); int expected = -1;
-        atomic_compare_exchange_strong(&g_inline_bulk_on, &expected, e && !strcmp(e, "1"));
+        atomic_compare_exchange_strong(&g_inline_bulk_on, &expected, !(e && !strcmp(e, "0")));   // default on since 2026-10-21
         v = atomic_load_explicit(&g_inline_bulk_on, memory_order_relaxed);
     }
     return v;
@@ -1525,7 +1530,7 @@ static int diag_env_once_on(void) {
     int v = atomic_load_explicit(&g_diag_env_once, memory_order_relaxed);
     if (v < 0) {
         const char *e = getenv("TOTK_DIAG_ENV_ONCE"); int initial = -1;
-        int desired = e && !strcmp(e, "1");
+        int desired = !(e && !strcmp(e, "0"));   /* cached by default (2026-10-20): the legacy re-read was a getenv per BindProgram */
         atomic_compare_exchange_strong(&g_diag_env_once, &initial, desired);
         v = atomic_load_explicit(&g_diag_env_once, memory_order_relaxed);
     }
@@ -1874,7 +1879,9 @@ _Atomic int dm_submit_busy;   // TOTK diagnostic: submissions being replayed (ru
 //    job of that image's last present, then for its present ticket as before. The replay frame number travels in the job.
 //  - Operations that destroy or read Metal state (pool / texture / program finalize, ReadTexels / WriteTexels, QueueFinish,
 //    suspend) wait until the queue is empty first (x_drain), so they never overtake a queued replay that still uses them.
-// TOTK_ASYNC_REPLAY=0 (default for now) runs everything on the calling thread as before.
+// TOTK_ASYNC_REPLAY=0 runs everything on the calling thread as before. Default on since 2026-10-21: the NX Optimizer
+// benchmark (bench_run.py) kept its average and raised the 1% / 0.1% lows from 35 / 27 to 38-39 / 30-31 fps, and the
+// 94-frame picture comparison with citron showed no difference from the synchronous replay.
 enum { XJ_SUBMIT = 1, XJ_PRESENT, XJ_TEXREL };
 typedef struct { int kind, n; uint64_t *h; void *ucap; win_t *win; int idx; double period; int crop[4]; uint64_t frame, sub; tex_t tex; } xjob;   // tex: copy of a finalized texture (XJ_TEXREL); ucap: uniforms captured at the submit call
 #define XQ 64
@@ -1887,7 +1894,7 @@ static win_t *g_xp_win; static uint64_t g_xp_job[4];   // job number of each swa
 static _Atomic uint64_t g_x_drains, g_x_drain_ns;
 static int async_replay(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("TOTK_ASYNC_REPLAY"); v = e && atoi(e) > 0; if (v) LOG("[nvn] 翻译线程：提交与出图排队交给独立线程回放（TOTK_ASYNC_REPLAY=0 关）"); }
+    if (v < 0) { const char *e = getenv("TOTK_ASYNC_REPLAY"); v = !e || atoi(e) > 0; if (v) LOG("[nvn] 翻译线程：提交与出图排队交给独立线程回放（TOTK_ASYNC_REPLAY=0 关）"); }
     return v;
 }
 static void submit_exec(int n, const uint64_t *h, void *ucap);
@@ -1971,10 +1978,27 @@ static int fence_wait(uint64_t k, uint64_t timeout_ns) {
     uint64_t used = now_ns() - t0;
     return mtl_wait(f, timeout_ns > used ? timeout_ns - used : 0);
 }
+/* fence_wait for the game's own nvnSyncWait: the Metal part may end early (mtl_wait_frame, TOTK_EARLY_FENCE). */
+static int fence_wait_frame(uint64_t k, uint64_t timeout_ns) {
+    pthread_mutex_lock(&g_xq_mu);
+    if (g_xsub_done < k) {
+        struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
+        uint64_t ns = (uint64_t)dl.tv_nsec + (timeout_ns > 3600000000000ull ? 3600000000000ull : timeout_ns);
+        dl.tv_sec += ns / 1000000000ull; dl.tv_nsec = ns % 1000000000ull;
+        while (g_xsub_done < k) if (pthread_cond_timedwait(&g_xq_cv, &g_xq_mu, &dl)) break;
+    }
+    int ok = g_xsub_done >= k;
+    uint64_t f = !k ? 0 : g_xsub_done - k < XF ? g_xsub_fence[k % XF] : mtl_last_fence();
+    pthread_mutex_unlock(&g_xq_mu);
+    int r = ok && mtl_wait_frame(f, timeout_ns);
+    if (r) { void mtl_gpu_poke(void); mtl_gpu_poke(); }
+    return r;
+}
 
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
     NVN_BLOCKING();
     totk_tl(TL_SUB_IN, (uint64_t)n, 0);
+    { static int said; extern uint32_t runtime_thread_current_handle(void); if (getenv("TOTK_CORE_LOG") && said++ < 3) LOG("[core-wait] submit thread %#x", runtime_thread_current_handle()); }
     { uint64_t now = __atomic_add_fetch(&g_submits, 1, __ATOMIC_RELAXED); for (int i = 0; i < n; i++) copy_touch(h[i], now); }
     if (totk_life_on()) { int k = 0; for (int i = 0; i < n; i++) k += totk_life_handle_has(h[i]); totk_life_log("submit n=%d followed=%d", n, k); }
     ((queue_t *)q)->submits++;
@@ -2178,6 +2202,7 @@ uint64_t dm_nvn_frame_count(void) { return g_frame; }
 extern uint64_t g_t0_ns;   // 宿主进程起点（main.c；UIMSG 时间戳同基） | Host process start point (main.c; same base as the UIMSG timestamps)
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
     NVN_BLOCKING();
+    mtl_early_gate();
     totk_tl(TL_ACQ_IN, 0, 0);
     win_t *o = (win_t *)w;
     *idx = o->active ? o->next++ % o->active : 0;
@@ -2242,6 +2267,12 @@ static void dump_frame(void) {
     if (g_frame <= (uint64_t)nframes) LOG("[nvn] %s %llu：%u 个函数 %llu 次调用 |%s", g_frame ? "帧" : "初始化", g_frame, nfn, total, line);
     else if (g_frame % 300 == 0) LOG("[nvn] 帧 %llu：%u 个函数 %llu 次调用", g_frame, nfn, total);
     g_frame++; g_frame_pub = g_frame; cs_dump();
+    /* TOTK_BENCH_FRAMES=<file> (benchmark, 2026-10-20): "<frame> <ns>" at every game frame, on the clock the survey
+       reports use (scripts/bench_run.py cuts the run into its fly segments by those frame numbers). */
+    { static FILE *bf; static int on = -1;
+      if (on < 0) { const char *e = getenv("TOTK_BENCH_FRAMES"); on = e && *e && (bf = fopen(e, "w")) != NULL; }
+      if (on) { fprintf(bf, "%llu %llu\n", (unsigned long long)g_frame, (unsigned long long)clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+                if (!(g_frame % 60)) fflush(bf); } }
     { void runtime_watch_tick(uint64_t); runtime_watch_tick(g_frame); }   // TOTK diagnostic write watchpoint (TOTK_WATCH_ADDR)
     // 每 300 帧读一次常驻内存，交图形层打内存读数行（mtl_mem_stat，低频封顶）。内存看门狗：常驻超过上限就报红自行退出——只在 Mac 宿主上缺省开（24 GB：宿主内存失控
     // 会把整机拖进内核崩溃，同机别的程序两次如此），或测试时用 DM_MEM_CAP_GB=<整数> 指定；玩家的 iOS 包不设上限（被系统杀之前自己退没有意义，反而多一种闪退）
@@ -2580,6 +2611,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     NVN_BLOCKING();
     (void)q; win_t *o = (win_t *)w; o->presents++;
     totk_tl_frame(o->presents); totk_tl(TL_PRES_IN, (uint64_t)idx, 0);
+    { void fps_overlay_note_game(double now_s); fps_overlay_note_game((double)now_ns() / 1e9); }   // frame-time graph: the game's own frame time
     if (runtime_frame_step_update) runtime_frame_step_update(now_ns());
     if (movie_host_tick) movie_host_tick();
     game_work_tick(o->presents);

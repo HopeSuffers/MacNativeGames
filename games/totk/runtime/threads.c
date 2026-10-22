@@ -54,6 +54,7 @@ typedef struct thr {
     uint64_t wseq;             // 登记等待的先后序号：同优先级先到先醒（与 Horizon 内核 KThread 等待树同序） | Sequence number of wait registration: at equal priority first come, first woken (same order as the Horizon kernel's KThread wait tree)
     struct thr *next;          // 等待链 | Wait chain
     struct thr *all;           // 全部线程链（现场导出用） | All-threads chain (for the state dump)
+    uint64_t core_wait_ns, core_waits;   // TOTK_CORE_LOG=1: time spent waiting for a virtual core
     int last_svc; uint64_t last_lr, last_fp;
     int closed;                // 句柄已关：与 exited 同时成立才释放对象（Horizon：线程对象随最后一个引用消失） | Handle closed: the object is freed only when this holds together with exited (Horizon: the thread object goes away with the last reference)
     uint64_t nsvc;             // SVC 次数（现场导出用） | SVC count (for the state dump)
@@ -148,7 +149,13 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
     if (c >= 0) { t->cur_core = c; t->core_since = now_ns(); g_core_owner[c] = t; return; }
     t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t;
     for (int i = 0; i < NCORE; i++) if (core_allowed(t, i) && g_core_owner[i] && g_core_owner[i]->prio > t->prio) g_core_owner[i]->preempt = 1;
+    uint64_t w0 = now_ns();
     while (t->cur_core < 0) pthread_cond_wait(&t->cv, &G);
+    t->core_wait_ns += now_ns() - w0; t->core_waits++;
+    { static int on = -1; static uint64_t last; if (on < 0) on = getenv("TOTK_CORE_LOG") != NULL;   // diagnostic: who waits for a core, every 5 s
+      uint64_t now = now_ns(); if (on && now - last > 5000000000ull) { last = now;
+        for (thr_t *x = g_all; x; x = x->all) if (x->core_wait_ns > 50000000ull) fprintf(stderr, "[core-wait] thread %#x prio %d mask %#llx: %.1f ms in %llu waits (5 s)\n", x->handle, x->prio, (unsigned long long)x->mask, x->core_wait_ns / 1e6, (unsigned long long)x->core_waits);
+        for (thr_t *x = g_all; x; x = x->all) { x->core_wait_ns = 0; x->core_waits = 0; } } }
 }
 static thr_t *me_or_null(void) { return g_keythr ? pthread_getspecific(g_keythr) : NULL; }
 void runtime_thread_note_hle(unsigned i) { thr_t *t = me_or_null(); if (t) t->last_hle = (int)i + 1; }   // hle_stack.c, while tracing

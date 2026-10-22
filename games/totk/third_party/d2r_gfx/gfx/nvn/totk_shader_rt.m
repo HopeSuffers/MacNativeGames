@@ -14,6 +14,7 @@
 #include <mach-o/dyld.h>
 #include <pthread.h>
 #include <spawn.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -105,6 +106,14 @@ static void service_start(void) {
     posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_adddup2(&fa, to[0], 0); posix_spawn_file_actions_adddup2(&fa, from[1], 1);
     posix_spawn_file_actions_addclose(&fa, to[1]); posix_spawn_file_actions_addclose(&fa, from[0]);
+    /* The service starts with an empty signal mask and default dispositions: posix_spawn inherits the caller's mask, and
+       a game thread (signals blocked) starting it left SIGCHLD blocked in the service, which then never learnt that its
+       spirv-cross had exited (a zombie) and waited for it forever; no translation finished for the rest of the session
+       and every draw that needed a new variant stayed skipped (2026-10-20). */
+    posix_spawnattr_t sa; posix_spawnattr_init(&sa);
+    sigset_t none, all; sigemptyset(&none); sigfillset(&all);
+    posix_spawnattr_setsigmask(&sa, &none); posix_spawnattr_setsigdefault(&sa, &all);
+    posix_spawnattr_setflags(&sa, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
     NSString *sc = [r stringByAppendingString:@"/build/spirv-cross/spirv-cross"];
     // TOTK_SHADER_XLATE=<totk_xlate.dll> runs a trial translator build (e.g. build/totk_xlate-opt) without replacing the
     // shared one (through shader_service.py); TOTK_SHADER_DEBUGMODE=0|1 reaches either service through the environment.
@@ -118,17 +127,17 @@ static void service_start(void) {
     if (use_native) {
         const char *argv[] = {native.UTF8String, "--service", "--spirv-cross", sc.UTF8String, "--out", totk_rt_dir().UTF8String,
                               "--chain", DMSH_CHAIN, NULL};
-        if (posix_spawn(&pid, argv[0], &fa, NULL, (char *const *)argv, environ)) die("start shader service %s", argv[0]);
+        if (posix_spawn(&pid, argv[0], &fa, &sa, (char *const *)argv, environ)) die("start shader service %s", argv[0]);
         if (dm) LOG("[shader] native translator, DebugMode %s", dm);
     } else {
         NSString *script = [r stringByAppendingString:@"/scripts/shader_service.py"], *dotnet = [r stringByAppendingString:@"/tooling/dotnet/dotnet"];
         NSString *xlate = xe && *xe ? @(xe) : [r stringByAppendingString:@"/build/totk_xlate/totk_xlate.dll"];
         const char *argv[] = {"python3", "-I", script.UTF8String, "--dotnet", dotnet.UTF8String, "--xlate", xlate.UTF8String,
                               "--spirv-cross", sc.UTF8String, "--out", totk_rt_dir().UTF8String, "--chain", DMSH_CHAIN, NULL};
-        if (posix_spawnp(&pid, "python3", &fa, NULL, (char *const *)argv, environ)) die("start shader service");
+        if (posix_spawnp(&pid, "python3", &fa, &sa, (char *const *)argv, environ)) die("start shader service");
         if (xe || dm) LOG("[shader] translator %s, DebugMode %s", xlate.UTF8String, dm ? dm : "default");
     }
-    posix_spawn_file_actions_destroy(&fa);
+    posix_spawn_file_actions_destroy(&fa); posix_spawnattr_destroy(&sa);
     close(to[0]); close(from[1]);
     g_svc_in = fdopen(to[1], "w"); g_svc_out = fdopen(from[0], "r");
     if (!g_svc_in || !g_svc_out) die("shader service streams");
@@ -190,6 +199,10 @@ static NSDictionary *service_translate(NSDictionary *rq, NSString *variant) {
     return [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:line length:strlen(line)] options:0 error:nil];
 }
 /* After the service answered: the reflection, the variant index, the counters. Under g_rt_lock. */
+/* TOTK_XLATE_FAIL_SKIP=1 (diagnostic only): a variant that fails to translate is remembered and its draws skipped
+   instead of stopping the game (pictures from such a run are not evidence; frame times still are). */
+static NSMutableSet<NSString *> *g_failed;
+static int fail_skip(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_XLATE_FAIL_SKIP"); v = e && atoi(e) > 0; } return v; }
 static NSString *finish_translation(NSString *shader, NSString *stage_name, NSString *variant, NSDictionary *reply,
                                     BOOL existed, uint64_t started) {
     NSMutableArray *vs = variants_of(shader);
@@ -197,6 +210,7 @@ static NSString *finish_translation(NSString *shader, NSString *stage_name, NSSt
         LOG("[survey-shader] frame %llu translation FAILED %s %s after %.2f ms: %s",
             (unsigned long long)dm_nvn_frame_count(), stage_name.UTF8String, variant.UTF8String,
             (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - started) / 1e6, [[reply[@"error"] description] UTF8String]);
+        if (fail_skip()) { if (!g_failed) g_failed = [NSMutableSet set]; [g_failed addObject:variant]; return nil; }
         die("shader %s (%s) translation failed: %s", variant.UTF8String, stage_name.UTF8String, [[reply[@"error"] description] UTF8String]);
     }
     NSData *jd = [NSData dataWithContentsOfFile:[totk_rt_dir() stringByAppendingFormat:@"/%@_b.json", variant]];
@@ -288,6 +302,7 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
     pthread_mutex_unlock(&g_rt_lock);
     return nil;
     }
+    if (g_failed && [g_failed containsObject:variant]) { pthread_mutex_unlock(&g_rt_lock); return nil; }
     BOOL existed = [NSFileManager.defaultManager fileExistsAtPath:[totk_rt_dir() stringByAppendingFormat:@"/%@_b.metal", variant]];   // a re-translation of a broken variant is not a new one
     if (async_misses()) {
         /* No stall (2026-10-20): a variant the cache lacks is translated, and its Metal library compiled, on a background

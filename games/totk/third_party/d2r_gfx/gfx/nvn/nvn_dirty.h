@@ -18,3 +18,10 @@ int nvn_dirty_recent(uintptr_t lo, uintptr_t hi, nvn_dirty_rec *out, int max);  
 void nvn_dirty_stats(uint64_t *faults, uint64_t *preps);           // 累计：游戏写触发的缺页次数、宿主写前解保护的页数 | Cumulative: number of page faults triggered by game writes, number of pages unprotected before host writes
 void nvn_dirty_mp_stats(uint64_t *calls, uint64_t *pages, uint64_t *ns);   // 累计：本模块 mprotect 调用次数、覆盖页数、耗时 | Cumulative: this module's mprotect call count, pages covered, time spent
 void nvn_dirty_slot_stats(int *live, int *used_slots, uint64_t *adds_total); // 当前存活槽、槽表高水位、登记总次数 | Currently live slots, slot table high-water mark, total number of registrations
+/* TOTK_EARLY_FENCE: make [addr, addr+len) inaccessible to the CPU until the GPU has completed fence (done() reads the
+   completed fence, signal-safely); a CPU access in between waits for it. 1 = held. nvn_hold_end ends the holds of
+   completed fences. */
+int nvn_hold_begin(const void *addr, size_t len, uint64_t fence, uint64_t (*done)(void));
+void nvn_hold_end(uint64_t done);
+void nvn_hold_stats(uint64_t *holds, uint64_t *faults, uint64_t *timeouts);
+int nvn_dirty_count_since(const void *addr, size_t len, uint64_t stamp, int *lo, int *hi);
