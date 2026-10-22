@@ -11,6 +11,7 @@
 #include <mach/mach.h>
 #include "mach_vm_compat.h"
 #include <pthread.h>
+#include <string.h>
 #include <unistd.h>
 
 #define F_CPU_NO_ACCESS NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS
@@ -76,6 +77,21 @@ static vmap_ent g_vmap[512]; static int g_nvmap;
 static void vmap_note(uintptr_t va, uint64_t size, uintptr_t cpu) {
     for (int i = 0; i < g_nvmap; i++) if (g_vmap[i].va == va) { g_vmap[i] = (vmap_ent){va, cpu, size}; return; }
     if (g_nvmap < 512) g_vmap[g_nvmap++] = (vmap_ent){va, cpu, size};
+}
+/* TOTK diagnostic ("vpoolcheck" in TOTK_INPUT_FILE): every mapped virtual range must show the same bytes as its physical
+   backing (they are one set of pages); a page that differs means the alias was broken (a copy-on-write split). */
+void totk_vpool_verify(void) {
+    pthread_mutex_lock(&g_map_mu);
+    uint64_t pages = 0, diff = 0, ranges = 0, bad_ranges = 0; const uint64_t pg = 16384;
+    for (int i = 0; i < g_nvmap; i++) {
+        const vmap_ent *e = &g_vmap[i]; if (!e->cpu) continue; ranges++; uint64_t d0 = diff;
+        for (uint64_t o = 0; o < e->size; o += pg) { pages++; if (memcmp((const void *)(e->va + o), (const void *)(e->cpu + o), pg)) diff++; }
+        if (diff > d0 && bad_ranges++ < 8) LOG("[vpool] range va=%#llx cpu=%#llx size=%#llx: %llu of %llu pages differ", (unsigned long long)e->va, (unsigned long long)e->cpu,
+                                               (unsigned long long)e->size, (unsigned long long)(diff - d0), (unsigned long long)(e->size / pg));
+    }
+    pthread_mutex_unlock(&g_map_mu);
+    LOG("[vpool] check: %llu mapped ranges, %llu pages, %llu pages differ from their physical backing (%llu ranges)", (unsigned long long)ranges,
+        (unsigned long long)pages, (unsigned long long)diff, (unsigned long long)bad_ranges);
 }
 int totk_vpool_backing(uintptr_t va, uint64_t len, uintptr_t *cpu) {
     pthread_mutex_lock(&g_map_mu); int r = 0;
