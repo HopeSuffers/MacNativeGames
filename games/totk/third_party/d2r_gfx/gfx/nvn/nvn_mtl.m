@@ -135,6 +135,10 @@ static uint64_t g_link_dropped;
 static int g_pq_inflight;   // 持 g_pq_mu：已提交给 GPU、完成回调还没来的上屏数 | Under g_pq_mu: number of presents committed to the GPU whose completion callback has not arrived yet
 int g_dm_present_link;   // 出图节拍模式（DM_PRESENT_LINK 的运行时值，同进程交替测量时直接改它）：0 = 自己取 drawable；1 = 显示节拍 60 Hz；2 = 120 Hz 节拍、游戏隔拍出一帧 | Present pacing mode (runtime value of DM_PRESENT_LINK, modified directly during same-process alternating measurement): 0 = acquire the drawable itself; 1 = display link at 60 Hz; 2 = display link at 120 Hz, the game presents a frame every other display-link tick
 static int g_present_latency = 1;
+/* TOTK_VSYNC (default off; =1 on): the layer's displaySyncEnabled. The display link (DM_PRESENT_LINK, default 1) stays on
+   either way: it shows the newest finished frame at each refresh and never makes the game wait, while a windowed layer
+   taking its own drawables hands them out at the compositor's 60 Hz even without display sync (bench 57.7 vs 64.7 fps). */
+static int vsync_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_VSYNC"); v = e && strcmp(e, "0"); } return v; }
 static uint64_t g_pq_done;
 static uint64_t g_pq_read;
 static id<MTLResidencySet> g_res;
@@ -13660,7 +13664,10 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     if (!layer) return 0;
     if (g_present_layer_resident != layer) { if (!layer.residencySet) MDIE("present layer has no residency set (layer device %s)", layer.device ? "set" : "missing"); [g_q4 addResidencySet:layer.residencySet]; g_present_layer_resident = layer; }
 #if TARGET_OS_OSX
-    if (!layer.displaySyncEnabled) layer.displaySyncEnabled = YES;   // 窗口模式按显示器垂直同步，防撕裂 | Windowed mode follows the display's vsync to prevent tearing
+    /* Vsync off by default (vsync_on, TOTK_VSYNC=1 turns it on): frames are shown as soon as they are done (tearing
+       possible), so a game running between 30 and 60 fps on a 60 Hz panel moves at its own even pace instead of
+       alternating 16.7 / 33.3 ms on screen (the frame-time graph's faint line). */
+    if (layer.displaySyncEnabled != (BOOL)vsync_on()) layer.displaySyncEnabled = (BOOL)vsync_on();
 #endif
     present_pipeline(layer.pixelFormat);   // 和原路径一样，首帧编管线在取drawable之前 | Same as the original path: the first frame compiles the pipeline before taking the drawable
     window_shot_tick(g_present_n);
