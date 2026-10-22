@@ -1,6 +1,7 @@
 // NVN 空设备的 Metal 执行层，见 nvn_mtl.h。
 // Metal execution layer of the NVN null device, see nvn_mtl.h.
 #import <Metal/Metal.h>
+#include <mach/mach.h>
 #include "totk_ui_lang.h"
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CAMetalDisplayLink.h>
@@ -299,7 +300,21 @@ static uint64_t gpu_budget_bytes(void) {
     }
     return b;
 }
+/* TOTK_RSS_LIMIT_MB: stop before the process footprint reaches the region where the kernel panicked (~15 GB resident on the
+   16 GB Mac). Default 12500 MB when MTL_CAPTURE_ENABLED is set (the capture layer keeps released objects, so footprint grows
+   and a capture session raises TOTK_GPU_BUDGET_MB), otherwise off. Checked every 16th call. */
+static void rss_limit_check(const char *where) {
+    static uint64_t lim; static int init, n;
+    if (!init) { init = 1; const char *e = getenv("TOTK_RSS_LIMIT_MB"); lim = e ? strtoull(e, NULL, 10) << 20 : getenv("MTL_CAPTURE_ENABLED") ? 12500ull << 20 : 0;
+        if (lim) MLOG("resident memory limit %llu MB (TOTK_RSS_LIMIT_MB)", (unsigned long long)(lim >> 20)); }
+    if (!lim || (n++ & 15)) return;
+    task_vm_info_data_t vi; mach_msg_type_number_t c = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &c) != KERN_SUCCESS) return;
+    if (vi.phys_footprint > lim) MDIE("%s: process footprint %llu MB over the limit %llu MB (TOTK_RSS_LIMIT_MB); stopping before the kernel runs out of wired memory",
+                                      where, (unsigned long long)(vi.phys_footprint >> 20), (unsigned long long)(lim >> 20));
+}
 static void gpu_budget_check(const char *where) {
+    rss_limit_check(where);
     uint64_t budget = gpu_budget_bytes(); if (!budget) return;
     uint64_t cur = (uint64_t)g_dev.currentAllocatedSize; if (cur <= budget) return;
     res_site_report(16);
