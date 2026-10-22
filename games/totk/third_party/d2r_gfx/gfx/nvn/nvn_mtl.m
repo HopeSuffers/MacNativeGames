@@ -13764,6 +13764,17 @@ static void cadence_note(double tt, int interp) {
     }
     pthread_mutex_unlock(&mu);
 }
+/* TOTK_PRESENT_RING (display-link mode, default on; =0 off): at present the game's swapchain image is copied on the GPU
+   into one of PRING_N internal textures (its own small submission, ordered before every later write to that image on the
+   one queue), the display link shows the copy, and the game gets ticket 0 back: acquiring that image never waits for a
+   display refresh. Before, with the game faster than the display, every swapchain image was queued and
+   nvnWindowAcquireTexture blocked up to a whole refresh (7.9 / 17.2 ms of the 23 / 34 ms spike frames at Kakariko).
+   A slot is free once the queue has moved past its ticket (shown or dropped) and no present command buffer reads it. */
+#define PRING_N 4
+static id<MTLTexture> g_pring[PRING_N]; static uint64_t g_pring_tk[PRING_N]; static int g_pring_busy[PRING_N];   // g_pq_mu
+static __thread int t_pn_ring = -1;   // the slot present_now shows instead of the game's image (set by its callers)
+static uint64_t g_pring_n, g_pring_full;
+static int pring_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PRESENT_RING"); v = !(e && !strcmp(e, "0")); } return v; }
 static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts, int interp) {
     if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
     g_present_n++;
@@ -13782,7 +13793,8 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
              g_up_total_ns / 1e6, g_bp_first_present / 1e9);
     }
     PD("X ser=%llu%s", t->serial, interp >= 0 ? " (MetalFX interpolated frame before it)" : "");
-    id<MTLTexture> src = interp >= 0 ? mfx_output(interp) : tex_mtl(t);   // TOTK_MFX: the interpolated frame shown one tick before this game frame
+    int ring = interp < 0 ? t_pn_ring : -1;   // TOTK_PRESENT_RING: the copy made at present time
+    id<MTLTexture> src = interp >= 0 ? mfx_output(interp) : ring >= 0 ? g_pring[ring] : tex_mtl(t);   // TOTK_MFX: the interpolated frame shown one tick before this game frame
     if (!src) { RED_ONCE(8, "出图贴图建不出 MTLTexture"); return 0; }
     if (interp < 0) anom_present(src, frame);   // TOTK_ANOMALY
     /* One-frame temporal fallback (TOTK_FLASH_GUARD=1, off by default): a same-queue readback of the picture's centre
@@ -14063,7 +14075,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
                 }
             }
         }
-        pthread_mutex_lock(&g_pq_mu); g_present_alloc_busy[alloc_i] = 0; if (interp < 0 && ticket > g_pq_done) g_pq_done = ticket; g_pq_inflight--; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
+        pthread_mutex_lock(&g_pq_mu); g_present_alloc_busy[alloc_i] = 0; if (interp < 0 && ticket > g_pq_done) g_pq_done = ticket; if (ring >= 0) g_pring_busy[ring] = 0; g_pq_inflight--; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
     }];
     pthread_mutex_lock(&g_pq_mu); g_present_alloc_busy[alloc_i] = 1; g_pq_inflight++; pthread_mutex_unlock(&g_pq_mu);
     q4_commit(cb, o);
@@ -14115,7 +14127,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
 // Swapchain texture return: before AcquireTexture gets a texture it waits for the ticket of that texture's previous present to be processed (mtl_present_wait), after which the commands the game draws into it
 // are necessarily ordered after that blit on the GPU queue.
 #define PQ 8
-typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; int interp, interp_shown; double interp_ts; } pq_item;   // interp (TOTK_MFX): output slot of the frame shown before this one, or -1; interp_ts: the refresh it was shown at   // t_in：游戏把这一帧交进出图队列的时刻（CACurrentMediaTime） | t_in: the time the game handed this frame into the present queue (CACurrentMediaTime)
+typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; int interp, interp_shown; double interp_ts; int ring; } pq_item;   // interp (TOTK_MFX): output slot of the frame shown before this one, or -1; interp_ts: the refresh it was shown at   // t_in：游戏把这一帧交进出图队列的时刻（CACurrentMediaTime） | t_in: the time the game handed this frame into the present queue (CACurrentMediaTime)
 static pq_item g_pq[PQ];
 static uint64_t g_pq_in;
 static int present_now(const tex_t *, double, uint64_t, uint64_t, const int[4], id<CAMetalDrawable>, double, int);
@@ -14180,7 +14192,12 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     pthread_cond_broadcast(&g_pq_cv);
     pthread_mutex_unlock(&g_pq_mu);
     int submitted;
+    int ring = interp < 0 ? it.ring : -1;
+    if (ring >= 0) { pthread_mutex_lock(&g_pq_mu); g_pring_busy[ring] = 1; pthread_mutex_unlock(&g_pq_mu); }
+    t_pn_ring = ring;
     @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, update.drawable, update.targetPresentationTimestamp, interp); }
+    t_pn_ring = -1;
+    if (ring >= 0 && !submitted) { pthread_mutex_lock(&g_pq_mu); g_pring_busy[ring] = 0; pthread_mutex_unlock(&g_pq_mu); }
     if (!submitted && interp < 0) {
         pthread_mutex_lock(&g_pq_mu);
         if (ticket > g_pq_done) g_pq_done = ticket;
@@ -14281,7 +14298,11 @@ static void *present_main(void *arg) {
         pthread_mutex_lock(&g_pq_mu); int behind = g_pq_read < g_pq_in; pthread_mutex_unlock(&g_pq_mu);
         int show_interp = it.interp >= 0 && !behind;
         if (show_interp) { @autoreleasepool { (void)present_now(&it.t, fmin(it.period / 2, tick), it.frame, ticket, it.crop, nil, 0, it.interp); } }
+        if (it.ring >= 0) { pthread_mutex_lock(&g_pq_mu); g_pring_busy[it.ring] = 1; pthread_mutex_unlock(&g_pq_mu); }
+        t_pn_ring = it.ring;
         @autoreleasepool { submitted = present_now(&it.t, show_interp ? it.period / 2 : it.period, it.frame, ticket, it.crop, nil, 0, -1); }
+        t_pn_ring = -1;
+        if (it.ring >= 0 && !submitted) { pthread_mutex_lock(&g_pq_mu); g_pring_busy[it.ring] = 0; pthread_mutex_unlock(&g_pq_mu); }
         pthread_mutex_lock(&g_pq_mu); g_classic_busy = 0; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
         if (!submitted) {
             pthread_mutex_lock(&g_pq_mu);
@@ -14385,14 +14406,40 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
         if (st == 1 && link_on() && now - t0 >= at) { st = 2; mtl_link_pause(1); MLOG("DM_TEST_LINK_STALL：暂停显示节拍 %.1f 秒（帧 %llu）", dur, (unsigned long long)atomic_load(&g_cur_frame)); }
         else if (st == 2 && now - t0 >= at + dur) { st = 3; mtl_link_pause(0); MLOG("DM_TEST_LINK_STALL：放开显示节拍（帧 %llu）", (unsigned long long)atomic_load(&g_cur_frame)); }
     }
+    int ring = -1;
+    id<MTLTexture> rsrc = t && pring_on() && link_on() && islot < 0 && !mfx_enabled() && !nogpu() ? tex_mtl(t) : nil;
+    if (rsrc && rsrc.textureType == MTLTextureType2D && rsrc.sampleCount == 1) {
+        pthread_mutex_lock(&g_pq_mu);
+        for (int i = 0; i < PRING_N && ring < 0; i++) if (g_pring_tk[i] <= g_pq_read && !g_pring_busy[i]) ring = i;
+        if (ring >= 0) g_pring_tk[ring] = UINT64_MAX;   // being filled
+        pthread_mutex_unlock(&g_pq_mu);
+        if (ring < 0) g_pring_full++;
+        else {
+            id<MTLTexture> r = g_pring[ring];
+            if (!r || r.width != rsrc.width || r.height != rsrc.height || r.pixelFormat != rsrc.pixelFormat) {
+                if (r) { res_remove(r); defer_obj_release(r); }
+                MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:rsrc.pixelFormat width:rsrc.width height:rsrc.height mipmapped:NO];
+                d.usage = MTLTextureUsageShaderRead; d.storageMode = MTLStorageModePrivate;
+                r = [g_dev newTextureWithDescriptor:d]; if (!r) MDIE("present ring texture %lux%lu", (unsigned long)rsrc.width, (unsigned long)rsrc.height);
+                r.label = [NSString stringWithFormat:@"present ring %d", ring]; res_add(r); g_pring[ring] = r;
+            }
+            mtl_sub_begin();
+            id<MTL4ComputeCommandEncoder> b = blit();
+            enc_b_copy_texture(b, rsrc, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(rsrc.width, rsrc.height, 1), r, 0, 0, MTLOriginMake(0, 0, 0));
+            enc_b_end(g_blit); g_blit = nil;
+            mtl_sub_commit();
+            if (++g_pring_n == 1 || g_pring_n % 3600 == 0) MLOG("[present-ring] %llu presents copied (no free slot %llu times)", (unsigned long long)g_pring_n, (unsigned long long)g_pring_full);
+        }
+    }
     pthread_mutex_lock(&g_pq_mu);
     while (g_pq_in - g_pq_done >= PQ) pthread_cond_wait(&g_pq_cv, &g_pq_mu);   // 队满才等；正常由 AcquireTexture 先挡住 | Wait only when the queue is full; normally AcquireTexture blocks first
-    pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), islot, 0, 0};
+    pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), islot, 0, 0, ring};
     if (crop) memcpy(it->crop, crop, sizeof it->crop);   // 当帧状态随票号入队，不在出图线程晚读可变window | The current frame's state is enqueued with the ticket number, rather than reading the mutable window late on the present thread
     uint64_t tk = ++g_pq_in;
+    if (ring >= 0) g_pring_tk[ring] = tk;
     pthread_cond_broadcast(&g_pq_cv);
     pthread_mutex_unlock(&g_pq_mu);
-    return tk;
+    return ring >= 0 ? 0 : tk;   // ticket 0: acquiring this image does not wait for the display (the copy is ordered before its next use)
 }
 // 丢弃期间不等：标志置上之后才入队的那一帧（出图线程正好走过了标志检查）没人取，等它就又卡住；它留给随后的 mtl_drain 清
 // 节拍模式下不无限等：见 STALL_NS 处的说明。只丢「还没被节拍取走」的帧，已在上屏途中的那张等它交给 GPU（同进后台的丢法）
