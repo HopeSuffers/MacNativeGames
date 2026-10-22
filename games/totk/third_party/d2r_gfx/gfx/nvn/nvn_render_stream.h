@@ -25,6 +25,7 @@ enum {
     RS_DRAW, RS_INSTANCED, RS_INDEXED, RS_STORE,
     RS_BEGIN,   /* u[0] = retained MTL4RenderPassDescriptor, u[1] = vertex table, u[2] = fragment table, u[3] = command buffer, u[4] = barrier at start, u[5] = visibility options */
     RS_END,     /* end the encoder (barrier at end if u[0], visibility options u[1]) */
+    RS_QBAR,    /* TOTK_HZ: consumer barrier inside the pass before its later draws: u[0] 0 after all earlier work, 1 fragment after earlier vertex / fragment, 2 vertex and fragment after them */
 };
 enum { RS_SPIN_NS = 200000 };   /* B waits (wfe) this long on an empty queue before sleeping on the semaphore. During a replay A never pauses
                                    for that long, so B sleeps in the frame gap and wakes (~30 us) at the next submission. The waits are wfe / sev,
@@ -68,11 +69,13 @@ static void rs_apply(id<MTL4RenderCommandEncoder> *enc, id<MTL4ArgumentTable> *v
             if (u[4] == 2) {   /* TOTK_BARRIER_NARROW: copies / compute order before every stage; earlier render work only before our fragment stage (the vertex stage overlaps the previous pass's fragment work) */
                 [e barrierAfterQueueStages:MTLStageBlit | MTLStageDispatch beforeStages:MTLStageVertex | MTLStageFragment visibilityOptions:(MTL4VisibilityOptions)u[5]];
                 [e barrierAfterQueueStages:MTLStageVertex | MTLStageFragment beforeStages:MTLStageFragment visibilityOptions:(MTL4VisibilityOptions)u[5]];
-            } else if (u[4]) [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:(MTL4VisibilityOptions)u[5]];
+            } else if (u[4] == 3) [e barrierAfterQueueStages:MTLStageVertex | MTLStageFragment beforeStages:MTLStageFragment visibilityOptions:(MTL4VisibilityOptions)u[5]];   /* TOTK_HZ: attachments after earlier render passes */
+            else if (u[4]) [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:(MTL4VisibilityOptions)u[5]];
             [e setArgumentTable:*vt atStages:MTLRenderStageVertex]; [e setArgumentTable:*ft atStages:MTLRenderStageFragment];
             CFRelease((CFTypeRef)(uintptr_t)u[0]);
             *enc = e; atomic_fetch_add_explicit(&g_rs_b_passes, 1, memory_order_relaxed);
             break; }
+        case RS_QBAR: [e barrierAfterQueueStages:u[0] ? MTLStageVertex | MTLStageFragment : MTLStageAll beforeStages:u[0] == 1 ? MTLStageFragment : MTLStageVertex | MTLStageFragment visibilityOptions:MTL4VisibilityOptionDevice]; break;
         case RS_END:
             if (u[0] == 2) [e barrierAfterStages:MTLStageVertex | MTLStageFragment beforeQueueStages:MTLStageFragment | MTLStageBlit | MTLStageDispatch visibilityOptions:(MTL4VisibilityOptions)u[1]];   /* TOTK_BARRIER_NARROW: later vertex stages do not wait */
             else if (u[0]) [e barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:(MTL4VisibilityOptions)u[1]];
