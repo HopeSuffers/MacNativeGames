@@ -19,3 +19,10 @@ void nvn_dirty_stats(uint64_t *faults, uint64_t *preps);           // 累计：�
 void nvn_dirty_mp_stats(uint64_t *calls, uint64_t *pages, uint64_t *ns);   // 累计：本模块 mprotect 调用次数、覆盖页数、耗时 | Cumulative: this module's mprotect call count, pages covered, time spent
 void nvn_dirty_slot_stats(int *live, int *used_slots, uint64_t *adds_total); // 当前存活槽、槽表高水位、登记总次数 | Currently live slots, slot table high-water mark, total number of registrations
 int nvn_dirty_count_since(const void *addr, size_t len, uint64_t stamp, int *lo, int *hi);   // pages written after stamp, -1 untracked (diagnostic)
+/* TOTK_OVERLAP page holds (nvn_dirty.c): keep the CPU off [addr, addr+len) until the GPU has completed fence. prot is
+   PROT_READ (the GPU reads it: CPU writes wait) or PROT_NONE (the GPU writes it: every CPU access waits). 1 = held.
+   nvn_hold_end ends the holds of completed fences; done() (set once) reads the completed fence signal-safely. */
+void nvn_hold_set_done(uint64_t (*done)(void));
+int nvn_hold_begin(const void *addr, size_t len, uint64_t fence, int prot);
+void nvn_hold_end(uint64_t done);
+void nvn_hold_stats(uint64_t v[6]);   // holds, pages, CPU accesses that waited, of them timed out, host writes that waited, hold slots full

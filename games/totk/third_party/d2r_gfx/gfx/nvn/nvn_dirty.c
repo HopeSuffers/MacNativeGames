@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <mach/mach_time.h>
 #include <sched.h>
+#include <time.h>
 
 // 页状态与 mprotect 的次序（改保护的一方先把状态改成 BUSY，mprotect 落地后才改成终态；别的线程见 BUSY 就等）：
 //   设只读：NONE → BUSY → mprotect(只读) → PROT；解保护：PROT → BUSY → mprotect(可写) → NONE。
@@ -93,6 +94,143 @@ static range_t *find(uintptr_t a) {
     for (int i = 0; i < n; i++) if (atomic_load_explicit(&g_r[i].live, memory_order_acquire) && a >= g_r[i].base && a < g_r[i].end) { recent[next++ & 7] = &g_r[i]; return &g_r[i]; }
     return NULL;
 }
+static void on_fault_init(void);
+static int g_drec_on;   // tentative definition (DM_NVN_TILELOG ring below)
+static void dirty_init(void) {   // first pool registration or first hold: page size, time base, fault and host-write hooks
+    static int inited;
+    if (!inited) { inited = 1; g_pg = (uintptr_t)getpagesize(); g_shift = __builtin_ctzl(g_pg); mach_timebase_info(&g_tb); on_fault_init(); g_drec_on = getenv("DM_NVN_TILELOG") != NULL; }
+}
+
+/* ---------- TOTK_OVERLAP: page holds ----------
+   When the game's frame wait is released while the last command buffer of a frame still runs on the GPU (nvn_mtl.m,
+   TOTK_OVERLAP), the guest memory that command buffer still reads or writes is held from the CPU until the GPU is done:
+   PROT_READ over memory the GPU only reads (a CPU write waits), PROT_NONE over memory the GPU writes (any CPU access
+   waits). A guest access that faults on a held page waits in the fault handler for that frame (signal-safe: atomic loads,
+   mach_absolute_time and nanosleep; at most HOLD_WAIT_MS, then the hold is dropped so that a lock the waiter holds can
+   never deadlock it), ends the hold and runs again. A host write announced through dm_guest_write_prepare (system calls
+   into guest memory, which would fail with EFAULT instead of faulting) waits the same way first. Ending a hold puts every
+   page back to what the dirty tracker and the other live holds need; a tracker change on a held page is clamped again
+   (hold_clamp). Holds are set up and torn down under one spin flag (never taken by code that can fault on guest memory). */
+enum { MAX_HOLD = 512, HOLD_WAIT_MS = 250 };
+typedef struct { _Atomic uintptr_t lo, hi; _Atomic uint64_t fence, released; _Atomic int on, prot; } hold_t;   // on: 0 free, 1 held, 2 being released, 3 being set up
+static hold_t g_hold[MAX_HOLD];
+static _Atomic int g_hold_used, g_hold_live;   // slots ever used (scan bound); holds in state 1..3
+static _Atomic uint64_t g_hold_n, g_hold_pages, g_hold_faults, g_hold_timeouts, g_hold_host, g_hold_fail;
+static uint64_t (*volatile g_hold_done)(void);   // completed fence, read signal-safely (nvn_mtl.m)
+static atomic_flag g_hold_lk = ATOMIC_FLAG_INIT;
+static void hold_nap(void) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); }
+static uint64_t hold_ms_since(uint64_t t0) { return (mach_absolute_time() - t0) * g_tb.numer / g_tb.denom / 1000000ull; }
+static void hold_lock(void) { while (atomic_flag_test_and_set_explicit(&g_hold_lk, memory_order_acquire)) sched_yield(); }
+static void hold_unlock(void) { atomic_flag_clear_explicit(&g_hold_lk, memory_order_release); }
+/* What the dirty tracker wants for the page at a. A page the tracker is changing (BUSY) is not waited for: every tracker
+   change ends with hold_clamp after its final state is stored, and that clamp runs after this one (g_hold_lk). */
+static int track_prot(uintptr_t a) {
+    range_t *r = find(a); if (!r) return PROT_READ | PROT_WRITE;
+    return atomic_load(&r->state[(a - r->base) >> g_shift]) == PG_PROT ? PROT_READ : PROT_READ | PROT_WRITE;
+}
+static void hold_apply(uintptr_t lo, uintptr_t hi, const hold_t *skip) {   // under g_hold_lk: protections of [lo, hi), runs coalesced
+    short over[MAX_HOLD]; int k = 0, n = atomic_load(&g_hold_used);   // the live holds over [lo, hi) but skip
+    for (int i = 0; i < n; i++) {
+        hold_t *h = &g_hold[i]; int on = atomic_load(&h->on);
+        if (h != skip && (on == 1 || on == 3) && atomic_load(&h->lo) < hi && atomic_load(&h->hi) > lo) over[k++] = (short)i;
+    }
+    uintptr_t run = lo; int run_prot = -1;
+    for (uintptr_t a = lo; a <= hi; a += g_pg) {
+        int prot = -2;
+        if (a < hi) {
+            prot = track_prot(a);
+            for (int j = 0; j < k; j++) { hold_t *h = &g_hold[over[j]]; if (a >= atomic_load(&h->lo) && a < atomic_load(&h->hi)) prot &= atomic_load(&h->prot); }
+        }
+        if (prot != run_prot) { if (run_prot >= 0) mp(run, a - run, run_prot); run = a; run_prot = prot; }
+    }
+}
+static void hold_clamp(uintptr_t lo, uintptr_t hi) {   // the tracker just changed [lo, hi): live holds win again
+    if (!atomic_load_explicit(&g_hold_live, memory_order_acquire)) return;
+    hold_lock();
+    int n = atomic_load(&g_hold_used);
+    for (int i = 0; i < n; i++) {
+        hold_t *h = &g_hold[i]; int on = atomic_load(&h->on); if (on != 1 && on != 3) continue;
+        uintptr_t a = atomic_load(&h->lo), b = atomic_load(&h->hi); if (a < lo) a = lo; if (b > hi) b = hi;
+        if (a < b) hold_apply(a, b, NULL);
+    }
+    hold_unlock();
+}
+static void hold_release(hold_t *h) {
+    int on = 1;
+    if (!atomic_compare_exchange_strong(&h->on, &on, 2)) return;   // another thread releases it (or it is free)
+    hold_lock(); hold_apply(atomic_load(&h->lo), atomic_load(&h->hi), h); hold_unlock();
+    atomic_store(&h->released, mach_absolute_time());
+    atomic_store(&h->on, 0); atomic_fetch_sub(&g_hold_live, 1);
+}
+void nvn_hold_set_done(uint64_t (*done)(void)) { g_hold_done = done; }
+int nvn_hold_begin(const void *addr, size_t len, uint64_t fence, int prot) {
+    if (!len) return 1;
+    dirty_init();
+    uintptr_t lo = (uintptr_t)addr & ~(g_pg - 1), hi = ((uintptr_t)addr + len + g_pg - 1) & ~(g_pg - 1);
+    for (int i = 0; i < MAX_HOLD; i++) {
+        hold_t *h = &g_hold[i]; int z = 0;
+        if (!atomic_compare_exchange_strong(&h->on, &z, 3)) continue;   // 3: being set up (a fault in it waits and retries)
+        atomic_store(&h->lo, lo); atomic_store(&h->hi, hi); atomic_store(&h->fence, fence); atomic_store(&h->prot, prot); atomic_store(&h->released, 0);
+        { int u = atomic_load(&g_hold_used); while (u < i + 1 && !atomic_compare_exchange_weak(&g_hold_used, &u, i + 1)) {} }
+        atomic_fetch_add(&g_hold_live, 1);
+        hold_lock(); hold_apply(lo, hi, NULL); hold_unlock();
+        atomic_store(&h->on, 1);
+        atomic_fetch_add(&g_hold_n, 1); atomic_fetch_add(&g_hold_pages, (hi - lo) >> g_shift);
+        uint64_t (*done)(void) = g_hold_done;
+        if (done && done() >= fence) hold_release(h);   // the GPU finished meanwhile (its nvn_hold_end may have run before this hold)
+        return 1;
+    }
+    atomic_fetch_add(&g_hold_fail, 1);
+    return 0;
+}
+void nvn_hold_end(uint64_t done) {   // the GPU completed up to done: end every hold of those frames
+    if (!atomic_load_explicit(&g_hold_live, memory_order_acquire)) return;
+    int n = atomic_load(&g_hold_used);
+    for (int i = 0; i < n; i++) if (atomic_load(&g_hold[i].on) == 1 && atomic_load(&g_hold[i].fence) <= done) hold_release(&g_hold[i]);
+}
+void nvn_hold_stats(uint64_t v[6]) {
+    v[0] = atomic_load(&g_hold_n); v[1] = atomic_load(&g_hold_pages); v[2] = atomic_load(&g_hold_faults);
+    v[3] = atomic_load(&g_hold_timeouts); v[4] = atomic_load(&g_hold_host); v[5] = atomic_load(&g_hold_fail);
+}
+/* A CPU access faulted at a: 1 = it concerned a hold (waited for the GPU and ended it, or the hold was changing): run the
+   access again. 2 = only a hold that ended within the last second covers it (the access may have faulted just before):
+   the tracker looks at it, and if it is not the tracker's either it is run again. */
+static int hold_fault(uintptr_t a, int is_write) {
+    int n = atomic_load(&g_hold_used), hit = 0;
+    for (int i = 0; i < n; i++) {
+        hold_t *h = &g_hold[i];
+        if (a < atomic_load(&h->lo) || a >= atomic_load(&h->hi)) continue;
+        int on = atomic_load(&h->on);
+        if (on == 3 || on == 2) { while ((on = atomic_load(&h->on)) == 3 || on == 2) hold_nap(); return 1; }
+        if (on == 0) { uint64_t r = atomic_load(&h->released); if (r && hold_ms_since(r) < 1000) hit = 2; continue; }
+        if (!is_write && atomic_load(&h->prot) != PROT_NONE) continue;   // this hold lets the CPU read: another one faulted it
+        atomic_fetch_add(&g_hold_faults, 1);
+        uint64_t f = atomic_load(&h->fence), t0 = mach_absolute_time();
+        uint64_t (*done)(void) = g_hold_done;
+        while (atomic_load(&h->on) == 1 && done && done() < f) {
+            if (hold_ms_since(t0) > HOLD_WAIT_MS) { atomic_fetch_add(&g_hold_timeouts, 1); break; }
+            hold_nap();
+        }
+        hold_release(h);
+        while (atomic_load(&h->on) == 2) hold_nap();   // another releaser restores the pages
+        return 1;
+    }
+    return hit;
+}
+static void hold_wait_host(uintptr_t a, uintptr_t e) {   // a host write into [a, e) follows: holds over it end first (not a signal handler)
+    int n = atomic_load(&g_hold_used);
+    for (int i = 0; i < n; i++) {
+        hold_t *h = &g_hold[i]; int on;
+        if (e <= atomic_load(&h->lo) || a >= atomic_load(&h->hi)) continue;
+        while ((on = atomic_load(&h->on)) == 3 || on == 2) hold_nap();
+        if (on != 1) continue;
+        atomic_fetch_add(&g_hold_host, 1);
+        uint64_t f = atomic_load(&h->fence), t0 = mach_absolute_time(); uint64_t (*done)(void) = g_hold_done;
+        while (atomic_load(&h->on) == 1 && done && done() < f && hold_ms_since(t0) < 2000) hold_nap();
+        hold_release(h);
+        while (atomic_load(&h->on) == 2) hold_nap();
+    }
+}
 /* TOTK diagnostic (on with DM_NVN_TILELOG): a ring of the latest page unprotections with the writer, read by
    nvn_dirty_recent: game writes (fault: pc / lr of the faulting code) and host writes (dm_guest_write_prepare caller). */
 #include <sys/ucontext.h>
@@ -117,21 +255,25 @@ static void unprotect_page(range_t *r, uintptr_t p) {   // 调用方已把状态
        is writable from here on, so without a newer "now" every later write went unseen until something else faulted. */
     atomic_fetch_add(&g_now, 1);
     atomic_store(&r->state[p], PG_NONE);
+    hold_clamp(r->base + (p << g_shift), r->base + ((p + 1) << g_shift));   // TOTK_OVERLAP: a live hold over this page wins
 }
 static int on_fault(void *addr, int is_write, void *uc) {
+    int held = atomic_load_explicit(&g_hold_used, memory_order_relaxed) ? hold_fault((uintptr_t)addr, is_write) : 0;   // TOTK_OVERLAP: a held page
+    if (held == 1) return 1;
     (void)uc;
     range_t *r = is_write ? find((uintptr_t)addr) : NULL;
-    if (!r) return 0;
+    if (!r) return held == 2;
     uintptr_t p = ((uintptr_t)addr - r->base) >> g_shift;
     uint8_t st = PG_PROT;
     if (atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY)) { unprotect_page(r, p); atomic_fetch_add(&g_faults, 1);
         if (g_drec_on && uc) { _STRUCT_MCONTEXT64 *mc = ((ucontext_t *)uc)->uc_mcontext; drec_add(r->base + (p << g_shift), mc->__ss.__pc, mc->__ss.__lr, 0); }
         return 1; }
     if (st == PG_BUSY) return busy_wait(r, p);   // 别的线程正在改这页的保护：等它改完重执行（改成了只读就再缺页一次、走上面那一支） | Another thread is changing this page's protection: wait for it to finish and re-execute (if it became read-only, it faults once more and takes the branch above)
-    return atomic_load(&r->gen[p]) != 0;   // 刚被别的线程解掉（本次缺页发生在解之前）：重执行；从未保护过的页不是我们的 | Just unprotected by another thread (this fault happened before the unprotect): re-execute; pages that were never protected are not ours
+    return atomic_load(&r->gen[p]) != 0 || held == 2;   // 刚被别的线程解掉（本次缺页发生在解之前）：重执行；从未保护过的页不是我们的 | Just unprotected by another thread (this fault happened before the unprotect): re-execute; pages that were never protected are not ours
 }
 static void prep_write(void *addr, size_t len) {
     uintptr_t a = (uintptr_t)addr, e = a + len;
+    if (len && atomic_load_explicit(&g_hold_live, memory_order_acquire)) hold_wait_host(a & ~(g_pg - 1), e);   // TOTK_OVERLAP
     while (len && a < e) {
         range_t *r = find(a);
         if (!r) { a = (a + g_pg) & ~(g_pg - 1); continue; }
@@ -144,6 +286,7 @@ static void prep_write(void *addr, size_t len) {
         a = stop;
     }
 }
+static void on_fault_init(void) { dm_fault_hook_register(on_fault); dm_guest_write_prep_register(prep_write); }
 
 /* Writes on behalf of the GPU (a rendering written back into CPU-visible memory): the bytes change without counting as
    a CPU write. Protected pages are taken to BUSY (a guest write meanwhile waits in the fault handler, then faults again
@@ -162,19 +305,19 @@ void *nvn_dirty_gpu_write_begin(void *addr, size_t len) {
             if (atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY)) { mp(r->base + (p << g_shift), g_pg, PROT_READ | PROT_WRITE); was[p - p0] = 1; break; }
             if (st != PG_BUSY || !busy_wait(r, p)) break; }
     }
-    return t;
+    return t;   // (TOTK_OVERLAP: the pages stay BUSY until nvn_dirty_gpu_write_end, which clamps the live holds again)
 }
 void nvn_dirty_gpu_write_end(void *tok) {
     gpu_write_tok *t = tok; if (!t) return;
     for (uintptr_t p = t->p0; p <= t->p1; p++) if (t->was[p - t->p0]) { mp(t->r->base + (p << g_shift), g_pg, PROT_READ); atomic_store(&t->r->state[p], PG_PROT); }
+    hold_clamp(t->r->base + (t->p0 << g_shift), t->r->base + ((t->p1 + 1) << g_shift));
     free(t->was); free(t);
 }
 #endif
 
 #if !defined(GAME_BOTW)
 void nvn_dirty_add_range(const void *mem, size_t size) {
-    static int inited;
-    if (!inited) { inited = 1; g_pg = (uintptr_t)getpagesize(); g_shift = __builtin_ctzl(g_pg); mach_timebase_info(&g_tb); dm_fault_hook_register(on_fault); dm_guest_write_prep_register(prep_write); g_drec_on = getenv("DM_NVN_TILELOG") != NULL; }
+    dirty_init();
     atomic_fetch_add(&g_adds_total, 1);
     pthread_mutex_lock(&g_slot_mu);
     int n = atomic_load(&g_nr);
@@ -251,7 +394,8 @@ void nvn_dirty_protect(const void *addr, size_t len) {
         uint8_t st = PG_NONE;
         int took = i <= q && atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY);
         if (took && !open) { run = i; open = 1; }
-        if (!took && open) { mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ); for (uintptr_t k = run; k < i; k++) atomic_store(&r->state[k], PG_PROT); open = 0; }
+        if (!took && open) { mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ); for (uintptr_t k = run; k < i; k++) atomic_store(&r->state[k], PG_PROT); open = 0;
+                             hold_clamp(r->base + (run << g_shift), r->base + (i << g_shift)); }   // TOTK_OVERLAP: a live hold over these pages wins
         if (!took && st == PG_BUSY && busy_wait(r, i)) i--;   // this page again
     }
 }
@@ -294,8 +438,7 @@ static void ov_log(const char *what, _Atomic uint64_t *c, const void *mem, size_
     if (k <= 3 || !(k & (k - 1))) LOG("脏页跟踪：池 %p+%#zx 与已跟踪区间重叠，%s（累计 %llu 次）", mem, size, what, (unsigned long long)k);
 }
 void nvn_dirty_add_range(const void *mem, size_t size) {
-    static int inited;
-    if (!inited) { inited = 1; g_pg = (uintptr_t)getpagesize(); g_shift = __builtin_ctzl(g_pg); mach_timebase_info(&g_tb); dm_fault_hook_register(on_fault); dm_guest_write_prep_register(prep_write); g_drec_on = getenv("DM_NVN_TILELOG") != NULL; }
+    dirty_init();
     atomic_fetch_add(&g_adds_total, 1);
     pthread_mutex_lock(&g_slot_mu);
     int n = atomic_load(&g_nr);
@@ -368,6 +511,7 @@ static void protect_seg(range_t *r, uintptr_t a, uintptr_t e) {
             int keep = !atomic_load(dying);
             if (keep) mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ);
             for (uintptr_t k = run; k < i; k++) atomic_store(&r->state[k], keep ? PG_PROT : PG_NONE);
+            hold_clamp(r->base + (run << g_shift), r->base + (i << g_shift));   // TOTK_OVERLAP: a live hold over these pages wins
             open = 0; }
         if (!took && st == PG_BUSY && busy_wait(r, i)) i--;   // this page again
     }

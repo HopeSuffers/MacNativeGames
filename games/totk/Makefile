@@ -314,6 +314,14 @@ probe-dirty-race:
 	xcrun clang -std=gnu11 -O1 -Wall -Wextra -Werror -Wno-unused-function -Ithird_party/d2r_gfx/gfx/nvn tests/dirty_race/probe.c -o build/dirty-race-probe
 	build/dirty-race-probe | tee analysis/dirty-race-probe.log
 
+.PHONY: probe-overlap-hold
+# CPU only: TOTK_OVERLAP page holds (nvn_dirty.c): accesses wait for a fake fence, tracker state restored, with a negative control.
+probe-overlap-hold:
+	@mkdir -p build analysis
+	xcrun clang -std=gnu11 -O1 -Wall -Wextra -Werror -Wno-unused-function -Ithird_party/d2r_gfx/gfx/nvn tests/overlap_hold/probe.c -o build/overlap-hold-probe
+	build/overlap-hold-probe | tee analysis/overlap-hold-probe.log
+	TOTK_PROBE_NEGATIVE=1 build/overlap-hold-probe | tee -a analysis/overlap-hold-probe.log
+
 .PHONY: probe-pool-index
 # CPU only: memory pool address index vs the old linear scan, with two negative controls and a timing line.
 probe-pool-index:
