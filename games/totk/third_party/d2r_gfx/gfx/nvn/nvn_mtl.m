@@ -2535,6 +2535,7 @@ static void pkg_owned_locked(uint64_t k) {
 typedef struct { tex_t t; uint64_t stamp; void *obj; uint8_t *snap; uint32_t snap_n; BOTW_WB_ENT_FIELDS } wb_ent;   // snap: the texture's own bytes when the rendering was noted (small targets only)
 static nvn_hmap g_wb = {.klen = 8};   // serial -> wb_ent * (g_smu): rendered since the last write-back
 static _Atomic int g_wb_on = 1;
+static _Atomic int g_wb_eager_small;   // diagnostic, see mtl_wb_eager
 /* TOTK: fill the driver segment c0 for vertex and compute shaders (thread-group counts, uniform / storage address tables,
    point size limit; see drv_scan). TOTK_DRV_FILL=0 or "flag drvfill 0" gives them the old all-zero segment (A/B only). */
 static _Atomic int g_drvfill_on = -1;
@@ -2625,6 +2626,7 @@ void dm_gfx_set_flag(const char *name, int v) {
     }
     if (!strcmp(name, "drv_cache")) { driver_cache_set(v); return; }
     if (!strcmp(name, "drv_cache_check")) { driver_cache_check_set(v); return; }
+    if (!strcmp(name, "wb_eager_small")) { atomic_store(&g_wb_eager_small, v != 0); MLOG("[flag] wb_eager_small = %d (diagnostic)", v != 0); return; }
     if (!strcmp(name, "writeback")) { atomic_store(&g_wb_on, v); MLOG("[flag] writeback = %d", v); return; }
     if (!strcmp(name, "deferred")) { extern void nvn_set_deferred_binds(int on); nvn_set_deferred_binds(v); return; }
     if (!strcmp(name, "framewait")) { extern void nvn_set_framewait(int on); nvn_set_framewait(v); return; }
@@ -2701,13 +2703,36 @@ static void wb_write_list(wb_ent **list, int nl, int force);
 /* Diagnostic TOTK_WB_EAGER=<w>x<h>: at every present, renderings of mirrored textures of that size are written back to
    memory without waiting for the game's invalidate (to see whether the CPU reads them from an uncached pool). */
 void mtl_wb_eager(void) {
-    static int on = -1; static unsigned w, h; if (on < 0) { const char *e = getenv("TOTK_WB_EAGER"); on = e && sscanf(e, "%ux%u", &w, &h) == 2; if (on) MLOG("TOTK_WB_EAGER: %ux%u renderings written back every frame", w, h); }
-    if (!on || !atomic_load(&g_wb_on)) return;
+    /* TOTK_WB_EAGER=all (2026-10-20, diagnostic): every rendering of a CPU-visible texture, at every present. Tests the
+       neo-citron finding: TotK's background memory relocation copies textures the GPU wrote without invalidating them,
+       so a native guest copies stale bytes and the game falls back to its far grass (Great Sky Island, ~30 s in). */
+    static int on = -1, all = 0; static unsigned w, h;
+    int small = atomic_load(&g_wb_eager_small);   // "flag wb_eager_small 1": renderings up to 2 MB, switched on in game
+    if (on < 0) { const char *e = getenv("TOTK_WB_EAGER"); all = e && !strcmp(e, "all"); on = all || (e && sscanf(e, "%ux%u", &w, &h) == 2);
+                  if (all) MLOG("TOTK_WB_EAGER: every CPU-visible rendering written back every frame");
+                  else if (on) MLOG("TOTK_WB_EAGER: %ux%u renderings written back every frame", w, h); }
+    /* TOTK_WB_LIST=1 (diagnostic): every 600 presents, the CPU-visible renderings not yet written back, by size and
+       format, to choose a TOTK_WB_EAGER=<w>x<h> */
+    { static int list_on = -1; static unsigned n;
+      if (list_on < 0) list_on = getenv("TOTK_WB_LIST") != NULL;
+      if (list_on && ++n % 600 == 0) {
+          struct { uint32_t w, h, f, c; uint64_t bytes; } k[64]; int nk = 0;
+          pthread_mutex_lock(&g_smu);
+          for (uint32_t i = 0; i < g_wb.cap; i++) {
+              wb_ent *e = g_wb.vals ? g_wb.vals[i] : NULL; if (!e) continue;
+              int j = 0; while (j < nk && (k[j].w != e->t.d.width || k[j].h != e->t.d.height || k[j].f != (uint32_t)e->t.d.format)) j++;
+              if (j == nk) { if (nk == 64) continue; k[nk++] = (typeof(k[0])){e->t.d.width, e->t.d.height, (uint32_t)e->t.d.format, 0, 0}; }
+              k[j].c++; k[j].bytes += e->t.L.size;
+          }
+          pthread_mutex_unlock(&g_smu);
+          for (int j = 0; j < nk; j++) MLOG("[wb-list] present %u: %ux%u nvnfmt=%#x x%u (%llu KB) rendered, not written back", n, k[j].w, k[j].h, k[j].f, k[j].c, (unsigned long long)(k[j].bytes >> 10));
+      } }
+    if ((!on && !small) || !atomic_load(&g_wb_on)) return;
     pthread_mutex_lock(&g_smu);
     wb_ent *list[512]; int nl = 0;
     for (uint32_t i = 0; i < g_wb.cap && nl < 512 && g_wb.n; i++) {
         wb_ent *e = g_wb.vals ? g_wb.vals[i] : NULL;
-        if (!e || e->t.d.width != w || e->t.d.height != h) continue;
+        if (!e || (!all && !(small && e->t.L.size <= (2u << 20)) && (!on || e->t.d.width != w || e->t.d.height != h))) continue;
         uint64_t k = e->t.serial; nvn_hm_del(&g_wb, &k); list[nl++] = e; i = (uint32_t)-1;
     }
     pthread_mutex_unlock(&g_smu);
