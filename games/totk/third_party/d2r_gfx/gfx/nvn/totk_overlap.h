@@ -6,7 +6,7 @@
    submit call, first chunk translated: ~2.2 ms a frame at Lookout Landing, plus ~1.8 ms of translation starvation later).
    Here the wait for a submission's fence is satisfied once every command buffer of it but the last ("the tail") has
    completed and the tail is committed (g_early_done); everything the CPU could see differently is made to look as if
-   the submission had completed:
+   the submission had completed (TOTK_OVERLAP=2 is a control: all of the below except the early release itself):
    - CPU-visible results posted by the submission (event signals, counter reports, occlusion query sums) are written at
      the release, and the replay's pending-counter records of the fence are retired then (cond_eval reads memory). A
      query reported inside the tail cannot be known yet: such a submission is not released early.
@@ -33,7 +33,7 @@
 #define OVL_SNAPS 8
 #define OVL_SNAP_MAX (64u << 10)
 #define OVL_RING 4
-static int g_ovl_tail, g_ovl_hold = 1, g_ovl_snap = 1, g_ovl_gate = 1, g_ovl_log;
+static int g_ovl_tail, g_ovl_hold = 1, g_ovl_snap = 1, g_ovl_gate = 1, g_ovl_log, g_snap_log;
 typedef struct { uint64_t lo, hi; int prot; } ovl_rng;
 /* The command buffer being recorded (reset at each mid-submission commit: at the commit of the submission it is the tail). */
 static struct {
@@ -57,14 +57,16 @@ static uint64_t ovl_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); 
 
 static void ovl_init(void) {   // replay thread, first submission
     if (g_ovl >= 0) return;
-    const char *e = getenv("TOTK_OVERLAP"); g_ovl = e && atoi(e) > 0;
-    if (!g_ovl) return;
+    const char *e = getenv("TOTK_OVERLAP"); g_ovl = e ? atoi(e) : 0;
+    if (g_ovl != 1 && g_ovl != 2) { g_ovl = 0; return; }
     e = getenv("TOTK_OVERLAP_TAIL"); g_ovl_tail = e ? atoi(e) : 0;
     e = getenv("TOTK_OVERLAP_HOLD"); g_ovl_hold = !(e && !strcmp(e, "0"));
     e = getenv("TOTK_OVERLAP_SNAP"); g_ovl_snap = !(e && !strcmp(e, "0"));
     e = getenv("TOTK_OVERLAP_GATE"); g_ovl_gate = !(e && !strcmp(e, "0"));
     e = getenv("TOTK_OVERLAP_LOG"); g_ovl_log = e && atoi(e) > 0 ? 40 : 0;
+    e = getenv("TOTK_OVERLAP_SNAP_LOG"); g_snap_log = e && atoi(e) > 0;
     nvn_hold_set_done(mtl_done_now);
+    if (g_ovl == 2) MLOG("TOTK_OVERLAP=2 (control): snapshots and bookkeeping as with 1, but no frame wait ends early");
     MLOG("TOTK_OVERLAP: frame waits end when only the last command buffer of a submission still runs (tail %s%s, holds %s, snapshots %s, gate %s; chunks %s)",
          g_ovl_tail > 0 ? "= last " : "= last ordinary chunk", g_ovl_tail > 0 ? [NSString stringWithFormat:@"%d draws", g_ovl_tail].UTF8String : "",
          g_ovl_hold ? "on" : "OFF (unsafe)", g_ovl_snap ? "on" : "off", g_ovl_gate ? "on" : "off", g_chunk_size ? "on" : "OFF: nothing is released early");
@@ -156,7 +158,8 @@ static int ovl_prepare(uint64_t fence, post_op *ops, int n, uint64_t gpu_f) {
     int why = 0; ovl_rng *h = NULL; int nh = 0;
     g_ovs_stat.subs++;
     ovl_pred_put(g_ot.key, g_stat_draw - g_ot.draws0);
-    if (!g_sub_chunks) why = 1;   // not split: nothing completes before the end
+    if (g_ovl == 2) why = 4;   // control mode: never released early
+    else if (!g_sub_chunks) why = 1;   // not split: nothing completes before the end
     else {
         g_ovs_stat.tail_draws += g_stat_draw - g_chunk_mark; g_ovs_stat.tail_n++;
         for (int i = g_ot.npost0; i < n; i++) if (ops[i].kind == 3) { why = 2; break; }   // an occlusion query in the tail
@@ -376,6 +379,11 @@ void mtl_overlap_publish(void) {
         }
         nvn_dirty_gpu_write_end(tok);
         s->pub_fence = s->s_fence[k]; g_ovs_stat.snap_pub++;
+        if (g_snap_log && g_ovs_stat.snap_pub % 60 == 1) {   // TOTK_OVERLAP_SNAP_LOG=1: what the game is handed (depth statistics: words 7300-7307 = bytes 0x7210..)
+            size_t at = len >= 0x72a0 ? 0x7210 : 0; const float *f = (const float *)((const uint8_t *)src + at); const uint32_t *u = (const uint32_t *)((const uint8_t *)src + at);
+            MLOG("[overlap] snapshot %#llx published fence %llu (completed %llu): +%#zx = %g %g %g %g %g %g %g %g (%08x %08x)%s", (unsigned long long)s->lo, (unsigned long long)s->pub_fence, (unsigned long long)done, at,
+                 f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], u[0], u[1], len >= 0x7268 ? [NSString stringWithFormat:@"; flag byte +0x7264 = %#x", ((const uint8_t *)src)[0x7264]].UTF8String : "");
+        }
     }
     os_unfair_lock_unlock(&g_snap_lk);
 }
@@ -396,9 +404,9 @@ static void ovl_sub_begin(void) {   // end of mtl_sub_begin
 static void ovl_stats_line(void) {
     if (g_ovs_stat.subs % 600) return;
     uint64_t hv[6]; nvn_hold_stats(hv);
-    MLOG("[overlap] %llu submissions: %llu released early (eligible %llu; not: unsplit %llu, query in the tail %llu, too many hold ranges %llu; hold slots full %llu); tail %.1f draws, released %.2f ms (max %.2f) before completion; gate waits %llu, %.3f ms avg",
+    MLOG("[overlap] %llu submissions: %llu released early (eligible %llu; not: unsplit %llu, query in the tail %llu, too many hold ranges %llu, control mode %llu; hold slots full %llu); tail %.1f draws, released %.2f ms (max %.2f) before completion; gate waits %llu, %.3f ms avg",
          (unsigned long long)g_ovs_stat.subs, (unsigned long long)g_ovs_stat.released, (unsigned long long)g_ovs_stat.eligible, (unsigned long long)g_ovs_stat.why[1], (unsigned long long)g_ovs_stat.why[2],
-         (unsigned long long)g_ovs_stat.why[3], (unsigned long long)g_ovs_stat.hold_fail, g_ovs_stat.tail_n ? (double)g_ovs_stat.tail_draws / (double)g_ovs_stat.tail_n : 0.0,
+         (unsigned long long)g_ovs_stat.why[3], (unsigned long long)g_ovs_stat.why[4], (unsigned long long)g_ovs_stat.hold_fail, g_ovs_stat.tail_n ? (double)g_ovs_stat.tail_draws / (double)g_ovs_stat.tail_n : 0.0,
          g_ovs_stat.lead_n ? (double)g_ovs_stat.lead_ns / (double)g_ovs_stat.lead_n / 1e6 : 0.0, g_ovs_stat.lead_max / 1e6,
          (unsigned long long)g_ovs_stat.gate_n, g_ovs_stat.gate_n ? (double)g_ovs_stat.gate_ns / (double)g_ovs_stat.gate_n / 1e6 : 0.0);
     MLOG("[overlap] holds %llu (%.1f ranges per release, %llu pages), CPU accesses that waited %llu (timed out %llu), host writes that waited %llu; snapshots active %d (activated %llu), published %llu, CPU merges %llu, conflicts %llu, ring full %llu, GPU bindings redirected %llu",
