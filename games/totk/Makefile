@@ -321,6 +321,14 @@ probe-pool-index:
 	xcrun clang -std=c11 -O2 -Wall -Wextra -Werror -Ithird_party/d2r_gfx/gfx/nvn tests/pool_index/probe.c -o build/pool-index-probe
 	build/pool-index-probe | tee analysis/pool-index-probe.log
 
+.PHONY: probe-gamehot
+# CPU only: TOTK_GAMEHOT's host RSDB row lookup against the game's own query executor (main+0x7f3688 of the 1.2.1 main.elf,
+# mapped executable), the patched entry included, with a negative control and a cost line.
+probe-gamehot:
+	@mkdir -p build analysis
+	xcrun clang -std=gnu11 -O2 -g -Wall -Wextra -Werror tests/gamehot/probe.c -o build/gamehot-probe
+	build/gamehot-probe extracted/v121/elf/main.elf | tee analysis/gamehot-probe.log
+
 .PHONY: probe-reverb
 # Reference binaries are local tools, not part of the shipped runtime.
 probe-reverb:

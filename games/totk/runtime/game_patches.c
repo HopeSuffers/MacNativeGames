@@ -2,6 +2,9 @@
 #include "aspect_patch.h"
 #include "game_version.h"
 #include "world_survey.h"
+#if defined(TOTK_GAME_V121)
+#include "gamehot_patch.h"
+#endif
 #include <TargetConditionals.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -674,6 +677,7 @@ void runtime_game_patches(Module *m) {
       aspect_install(m, "1.2.1", sites, 4, 2, (m->text_end + 15) & ~15ULL, 0,   /* no free padding for Vert+ stubs */
                      (m->file_size + 0x3fff) & ~0x3fffULL); }
     patch_bench_cam(m);
+    gamehot_install(m, 0x7f3688, 0xd10203ff);   /* RSDB query executor: sub sp, sp, #0x80 (gamehot_patch.h) */
 #else
     if (aspect_requested()) runtime_fail("TOTK_ASPECT: only 1.2.1 and 1.4.3 so far");
 #endif
