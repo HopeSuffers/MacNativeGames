@@ -98,6 +98,27 @@ static int busy_wait(range_t *r, uintptr_t p) {
     }
     return 1;
 }
+/* Sorted index of the live ranges (by base), rebuilt under g_slot_mu whenever a range goes live or dies, published by
+   pointer; a lookup that misses the per-thread caches is a binary search instead of a scan of the ~4,000 live ranges
+   (2026-10-23: the deeper frame wait looked up many pages and untracked addresses: find was 34% of the translate thread).
+   An old index is freed 16 rebuilds later (a reader in a signal handler holds it for a few instructions). */
+typedef struct { int n; uintptr_t *base; range_t **r; } rindex_t;
+static rindex_t *_Atomic g_rix; static rindex_t *g_rix_old[16]; static unsigned g_rix_oi; static _Atomic uint64_t g_rgen;
+static int rix_cmp(const void *x, const void *y) { const range_t *a = *(range_t *const *)x, *b = *(range_t *const *)y; return a->base < b->base ? -1 : a->base > b->base; }
+static void rindex_rebuild(void) {   // under g_slot_mu
+    int n = atomic_load(&g_nr), k = 0;
+    rindex_t *x = malloc(sizeof *x); range_t **r = malloc(sizeof *r * (size_t)(n ? n : 1)); uintptr_t *b = malloc(sizeof *b * (size_t)(n ? n : 1));
+    if (!x || !r || !b) { free(x); free(r); free(b); atomic_store(&g_rix, NULL); atomic_fetch_add(&g_rgen, 1); return; }   // lookups scan
+    for (int i = 0; i < n; i++) if (atomic_load_explicit(&g_r[i].live, memory_order_acquire)) r[k++] = &g_r[i];
+    qsort(r, (size_t)k, sizeof *r, rix_cmp);
+    for (int i = 0; i < k; i++) b[i] = r[i]->base;
+    x->n = k; x->base = b; x->r = r;
+    rindex_t *old = atomic_exchange(&g_rix, x);
+    unsigned slot = g_rix_oi++ % 16; rindex_t *gone = g_rix_old[slot]; g_rix_old[slot] = old;
+    if (gone) { free(gone->base); free(gone->r); free(gone); }
+    atomic_fetch_add(&g_rgen, 1);
+}
+uint64_t nvn_dirty_range_gen(void) { return atomic_load(&g_rgen); }
 static range_t *find(uintptr_t a) {
     /* TOTK: the replay asks about the same few pools over and over; the last hits per thread (8, round robin) are checked
        first (a slot reused for another pool fails the bounds or live test and falls through to the scan), so the scan over
@@ -114,6 +135,16 @@ static range_t *find(uintptr_t a) {
         range_t *l = hashed[h];
         if (l && atomic_load_explicit(&l->live, memory_order_acquire) && a >= l->base && a < l->end) { recent[next++ & 7] = l; atomic_fetch_add_explicit(&g_find_hash_hits, 1, memory_order_relaxed); return l; }
         atomic_fetch_add_explicit(&g_find_scans, 1, memory_order_relaxed);
+    }
+    rindex_t *x = atomic_load_explicit(&g_rix, memory_order_acquire);
+    if (x && g_dirty_fast) {   // the last range starting at or below a
+        int lo = 0, hi = x->n;
+        while (lo < hi) { int m = (lo + hi) / 2; if (x->base[m] <= a) lo = m + 1; else hi = m; }
+        for (int i = lo - 1; i >= 0 && i >= lo - 2; i--) {   // (a range rebuilt in place may sit one entry off)
+            range_t *l = x->r[i];
+            if (atomic_load_explicit(&l->live, memory_order_acquire) && a >= l->base && a < l->end) { recent[next++ & 7] = l; hashed[h] = l; return l; }
+        }
+        if (atomic_load(&g_rix) == x) return NULL;   // not in a live range (the index did not change meanwhile)
     }
     int n = atomic_load(&g_nr);
     for (int i = 0; i < n; i++) if (atomic_load_explicit(&g_r[i].live, memory_order_acquire) && a >= g_r[i].base && a < g_r[i].end) { recent[next++ & 7] = &g_r[i]; if (g_dirty_fast) hashed[h] = &g_r[i]; return &g_r[i]; }
@@ -314,7 +345,7 @@ int nvn_pl_gpu_written(const void *addr, size_t len, uint64_t done) {
     if (g_pl_mode <= 0 || !len) return 0;
     uintptr_t a = (uintptr_t)addr, e = a + len;
     while (a < e) {
-        range_t *r = find(a); if (!r || !r->pl_wf) { a = (a + g_pg) & ~(g_pg - 1); continue; }
+        range_t *r = find(a); if (!r || !r->pl_wf) return 0;   // untracked from here on: no GPU write is known there
         uintptr_t stop = e < r->end ? e : r->end;
         for (uintptr_t p = (a - r->base) >> g_shift, q = (stop - 1 - r->base) >> g_shift; p <= q;) {
             uintptr_t last = ((p >> BLK_SHIFT) << BLK_SHIFT) + BLK_PAGES - 1; if (last > q) last = q;
@@ -342,7 +373,7 @@ void nvn_pl_publish(uint64_t fence, const uintptr_t *lo, const uintptr_t *hi, in
 }
 static void pl_protect_run(uintptr_t a, uintptr_t e, int *k) {   // protect the pages of [a, e) the tracker has writable
     while (a < e) {
-        range_t *r = find(a); if (!r) { a = (a + g_pg) & ~(g_pg - 1); continue; }
+        range_t *r = find(a); if (!r) return;   // untracked from here on: nothing to protect
         uintptr_t stop = e < r->end ? e : r->end, run = 0; int open = 0;
         for (uintptr_t p = (a - r->base) >> g_shift, q = (stop - 1 - r->base) >> g_shift; p <= q + 1; p++) {
             int none = p <= q && atomic_load(&r->state[p]) == PG_NONE && !(g_pl_passkeep && r->pl_psk && p < r->pl_cap && atomic_load(&r->pl_psk[p]) > atomic_load(&g_pl_frame));
@@ -567,6 +598,7 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     pl_arrays(r, np);
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
+    rindex_rebuild();
     pthread_mutex_unlock(&g_slot_mu);
 }
 // 池销毁：先把仍受保护的页还原成可写（池内存归还游戏后可能另作他用），再标失效
@@ -574,7 +606,7 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
 void nvn_dirty_remove_range(const void *mem) {
     pthread_mutex_lock(&g_slot_mu);
     range_t *r = find((uintptr_t)mem);
-    if (r) { prep_write((void *)r->base, r->end - r->base); atomic_store_explicit(&r->live, 0, memory_order_release); atomic_fetch_sub(&g_live, 1); }
+    if (r) { prep_write((void *)r->base, r->end - r->base); atomic_store_explicit(&r->live, 0, memory_order_release); atomic_fetch_sub(&g_live, 1); rindex_rebuild(); }
     pthread_mutex_unlock(&g_slot_mu);
 }
 int nvn_dirty_tracked(const void *addr, size_t len) {
@@ -635,6 +667,7 @@ static void range_put(int slot, int n, uintptr_t base, uintptr_t end, const void
     g_rmem[slot] = (uintptr_t)mem; atomic_store(&g_rdying[slot], 0);
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
+    rindex_rebuild();
 }
 static void ov_log(const char *what, _Atomic uint64_t *c, const void *mem, size_t size) {
     uint64_t k = atomic_fetch_add(c, 1) + 1;
@@ -687,7 +720,7 @@ void nvn_dirty_remove_range(const void *mem) {
         range_t *r = &g_r[i];
         if (!atomic_load_explicit(&r->live, memory_order_acquire) || g_rmem[i] != (uintptr_t)mem) continue;
         atomic_store(&g_rdying[i], 1);   // before the unprotect: see protect_seg
-        prep_write((void *)r->base, r->end - r->base); atomic_store_explicit(&r->live, 0, memory_order_release); atomic_fetch_sub(&g_live, 1); found++;
+        prep_write((void *)r->base, r->end - r->base); atomic_store_explicit(&r->live, 0, memory_order_release); atomic_fetch_sub(&g_live, 1); found++; rindex_rebuild();
     }
     /* "now" moves on: a texture of a neighbour pool that crossed into the removed range is untracked from here on, and the
        replay's shortcut (nothing written since the last look = clean, nvn_mtl.m) must look again */
