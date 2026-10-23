@@ -2376,10 +2376,23 @@ static uint64_t g_treg_same, g_treg_changed;   // TOTK: identical / changed text
    the slow path (about 13% of the replay). Written under g_smu before the generation is published. */
 #define SER_CHG_N 1024
 static _Atomic uint64_t g_ser_chg[SER_CHG_N];
+/* TOTK: the newest generation step per hashed serial (and for "everything"), written with the step under g_smu before the
+   generation is published. last <= from for a serial's slot and for "everything" means no step in (from, now] was for that
+   serial (a shared slot only answers "maybe": the caller then looks again). O(1), and not limited to the last SER_CHG_N
+   steps; tex_fast uses it so a texture view survives steps for other serials without leaving the inline path. */
+#define SER_LAST_N 4096
+static _Atomic uint64_t g_ser_last[SER_LAST_N], g_ser_last_all;
+static inline unsigned ser_last_slot(uint64_t serial) { return (unsigned)((serial * UINT64_C(0x9E3779B97F4A7C15)) >> 52) & (SER_LAST_N - 1); }
 static void ser_bump_locked(uint64_t serial) {
     uint64_t g = atomic_load_explicit(&g_ser_gen, memory_order_relaxed) + 1;
     atomic_store_explicit(&g_ser_chg[g % SER_CHG_N], serial, memory_order_relaxed);
+    atomic_store_explicit(serial ? &g_ser_last[ser_last_slot(serial)] : &g_ser_last_all, g, memory_order_relaxed);
     atomic_store_explicit(&g_ser_gen, g, memory_order_release);
+}
+/* 1: no generation step after `from` up to the last g_ser_gen this thread acquired was for this serial or for everything. */
+static inline int ser_unaffected_since(uint64_t from, uint64_t serial) {
+    return serial && atomic_load_explicit(&g_ser_last_all, memory_order_relaxed) <= from &&
+           atomic_load_explicit(&g_ser_last[ser_last_slot(serial)], memory_order_relaxed) <= from;
 }
 static void ser_bump(uint64_t serial);
 /* 1 when none of the generation steps (from, to] was for this serial (or for "everything"). */
@@ -6192,12 +6205,28 @@ static void *tex_by_id_p(int tid) {   // 调用方持 g_rmu | Caller holds g_rmu
 }
 // 热路径取对象：表里有效就直接返回表持有的指针（不经 ARC 的 retain / autorelease），否则走慢路建 / 校验。调用方持 g_rmu。
 // Hot-path object fetch: if the table entry is valid, return the table-held pointer directly (without ARC retain / autorelease), otherwise take the slow path to build / validate. Caller holds g_rmu.
+/* TOTK_TEX_SER_FAST (default on): the serial table steps for every texture or program the game creates or finalizes, and
+   each step sent every bound texture of the following draws through tex_by_id, whose scan of the steps since the view was
+   validated (ser_unaffected) and call cost ~2-3% of the replay. When the view is otherwise valid (stamp as above) and no
+   step since its validation was for its serial (ser_unaffected_since), the inline path does what tex_by_id's own early
+   return does: mark the slot used in this submission, move view_ser to the current generation, return the view. A view
+   still waiting for a finalised serial's successor (dead_pending) and lifetime logging keep going through tex_by_id. */
+static int tex_ser_fast_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_TEX_SER_FAST"); v = !(e && !atoi(e)); if (!v) MLOG("TOTK_TEX_SER_FAST=0: a serial-table step sends texture views through tex_by_id"); } return v; }
+static inline __attribute__((always_inline)) int tex_view_valid(int tid) {   // caller holds g_rmu
+    if (!(tid > 0 && tid < g_ntreg)) return 0;
+    treg_t *r = &g_treg[tid];
+    if (!r->ok || !r->view || (r->view_pkg && r->view_dirty != treg_stamp(r->view_pkg))) return 0;
+    uint64_t sg = g_ser_gen;
+    if (r->view_ser == sg) return 1;
+    if (r->dead_pending || !tex_ser_fast_on() || totk_life_on() || !ser_unaffected_since(r->view_ser, r->t.serial)) return 0;
+    r->used = g_sub_serial; r->view_ser = sg; return 1;
+}
 static inline __attribute__((always_inline)) void *tex_fast(int tid) {
-    if (tid > 0 && tid < g_ntreg && g_treg[tid].ok && g_treg[tid].view && g_treg[tid].view_ser == g_ser_gen && (!g_treg[tid].view_pkg || g_treg[tid].view_dirty == treg_stamp(g_treg[tid].view_pkg))) return g_treg[tid].view;
+    if (tex_view_valid(tid)) return g_treg[tid].view;
     return tex_by_id_p(tid);
 }
 static inline __attribute__((always_inline)) uint64_t tex_fast_rid(int tid, void **out) {
-    if (tid > 0 && tid < g_ntreg && g_treg[tid].ok && g_treg[tid].view && g_treg[tid].view_ser == g_ser_gen && (!g_treg[tid].view_pkg || g_treg[tid].view_dirty == treg_stamp(g_treg[tid].view_pkg))) { if (out) *out = g_treg[tid].view; return g_treg[tid].view_rid; }
+    if (tex_view_valid(tid)) { if (out) *out = g_treg[tid].view; return g_treg[tid].view_rid; }
     void *t = tex_by_id_p(tid); if (out) *out = t; return t ? ((__bridge id<MTLTexture>)t).gpuResourceID._impl : 0;
 }
 static MTLSamplerAddressMode wrapm(int w) {
