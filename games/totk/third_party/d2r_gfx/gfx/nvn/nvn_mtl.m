@@ -1858,6 +1858,7 @@ static uint64_t g_upd_bits[UPD_BITS / 64]; static int g_upd_bits_any, g_upd_bits
 static uint64_t g_upd_filter_q, g_upd_filter_skip;           // overlap queries past the hull test / answered by the filter
 static uint64_t g_sig_incr_n, g_sig_full_n, g_tex_ser_fast_n;  // stage_sig incremental / full walks; tex_view_valid steps taken inline
 static uint64_t g_cbc_hits, g_cbc_misses, g_cbc_verified; static int cbc_mode(void);   // TOTK_CBUF_CACHE (defined before encode_args)
+static uint64_t g_pso_memo_hits, g_pso_memo_misses; static int pso_memo_on(void);   // TOTK_PSO_MEMO (defined with g_pso)
 static uint64_t g_ab_same;   // TOTK_AB_SAME: argument blocks bound again because the new bytes equal the shader's previous block
 static int upd_fast_on(void) {
     static int v = -1;
@@ -4038,9 +4039,10 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     MLOG("[replay-fast] upd-filter=%d queries=%llu skipped=%llu | sig incremental=%llu full=%llu | tex-ser-fast steps=%llu",upd_fast_on(),(unsigned long long)g_upd_filter_q,(unsigned long long)g_upd_filter_skip,
          (unsigned long long)g_sig_incr_n,(unsigned long long)g_sig_full_n,(unsigned long long)g_tex_ser_fast_n);
     { int dfon; uint64_t dskip, dhash, dscan; nvn_dirty_fast_stats(&dfon, &dskip, &dhash, &dscan);
-      MLOG("[replay-fast2] dirty-fast=%d blocks-skipped=%llu range-table=%llu range-scans=%llu | cbuf-cache=%d hits=%llu misses=%llu verified=%llu | ab-same=%llu | side-cb=%d switches=%llu idle=%llu fallbacks=%llu extra-cbs=%llu", dfon, (unsigned long long)dskip, (unsigned long long)dhash, (unsigned long long)dscan,
+      MLOG("[replay-fast2] dirty-fast=%d blocks-skipped=%llu range-table=%llu range-scans=%llu | cbuf-cache=%d hits=%llu misses=%llu verified=%llu | ab-same=%llu | side-cb=%d switches=%llu idle=%llu fallbacks=%llu extra-cbs=%llu | pso-memo=%d hits=%llu misses=%llu", dfon, (unsigned long long)dskip, (unsigned long long)dhash, (unsigned long long)dscan,
            cbc_mode(), (unsigned long long)g_cbc_hits, (unsigned long long)g_cbc_misses, (unsigned long long)g_cbc_verified, (unsigned long long)g_ab_same,
-           side_cb_on(), (unsigned long long)g_side_switches, (unsigned long long)g_side_idle, (unsigned long long)g_side_fallbacks, (unsigned long long)g_side_extra); }
+           side_cb_on(), (unsigned long long)g_side_switches, (unsigned long long)g_side_idle, (unsigned long long)g_side_fallbacks, (unsigned long long)g_side_extra,
+           pso_memo_on(), (unsigned long long)g_pso_memo_hits, (unsigned long long)g_pso_memo_misses); }
     MLOG("[pkg-final-cache] enabled=%d kept=%llu", pkg_final_cache_on(), (unsigned long long)atomic_load(&g_pkg_final_kept));
     MLOG("贴图类型缓存已回收退役视图 %llu 个", (unsigned long long)g_type_retired_views);
     res_site_report(8);
@@ -6708,6 +6710,24 @@ static os_unfair_lock g_fz_fn_lock = OS_UNFAIR_LOCK_INIT;
 static NSMutableDictionary<NSString *, id<MTLFunction>> *g_bf_fn_cache;
 static NSMutableDictionary<NSString *, id<MTLLibrary>> *g_bf_lib_cache;
 static nvn_hmap g_pso = {.klen = sizeof(pso_key)}, g_dss;
+/* TOTK_PSO_MEMO (default on; =0 off), 2026-10-23: the pipeline table's lookup hashes the whole pipeline key (~0.5 KB, one
+   dependent multiply per 8 bytes) on every draw: 80 samples of pso_get in the Korok Forest profile. A small table indexed
+   by the program keeps the last key found for it and its pipeline: an equal key (memcmp, the same comparison the table
+   makes) gives that pipeline without hashing. g_pso_gen moves on whenever a pipeline is put into g_pso (a put can replace
+   and release one), which drops every remembered answer; misses are not remembered. The table is the submit thread's,
+   like g_pso. */
+typedef struct { const void *pr; uint64_t gen; pso_key k; void *ps; } pso_memo_ent;
+#define PSO_MEMO_N 256
+static pso_memo_ent g_pso_memo[PSO_MEMO_N]; static uint64_t g_pso_gen = 1;
+static int pso_memo_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PSO_MEMO"); v = !(e && !atoi(e)); if (!v) MLOG("TOTK_PSO_MEMO=0: every pipeline lookup hashes the key"); } return v; }
+static inline void *pso_lookup(const void *pr, const pso_key *k) {
+    if (!pso_memo_on()) return hm_get_ptr(&g_pso, k);
+    uintptr_t h = (uintptr_t)pr; pso_memo_ent *e = &g_pso_memo[((h >> 4) ^ (h >> 13)) & (PSO_MEMO_N - 1)];
+    if (e->pr == pr && e->gen == g_pso_gen && !memcmp(&e->k, k, sizeof *k)) { g_pso_memo_hits++; return e->ps; }
+    void *ps = hm_get_ptr(&g_pso, k); g_pso_memo_misses++;
+    if (ps) { e->pr = pr; e->gen = g_pso_gen; e->k = *k; e->ps = ps; }
+    return ps;
+}
 // TOTK: stages are translated separately, so a fragment shader may read user varyings the vertex shader never writes
 // (undefined values on the Switch GPU). Metal rejects such pairs; the vertex function gets the missing outputs added
 // (left zero) in a patched copy of its MSL, cached per missing set.
@@ -7467,7 +7487,7 @@ static void pso_adopt(const pso_key *k, NvShader *vs, NvShader *fs, int border, 
     pso_user_record("R\t%s\n", shex);
     if (brec) pso_user_record("B\t%s\t%s\n", shex, brec.UTF8String);   // its border recipe (border_parse): the warm-up builds this one too
     pso_contribute(&sk, brec);
-    hm_put_id(&g_pso, k, ps);
+    hm_put_id(&g_pso, k, ps); g_pso_gen++;   // TOTK_PSO_MEMO: a put may replace (and release) a remembered pipeline
 }
 /* Async pipelines (async shaders): a draw that may be skipped (draw_may_skip) does not wait for a new pipeline. It is
    compiled on a background queue from the same descriptor and adopted by the submit thread (apso_claim); until then
@@ -7530,18 +7550,21 @@ static void *pso_get_p(NvProg *pr, MTLRenderPassDescriptor *unused) {
     NSString *vrec = nil, *frec = nil;   // the border recipes of this key (pso_adopt)
     __unsafe_unretained id<MTLFunction> bfn = !g_pso_lmap && !g_mfx.role ? fs_fn_border(fs, k.dfmt == 0, &frec) : nil;   // TOTK: sampler border colour emulation
     if (bfn) k.fsfn = (__bridge void *)bfn;
-    { float bc[8][4]; int ba[8], bn; unsigned axes[8]; samp_par bp[8]; if (border_key(vs, 0, bc, ba, axes, bp, &bn)) {
+    { border_in vb; NSString *vkey = border_key(vs, 0, vb.c, vb.a, vb.x, vb.p, &vb.n); if (vkey) {
         k.a2c |= PSO_VBORDER;
         // The same shader can bind different border constants. Cache the actual
         // vertex variant identity, not just the fact that one exists. Persisted
         // recipes clear this pointer in pso_skey_from, keeping the stable ABI.
-        k.vs = (__bridge void *)vs_fn_for(vs, fs, (k.a2c & PSO_LAYERED) != 0, 1, &vrec);
+        /* TOTK_PSO_MEMO: the key just made is the one vs_fn_for would make again (border_key's per-stage cache, under the
+           registry lock once more); vs_fn_for takes it only from a vertex shader with source. */
+        if (pso_memo_on()) { vrec = sh_has_src(vs) ? vkey : nil; if (!vrec) vb.n = 0; k.vs = (__bridge void *)vs_fn_variant(vs, fs, (k.a2c & PSO_LAYERED) != 0, vrec, vb, NULL); }
+        else k.vs = (__bridge void *)vs_fn_for(vs, fs, (k.a2c & PSO_LAYERED) != 0, 1, &vrec);
     } }
     g_vprobe = 0;
     if (g_vmissing && !plain) { g_pso_deferred = 1; return NULL; }
     int bordered = bfn || (k.a2c & PSO_VBORDER);
     if (g_vmissing) { bfn = nil; k.fsfn = NULL; k.a2c &= ~PSO_VBORDER; k.vs = (__bridge void *)vs; }
-    __unsafe_unretained id<MTLRenderPipelineState> cached = (__bridge id<MTLRenderPipelineState>)hm_get_ptr(&g_pso, &k);
+    __unsafe_unretained id<MTLRenderPipelineState> cached = (__bridge id<MTLRenderPipelineState>)pso_lookup((__bridge const void *)pr, &k);
     if (cached) { if (g_vmissing) atomic_fetch_add_explicit(&g_stat_variant_plain, 1, memory_order_relaxed); return (__bridge void *)cached; }
     NSString *brec = !g_vmissing && bordered ? [NSString stringWithFormat:@"%@\t%@", (k.a2c & PSO_VBORDER) && vrec ? vrec : @"-", bfn && frec ? frec : @"-"] : nil;
     if (plain && !g_vmissing && bordered && apso_defer(&k, vs, fs, bfn, brec)) {   // the border pipeline is compiling: the plain one meanwhile
@@ -11933,7 +11956,7 @@ static void warm_claim(void) {
                 if (vf) item->pso.vs = (__bridge void *)vf;
                 item->pso.fsfn = (__bridge void *)bf;
             }
-            if (!hm_get_id(&g_pso, &item->pso)) { hm_put_id(&g_pso, &item->pso, item->object); g_warm_claim_rps++; }
+            if (!hm_get_id(&g_pso, &item->pso)) { hm_put_id(&g_pso, &item->pso, item->object); g_pso_gen++; g_warm_claim_rps++; }
         } else {
             NvShader *cs = g_shcache[item->key];
             if (!cs) { cs = item->shader; if (!g_shcache) g_shcache = [NSMutableDictionary dictionary]; g_shcache[item->key] = cs; }
