@@ -1787,6 +1787,8 @@ static uint64_t *g_upd_maxhi;
 #define UPD_GRAN_SHIFT 16
 #define UPD_GRAN_MAX 64
 static uint64_t g_upd_bits[UPD_BITS / 64]; static int g_upd_bits_any, g_upd_bits_all;
+static uint64_t g_upd_filter_q, g_upd_filter_skip;           // overlap queries past the hull test / answered by the filter
+static uint64_t g_sig_incr_n, g_sig_full_n, g_tex_ser_fast_n;  // stage_sig incremental / full walks; tex_view_valid steps taken inline
 static int upd_fast_on(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("TOTK_UPD_FAST"); v = !(e && !atoi(e)); if (!v) MLOG("TOTK_UPD_FAST=0: uniform-update overlap checks search the log for every range and walk every binding"); }
@@ -1823,7 +1825,7 @@ static void upd_insert(uint64_t lo, uint64_t hi) {
 // Newest seq among logged updates overlapping [lo, hi), 0 when none.
 static uint64_t upd_overlap_seq(uint64_t lo, uint64_t hi) {
     if (!g_nupd || hi <= g_upd_lo || lo >= g_upd_hi) return 0;
-    if (upd_fast_on() && upd_bits_miss(lo, hi)) return 0;
+    if (upd_fast_on()) { g_upd_filter_q++; if (upd_bits_miss(lo, hi)) { g_upd_filter_skip++; return 0; } }
     int a = 0, b = g_nupd; while (a < b) { int m = (a + b) >> 1; if (g_upd[m].lo < hi) a = m + 1; else b = m; }   // entries [0, a) start below hi
     uint64_t last = 0;
     for (int i = a - 1; i >= 0 && g_upd_maxhi[i] > lo; i--) if (g_upd[i].hi > lo && g_upd[i].seq > last) last = g_upd[i].seq;
@@ -3961,6 +3963,8 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
       MLOG("[pool-query-cache] enabled=%d hits=%llu misses=%llu checked=%llu",pool_query_on(),(unsigned long long)hits,(unsigned long long)misses,(unsigned long long)checked); }
     MLOG("[pool-tls] enabled=%d hits=%llu misses=%llu verified=%llu page-table=%d page-hits=%llu",pool_tls_on(),(unsigned long long)g_pool_tls_hits,(unsigned long long)g_pool_tls_misses,(unsigned long long)g_pool_tls_verified,pool_hash_on(),(unsigned long long)g_pool_hash_hits);
     MLOG("[shadow-index] enabled=%d hit=%llu miss=%llu verified=%llu",shadow_index_on(),(unsigned long long)g_shadow_index_hits,(unsigned long long)g_shadow_index_misses,(unsigned long long)g_shadow_index_verified);
+    MLOG("[replay-fast] upd-filter=%d queries=%llu skipped=%llu | sig incremental=%llu full=%llu | tex-ser-fast steps=%llu",upd_fast_on(),(unsigned long long)g_upd_filter_q,(unsigned long long)g_upd_filter_skip,
+         (unsigned long long)g_sig_incr_n,(unsigned long long)g_sig_full_n,(unsigned long long)g_tex_ser_fast_n);
     MLOG("[pkg-final-cache] enabled=%d kept=%llu", pkg_final_cache_on(), (unsigned long long)atomic_load(&g_pkg_final_kept));
     MLOG("贴图类型缓存已回收退役视图 %llu 个", (unsigned long long)g_type_retired_views);
     res_site_report(8);
@@ -6096,7 +6100,7 @@ static inline __attribute__((always_inline)) int tex_view_valid(int tid) {   // 
     uint64_t sg = g_ser_gen;
     if (r->view_ser == sg) return 1;
     if (r->dead_pending || !tex_ser_fast_on() || totk_life_on() || !ser_unaffected_since(r->view_ser, r->t.serial)) return 0;
-    r->used = g_sub_serial; r->view_ser = sg; return 1;
+    r->used = g_sub_serial; r->view_ser = sg; g_tex_ser_fast_n++; return 1;
 }
 static inline __attribute__((always_inline)) void *tex_fast(int tid) {
     if (tex_view_valid(tid)) return g_treg[tid].view;
@@ -6346,7 +6350,7 @@ static uint64_t stage_sig(int st) {
           if (tex_gen_check() && memcmp(last_tex[st], S.tex[st], sizeof(uint64_t) * hi)) MDIE("texture slot generation %llu of stage %d kept, handles changed", (unsigned long long)S.tex_gen[st], st);
           dm = last_dm[st]; }
       else if (incr && st >= 0 && st < 6 && gen == last_gen[st] && inc_hi[st] >= hi && sig_incr_locked(gen)) {
-          int locked = g_sig_incr_locked;   // the registry lock is held (taken by sig_incr_locked); registrations bump g_reg_gen under it
+          int locked = g_sig_incr_locked; g_sig_incr_n++;   // the registry lock is held (taken by sig_incr_locked); registrations bump g_reg_gen under it
           for (int r = 0; r < hi; r++) { uint64_t h = S.tex[st][r]; if (h == last_tex[st][r]) continue;
               int d = 0; const treg_t *t = h ? bound_tex(h) : NULL;
               if (t) { int f = t->has_v && t->v.set_format ? t->v.format : t->t.d.format; d = f >= 0x32 && f <= 0x36; }
@@ -6357,7 +6361,7 @@ static uint64_t stage_sig(int st) {
           if (locked) { last_tg[st] = S.tex_gen[st]; last_dm[st] = dm; } else inc_hi[st] = 0;
       }
       else {
-          dm = 0; int locked = registry_lock(); uint64_t dep[2] = {0, 0};
+          dm = 0; int locked = registry_lock(); uint64_t dep[2] = {0, 0}; g_sig_full_n++;
           for (int r = 0; r < hi; r++) if (S.tex[st][r]) { const treg_t *t = bound_tex(S.tex[st][r]); if (!t) continue;
               int f = t->has_v && t->v.set_format ? t->v.format : t->t.d.format; if (f >= 0x32 && f <= 0x36) { dm ^= 0x9E3779B97F4A7C15ull * (uint64_t)(r + 1); dep[r >> 6] |= UINT64_C(1) << (r & 63); } }
           registry_unlock();
