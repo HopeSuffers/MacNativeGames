@@ -61,7 +61,8 @@ static int page_writable(size_t off) {
     return (info.protection & VM_PROT_WRITE) ? 2 : (info.protection & VM_PROT_READ) ? 1 : 0;
 }
 
-static void publish1(uint64_t fence, uintptr_t lo, uintptr_t hi) { nvn_pl_publish(fence, &lo, &hi, 1); }
+static void publish1(uint64_t fence, uintptr_t lo, uintptr_t hi) { nvn_pl_publish(fence, &lo, &hi, 1, 0); }
+static void publishw(uint64_t fence, uintptr_t lo, uintptr_t hi) { nvn_pl_publish(fence, &lo, &hi, 1, 1); }
 int main(int argc, char **argv) {
     int dry = argc > 1 && !strcmp(argv[1], "dry"), negative = getenv("TOTK_PROBE_NEGATIVE") && atoi(getenv("TOTK_PROBE_NEGATIVE"));
     setenv("TOTK_PIPELINE", dry ? "2" : "1", 1);
@@ -141,6 +142,14 @@ int main(int argc, char **argv) {
     EXPECT("unprotected page of the range read-only again", 1, page_writable(11 * P));
     EXPECT("page of the non-static range read-only", 1, page_writable(10 * P));
     { nvn_pl_hold_rec h[8]; int n = nvn_pl_holds(h, 8); EXPECT("hold records kept", 1, n >= 2); }
+    {   // a write that meets only a GPU write range of the released frame goes through (TOTK_PIPELINE_WWHOLD=1 holds it)
+        atomic_store(&g_done_fence, 15); publishw(16, M + 15 * P, M + 15 * P + 256); publish1(16, M + 15 * P + 1024, M + 15 * P + 1100);
+        nvn_dirty_protect((const void *)(M + 15 * P), P); nvn_pl_set_released(16, 15);
+        EXPECT("write over a GPU write range only: not held", 1, run_thread(writer, 15 * P + 64, 7, 150, 0));
+        uint64_t v[NVN_PLS_N]; nvn_pl_stats(v); EXPECT("counted", 1, v[NVN_PLS_WWPASS]);
+        nvn_dirty_protect((const void *)(M + 15 * P), P);
+        EXPECT(dry ? "dry: write over a read range not held" : "write over a GPU read range: held", dry ? 1 : 0, run_thread(writer, 15 * P + 1040, 7, 150, 16));
+    }
     {   // a page whose other part the CPU writes after every release is left writable after 4 passes (TOTK_PIPELINE_PASSKEEP)
         publish1(15, M + 14 * P, M + 14 * P + 64); nvn_pl_set_released(15, 14); atomic_store(&g_done_fence, 14);
         int prot = 0;
