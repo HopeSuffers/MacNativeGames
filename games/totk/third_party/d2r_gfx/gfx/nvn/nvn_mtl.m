@@ -5132,6 +5132,7 @@ typedef struct { uint64_t gen; int ok, ns; int32_t sig[16]; border_in in; __stro
 @interface NvShader : NSObject { @public id<MTLFunction> fn; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, writes_depth, lay_ok; uint8_t drv_scanned[3];   /* drv_scanned (TOTK): driver segment c0 / c2 reads found by drv_scan in the MSL but missing from the reflection json */ /* lay_ok (TOTK): vertex MSL can write the layer (1) or not (-1), 0 = not checked yet; writes_depth (TOTK): the fragment function has a [[depth(...)]] output, so its pipeline needs a depth attachment */ const char *builtin; uint64_t logged; char key[80]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
     uint16_t texture_slots[NVN_REFL_MAXB]; uint8_t texture_count, texture_plan_ready;
     uint8_t guard_idx[NVN_REFL_MAXB], guard_count, guard_plan_ready;   // TOTK: the bindings upd_guard_stage looks at (storage / typed buffers), from the reflection once
+    uint8_t samp_idx[NVN_REFL_MAXB], samp_count, samp_plan_ready;   // TOTK_BORDER_PLAN: the sampler bindings (reg < 128) border_key looks at, in reflection order
     // 上次编好的参数缓冲
     // The argument buffer encoded last time
     arg_epoch_key ab_epoch; int ab_epoch_ok;
@@ -6844,8 +6845,20 @@ static NSString *border_key(NvShader *sh, int stage, float colours[][4], int aid
     *n = 0;
     if (!atomic_load_explicit(&g_border_custom_any, memory_order_relaxed)) return nil;
     NSMutableString *key = nil; int32_t sig[16]; int ns = 0;
-    registry_lock();
-    for (int i = 0; i < sh->rf.nb && *n < 8; i++) {
+    /* TOTK_BORDER_PLAN (default on; =0 off), 2026-10-23: pso_get asks for both stages' border inputs on most draws, and the
+       loop went over every binding of the shader to find its samplers (border_key ~23 self samples of ~1460 busy in the
+       Kakariko translate profile). The sampler bindings are listed once per shader (reflection order, the bindings the
+       loop would not skip); the loop below visits only those, in the same order. */
+    static int plan_on = -1; if (plan_on < 0) { const char *e = getenv("TOTK_BORDER_PLAN"); plan_on = !(e && !atoi(e)); if (!plan_on) MLOG("TOTK_BORDER_PLAN=0: border inputs scan every binding of the shader"); }
+    registry_lock();   // also orders the plan's one-time fill (border_key may run on other threads too)
+    if (plan_on && !sh->samp_plan_ready) {
+        unsigned c = 0;
+        for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; if ((b->kind == NVN_RB_SAMP || b->kind == NVN_RB_SAMPT) && b->reg < 128) sh->samp_idx[c++] = (uint8_t)i; }
+        sh->samp_count = (uint8_t)c; sh->samp_plan_ready = 1;
+    }
+    int count = plan_on ? sh->samp_count : sh->rf.nb;
+    for (int j = 0; j < count && *n < 8; j++) {
+        int i = plan_on ? sh->samp_idx[j] : j;
         const nvn_rbind *b = &sh->rf.b[i];
         if ((b->kind != NVN_RB_SAMP && b->kind != NVN_RB_SAMPT) || b->reg >= 128) continue;
         int sid = (int)((b->kind == NVN_RB_SAMPT ? S.tex[stage][b->reg] : S.samp[stage][b->reg]) >> 20);
