@@ -1860,6 +1860,7 @@ static uint64_t g_sig_incr_n, g_sig_full_n, g_tex_ser_fast_n;  // stage_sig incr
 static uint64_t g_cbc_hits, g_cbc_misses, g_cbc_verified; static int cbc_mode(void);   // TOTK_CBUF_CACHE (defined before encode_args)
 static uint64_t g_pso_memo_hits, g_pso_memo_misses; static int pso_memo_on(void);   // TOTK_PSO_MEMO (defined with g_pso)
 static uint64_t g_vbm_hits, g_vbm_misses, g_vbm_verified; static int vbm_mode(void);   // TOTK_VB_MEMO (defined with bind_vertex_streams)
+static uint64_t g_ugm_hits, g_ugm_misses, g_ugm_verified; static int ugm_mode(void);   // TOTK_GUARD_MEMO (defined with upd_guard_draw)
 static uint64_t g_ab_same;   // TOTK_AB_SAME: argument blocks bound again because the new bytes equal the shader's previous block
 static int upd_fast_on(void) {
     static int v = -1;
@@ -4054,7 +4055,8 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
            cbc_mode(), (unsigned long long)g_cbc_hits, (unsigned long long)g_cbc_misses, (unsigned long long)g_cbc_verified, (unsigned long long)g_ab_same,
            side_cb_on(), (unsigned long long)g_side_switches, (unsigned long long)g_side_idle, (unsigned long long)g_side_fallbacks, (unsigned long long)g_side_extra,
            pso_memo_on(), (unsigned long long)g_pso_memo_hits, (unsigned long long)g_pso_memo_misses); }
-    MLOG("[replay-fast3] vb-memo=%d hits=%llu misses=%llu verified=%llu", vbm_mode(), (unsigned long long)g_vbm_hits, (unsigned long long)g_vbm_misses, (unsigned long long)g_vbm_verified);
+    MLOG("[replay-fast3] vb-memo=%d hits=%llu misses=%llu verified=%llu | guard-memo=%d hits=%llu misses=%llu verified=%llu", vbm_mode(), (unsigned long long)g_vbm_hits, (unsigned long long)g_vbm_misses, (unsigned long long)g_vbm_verified,
+         ugm_mode(), (unsigned long long)g_ugm_hits, (unsigned long long)g_ugm_misses, (unsigned long long)g_ugm_verified);
     MLOG("[pkg-final-cache] enabled=%d kept=%llu", pkg_final_cache_on(), (unsigned long long)atomic_load(&g_pkg_final_kept));
     MLOG("贴图类型缓存已回收退役视图 %llu 个", (unsigned long long)g_type_retired_views);
     res_site_report(8);
@@ -11114,11 +11116,43 @@ static void upd_guard_stage(NvShader *sh, int st) {
         }
     }
 }
+/* TOTK_GUARD_MEMO (default on; =0 off, =2 verify every hit with the search), 2026-10-23: while uniform updates are logged,
+   every draw asked the update log whether any of the 16 vertex-stream ranges or the index range overlaps a logged update
+   (upd_overlap_seq: the hull test, then the granule filter, a search when a granule bit is set): ~50 of ~1460 busy samples
+   of the Kakariko translate profile, about 10 queries a draw for ~200 updates a frame. Each vertex slot and the index
+   buffer keep the last range found free of logged updates together with the log's state (g_upd_seq, which every logged
+   update raises, and g_nupd, which only the flush lowers); the same range under the same log state is free again without
+   the query. An overlap flushes the log, so only "free" answers are kept. upd_guard_stage is not entered for a shader whose
+   guard plan is known to be empty (its loop would look at nothing). */
+typedef struct { uint64_t lo, hi, seq; int n; } ugm_ent;
+static ugm_ent g_ugm[17];   // vertex streams 0-15, index buffer 16
+static uint64_t g_ugm_hits, g_ugm_misses, g_ugm_verified;
+static int ugm_mode(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_GUARD_MEMO"); v = e ? atoi(e) : 1; if (v < 0 || v > 2) v = 1;
+                 if (v != 1) MLOG("TOTK_GUARD_MEMO=%d: %s", v, v ? "update-guard answers remembered, every hit verified" : "every vertex / index range asks the update log"); }
+    return v;
+}
+static inline void upd_guard_m(int slot, uint64_t lo, uint64_t hi, int m) {   // upd_guard(lo, hi) with the slot's memo (m = ugm_mode())
+    if (!m) { upd_guard(lo, hi); return; }
+    if (!g_nupd || g_upd_guard_off) return;
+    ugm_ent *e = &g_ugm[slot];
+    if (e->lo == lo && e->hi == hi && e->seq == g_upd_seq && e->n == g_nupd) {
+        if (m == 2) { if (upd_overlap_seq(lo, hi)) MDIE("update-guard memo: %#llx..%#llx overlaps a logged update (slot %d)", (unsigned long long)lo, (unsigned long long)hi, slot); g_ugm_verified++; }
+        g_ugm_hits++; return;
+    }
+    g_ugm_misses++;
+    if (!upd_overlap_seq(lo, hi)) { *e = (ugm_ent){lo, hi, g_upd_seq, g_nupd}; return; }
+    g_ren_flushes++; upd_flush();   // as upd_guard
+}
 static void upd_guard_draw(NvProg *pr, const p_draw_idx *di) {
     if (!g_nupd) return;
-    for (int s_ = 0; s_ < 16 && g_nupd; s_++) if (S.vbuf[s_].address) upd_guard(S.vbuf[s_].address, S.vbuf[s_].address + (S.vbuf[s_].size ? S.vbuf[s_].size : 1));
-    if (di && di->ibuf && g_nupd) upd_guard(di->ibuf, di->ibuf + (uint64_t)di->count * (di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4));
-    if (pr) { upd_guard_stage(pr->sh[0], 0); upd_guard_stage(pr->sh[1], 1); }
+    int m = ugm_mode();
+    for (int s_ = 0; s_ < 16 && g_nupd; s_++) if (S.vbuf[s_].address) upd_guard_m(s_, S.vbuf[s_].address, S.vbuf[s_].address + (S.vbuf[s_].size ? S.vbuf[s_].size : 1), m);
+    if (di && di->ibuf && g_nupd) upd_guard_m(16, di->ibuf, di->ibuf + (uint64_t)di->count * (di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4), m);
+    if (pr) for (int st = 0; st < 2; st++) { __unsafe_unretained NvShader *sh = pr->sh[st];
+        if (m && sh && sh->guard_plan_ready && !sh->guard_count && upd_fast_on()) continue;   // the planned loop would look at nothing
+        upd_guard_stage(sh, st); }
 }
 /* TOTK_ANOMALY=<dir> (diagnostic, 2026-10-15): catch single-frame picture anomalies -- jumping now and then renders a
    distant part of the map in front of the camera for one frame -- together with the draws that made them. Every draw's
