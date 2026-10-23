@@ -101,9 +101,12 @@ static int busy_wait(range_t *r, uintptr_t p) {
 /* Sorted index of the live ranges (by base), rebuilt under g_slot_mu whenever a range goes live or dies, published by
    pointer; a lookup that misses the per-thread caches is a binary search instead of a scan of the ~4,000 live ranges
    (2026-10-23: the deeper frame wait looked up many pages and untracked addresses: find was 34% of the translate thread).
-   An old index is freed 16 rebuilds later (a reader in a signal handler holds it for a few instructions). */
+   An old index is freed only when no lookup is inside one (g_rix_readers: a lookup counts itself before it loads the
+   pointer, so a rebuild that sees no reader after the swap knows nobody holds an old index); until then it waits in a
+   retire list (freed at a later rebuild). */
 typedef struct { int n; uintptr_t *base; range_t **r; } rindex_t;
-static rindex_t *_Atomic g_rix; static rindex_t *g_rix_old[16]; static unsigned g_rix_oi; static _Atomic uint64_t g_rgen;
+static rindex_t *_Atomic g_rix; static rindex_t *g_rix_retired[64]; static int g_rix_nret; static _Atomic int g_rix_readers; static _Atomic uint64_t g_rgen;
+static void rix_free(rindex_t *x) { if (x) { free(x->base); free(x->r); free(x); } }
 static int rix_cmp(const void *x, const void *y) { const range_t *a = *(range_t *const *)x, *b = *(range_t *const *)y; return a->base < b->base ? -1 : a->base > b->base; }
 static void rindex_rebuild(void) {   // under g_slot_mu
     int n = atomic_load(&g_nr), k = 0;
@@ -114,8 +117,11 @@ static void rindex_rebuild(void) {   // under g_slot_mu
     for (int i = 0; i < k; i++) b[i] = r[i]->base;
     x->n = k; x->base = b; x->r = r;
     rindex_t *old = atomic_exchange(&g_rix, x);
-    unsigned slot = g_rix_oi++ % 16; rindex_t *gone = g_rix_old[slot]; g_rix_old[slot] = old;
-    if (gone) { free(gone->base); free(gone->r); free(gone); }
+    if (old) {
+        if (g_rix_nret == 64) { while (atomic_load(&g_rix_readers)) sched_yield(); for (int i = 0; i < g_rix_nret; i++) rix_free(g_rix_retired[i]); g_rix_nret = 0; }   // full: wait for a quiet moment
+        g_rix_retired[g_rix_nret++] = old;
+    }
+    if (!atomic_load(&g_rix_readers)) { for (int i = 0; i < g_rix_nret; i++) rix_free(g_rix_retired[i]); g_rix_nret = 0; }   // nobody can hold a retired index now
     atomic_fetch_add(&g_rgen, 1);
 }
 uint64_t nvn_dirty_range_gen(void) { return atomic_load(&g_rgen); }
@@ -136,15 +142,21 @@ static range_t *find(uintptr_t a) {
         if (l && atomic_load_explicit(&l->live, memory_order_acquire) && a >= l->base && a < l->end) { recent[next++ & 7] = l; atomic_fetch_add_explicit(&g_find_hash_hits, 1, memory_order_relaxed); return l; }
         atomic_fetch_add_explicit(&g_find_scans, 1, memory_order_relaxed);
     }
-    rindex_t *x = atomic_load_explicit(&g_rix, memory_order_acquire);
-    if (x && g_dirty_fast) {   // the last range starting at or below a
-        int lo = 0, hi = x->n;
-        while (lo < hi) { int m = (lo + hi) / 2; if (x->base[m] <= a) lo = m + 1; else hi = m; }
-        for (int i = lo - 1; i >= 0 && i >= lo - 2; i--) {   // (a range rebuilt in place may sit one entry off)
-            range_t *l = x->r[i];
-            if (atomic_load_explicit(&l->live, memory_order_acquire) && a >= l->base && a < l->end) { recent[next++ & 7] = l; hashed[h] = l; return l; }
-        }
-        if (atomic_load(&g_rix) == x) return NULL;   // not in a live range (the index did not change meanwhile)
+    if (g_dirty_fast) {
+        atomic_fetch_add(&g_rix_readers, 1);
+        rindex_t *x = atomic_load_explicit(&g_rix, memory_order_acquire);
+        if (x) {   // the last range starting at or below a
+            int lo = 0, hi = x->n; range_t *found = NULL;
+            while (lo < hi) { int m = (lo + hi) / 2; if (x->base[m] <= a) lo = m + 1; else hi = m; }
+            for (int i = lo - 1; i >= 0 && i >= lo - 2 && !found; i--) {   // (a range rebuilt in place may sit one entry off)
+                range_t *l = x->r[i];
+                if (atomic_load_explicit(&l->live, memory_order_acquire) && a >= l->base && a < l->end) found = l;
+            }
+            int same = atomic_load(&g_rix) == x;
+            atomic_fetch_sub(&g_rix_readers, 1);
+            if (found) { recent[next++ & 7] = found; hashed[h] = found; return found; }
+            if (same) return NULL;   // not in a live range (the index did not change meanwhile)
+        } else atomic_fetch_sub(&g_rix_readers, 1);
     }
     int n = atomic_load(&g_nr);
     for (int i = 0; i < n; i++) if (atomic_load_explicit(&g_r[i].live, memory_order_acquire) && a >= g_r[i].base && a < g_r[i].end) { recent[next++ & 7] = &g_r[i]; if (g_dirty_fast) hashed[h] = &g_r[i]; return &g_r[i]; }
@@ -207,12 +219,14 @@ static _Atomic uint64_t g_pl_st[NVN_PLS_N];
 enum { PL_HOLD_MS = 500, PL_RSETS = 8, PL_URING = 16384 };
 static nvn_pl_hold_rec g_pl_hrec[64]; static _Atomic uint64_t g_pl_hrec_n;
 typedef struct { _Atomic uint64_t fence; _Atomic int n; uintptr_t *_Atomic lo, *_Atomic hi, *_Atomic mx; int cap; } pl_rset;
-static pl_rset g_pl_rs[PL_RSETS];
+static pl_rset g_pl_rs[PL_RSETS], g_pl_ws[PL_RSETS];   // per submission: in-place reads, GPU writes
+static int g_pl_wwhold;   // TOTK_PIPELINE_WWHOLD=1: also hold CPU writes that only meet GPU writes (W-W)
 static _Atomic uintptr_t g_pl_uring[PL_URING]; static _Atomic uint64_t g_pl_uring_n; static uint64_t g_pl_uring_cur;
 static void pl_init(void) {
     if (g_pl_mode >= 0) return;
     const char *e = getenv("TOTK_PIPELINE"); int m = e ? atoi(e) : 0;
     e = getenv("TOTK_PIPELINE_PASSKEEP"); if (e) g_pl_passkeep = atoi(e) != 0;
+    e = getenv("TOTK_PIPELINE_WWHOLD"); if (e) g_pl_wwhold = atoi(e) != 0;
     g_pl_mode = m == 1 || m == 2 ? m : 0;
 }
 int nvn_pl_mode(void) { pl_init(); return g_pl_mode; }
@@ -262,20 +276,25 @@ static int pl_rset_hit(pl_rset *s, uint64_t f, uintptr_t a, uintptr_t b) {
     return atomic_load_explicit(&s->fence, memory_order_acquire) == f ? hit : 1;   // the set was replaced meanwhile: conservative
 }
 /* The newest released, unfinished fence whose in-place ranges overlap [a, b), 0 = none. */
-static uint64_t pl_inflight_hit(uintptr_t a, uintptr_t b, uint64_t done, uint64_t rel) {
-    uint64_t until = 0;
+static uint64_t pl_inflight_hit2(uintptr_t a, uintptr_t b, uint64_t done, uint64_t rel, int *kinds) {   // kinds: 1 a read range, 2 a write range
+    uint64_t until = 0; int k = 0;
     for (int i = 0; i < PL_RSETS; i++) {
         uint64_t f = atomic_load_explicit(&g_pl_rs[i].fence, memory_order_acquire);
-        if (f > done && f <= rel && f > until && pl_rset_hit(&g_pl_rs[i], f, a, b)) until = f;
+        if (f > done && f <= rel && pl_rset_hit(&g_pl_rs[i], f, a, b)) { k |= 1; if (f > until) until = f; }
+        f = atomic_load_explicit(&g_pl_ws[i].fence, memory_order_acquire);
+        if (f > done && f <= rel && pl_rset_hit(&g_pl_ws[i], f, a, b)) { k |= 2; if (f > until) until = f; }
     }
+    if (kinds) *kinds = k;
     return until;
 }
+static uint64_t pl_inflight_hit(uintptr_t a, uintptr_t b, uint64_t done, uint64_t rel) { return pl_inflight_hit2(a, b, done, rel, NULL); }
 /* A CPU write of [a, b) (one page) is about to make page p of r writable (fault handler, or a host write announced
    through prep_write). */
 static void pl_before_write(range_t *r, uintptr_t p, uintptr_t a, uintptr_t b, uint64_t pc, const uint64_t *bt, int host) {
     uint64_t rel = atomic_load(&g_pl_released), done = pl_done_now();
     if (rel <= done) return;
-    uint64_t until = pl_inflight_hit(a, b, done, rel);
+    int kinds = 0; uint64_t until = pl_inflight_hit2(a, b, done, rel, &kinds);
+    if (until && kinds == 2 && !g_pl_wwhold) { atomic_fetch_add(&g_pl_st[NVN_PLS_WWPASS], 1); until = 0; }   // only GPU writes there (the game partitions such buffers: particle pools): goes through
     if (!until) {   // another part of the page; a page whose CPU part is written every frame is left writable for a while
         atomic_fetch_add(&g_pl_st[NVN_PLS_PASS], 1);
         if (r->pl_pc && p < r->pl_cap && atomic_fetch_add(&r->pl_pc[p], 1) >= 3) { atomic_store(&r->pl_pc[p], 0); atomic_store(&r->pl_psk[p], atomic_load(&g_pl_frame) + 256); atomic_fetch_add(&g_pl_st[NVN_PLS_PASSKEEP], 1); }
@@ -283,7 +302,7 @@ static void pl_before_write(range_t *r, uintptr_t p, uintptr_t a, uintptr_t b, u
     }
     if (r->pl_pc && p < r->pl_cap) { atomic_store(&r->pl_pc[p], 0); atomic_store(&r->pl_psk[p], 0); }
     uint64_t i = atomic_fetch_add(&g_pl_hrec_n, 1);
-    nvn_pl_hold_rec *hr = &g_pl_hrec[i % 64]; *hr = (nvn_pl_hold_rec){pc, a, atomic_load(&g_pl_frame), (uint32_t)host, until, rel, {0}};
+    nvn_pl_hold_rec *hr = &g_pl_hrec[i % 64]; *hr = (nvn_pl_hold_rec){pc, a, atomic_load(&g_pl_frame), (uint32_t)host, until, rel, {0}, (uint32_t)kinds};
     if (bt) memcpy(hr->bt, bt, sizeof hr->bt);
     if (g_pl_mode == 2) { atomic_fetch_add(&g_pl_st[NVN_PLS_WOULD], 1); return; }
     if (!pl_guest_thread()) { atomic_fetch_add(&g_pl_st[NVN_PLS_HOSTSKIP], 1); return; }
@@ -362,9 +381,9 @@ int nvn_pl_gpu_written(const void *addr, size_t len, uint64_t done) {
     return 0;
 }
 /* The in-place ranges of submission fence, sorted by start (they may overlap). Replaces the set of fence - PL_RSETS. */
-void nvn_pl_publish(uint64_t fence, const uintptr_t *lo, const uintptr_t *hi, int n) {
+void nvn_pl_publish(uint64_t fence, const uintptr_t *lo, const uintptr_t *hi, int n, int writes) {
     if (g_pl_mode <= 0) return;
-    pl_rset *s = &g_pl_rs[fence % PL_RSETS];
+    pl_rset *s = &(writes ? g_pl_ws : g_pl_rs)[fence % PL_RSETS];
     atomic_store_explicit(&s->fence, 0, memory_order_release); atomic_store(&s->n, 0);
     if (n > s->cap) {   // the old arrays are not freed (a signal handler may still read them)
         int cap = n + n / 2 + 256; uintptr_t *l = malloc(sizeof *l * (size_t)cap), *h = malloc(sizeof *h * (size_t)cap), *m = malloc(sizeof *m * (size_t)cap);
@@ -404,8 +423,8 @@ int nvn_pl_reprotect(uint64_t done, uint64_t released, const uintptr_t *nlo, con
     int k = 0;
     uint64_t end = atomic_load(&g_pl_uring_n), from = g_pl_uring_cur;
     if (end - from > PL_URING) {   // the ring overflowed: every range of those submissions
-        for (int i = 0; i < PL_RSETS; i++) {
-            pl_rset *s = &g_pl_rs[i]; uint64_t f = atomic_load(&s->fence);
+        for (int i = 0; i < 2 * PL_RSETS; i++) {
+            pl_rset *s = i < PL_RSETS ? &g_pl_rs[i] : &g_pl_ws[i - PL_RSETS]; uint64_t f = atomic_load(&s->fence);
             if (f <= done || f > released) continue;
             int n = atomic_load(&s->n); uintptr_t *lo = atomic_load(&s->lo), *hi = atomic_load(&s->hi);
             for (int j = 0; j < n; j++) pl_protect_run(lo[j], hi[j], &k);
@@ -439,7 +458,7 @@ static int pl_watch_fault(uintptr_t a, int is_write, uint64_t pc, const uint64_t
     if (atomic_exchange(&g_plw_on[i], 0)) {
         atomic_fetch_add(&g_pl_st[is_write ? NVN_PLS_WATCH_WRITE : NVN_PLS_WATCH_READ], 1);
         uint64_t k = atomic_fetch_add(&g_pl_hrec_n, 1);
-        nvn_pl_hold_rec *hr = &g_pl_hrec[k % 64]; *hr = (nvn_pl_hold_rec){pc, a, atomic_load(&g_pl_frame), is_write ? 3u : 2u, 0, atomic_load(&g_pl_released), {0}};
+        nvn_pl_hold_rec *hr = &g_pl_hrec[k % 64]; *hr = (nvn_pl_hold_rec){pc, a, atomic_load(&g_pl_frame), is_write ? 3u : 2u, 0, atomic_load(&g_pl_released), {0}, 0};
         if (bt) memcpy(hr->bt, bt, sizeof hr->bt);
     }
     return 1;
