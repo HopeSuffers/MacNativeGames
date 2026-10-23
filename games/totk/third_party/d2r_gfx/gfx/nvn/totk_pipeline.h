@@ -84,6 +84,7 @@ static struct {
     uint64_t subs, over_budget, snaps[PLK_N], snap_bytes, snap_ns, memo_hits, cache_hits, live[PLK_N], live_static, live_gpuw, live_big, live_noshot, live_untracked;
     uint64_t ranges, nonstatic, writes, snap_drops, dsnap_redirects, ns, t_decide, t_commit, decides;
 } g_pls_st;
+static _Atomic uint64_t g_pl_rel_t[3];   // release on the game thread: early results / protection / snapshots published
 static _Atomic uint64_t g_pl_waits, g_pl_early, g_pl_lead_ns, g_pl_lead_n, g_pl_lead_max, g_pl_gate_n, g_pl_gate_ns, g_pl_inval_n, g_pl_inval_gates, g_pl_rel_ns, g_pl_rel_n;
 static _Atomic uint64_t g_plds_pub, g_plds_merge, g_plds_conflict, g_plds_skip, g_plds_act, g_plds_learned;
 
@@ -102,7 +103,7 @@ static void pl_rvec_add(pl_rvec *v, uintptr_t lo, uintptr_t hi) {
 }
 static void pl_rng_add(uintptr_t lo, uintptr_t hi, int nonstatic, int write) {
     pl_rvec_add(&g_plr_all, lo, hi);
-    if (nonstatic) pl_rvec_add(&g_plr_ns, lo, hi);
+    if (nonstatic) { pl_rvec_add(&g_plr_ns, lo, hi); nvn_pl_protect_span((const void *)lo, (size_t)(hi - lo)); }   // CPU writes until the release then go through the ring
     if (write) pl_rvec_add(&g_plr_w, lo, hi);
 }
 /* decisions per submission: -1 GPU-written / untracked, 0 static, 1 volatile */
@@ -120,16 +121,19 @@ static pl_memo *pl_memo_find(uint64_t lo, uint64_t hi, int *fresh) {
     }
     return NULL;
 }
-/* Static decisions across submissions: [lo, hi) was static (no page volatile or on probation, every page write-protected)
-   as of tracker generation stamp; it stays static while nvn_dirty_since finds no page written after it. */
-typedef struct { uint64_t lo, hi, stamp; } pl_sc;
+/* Decisions across submissions: [lo, hi) was static (no page volatile or on probation, every page write-protected) as of
+   tracker generation stamp, and stays static while nvn_dirty_since finds no page written after it; or volatile, which is
+   reused for PL_VOL_REUSE frames (a page stays volatile KEEP frames after a write: reusing it longer only snapshots a
+   little longer). */
+typedef struct { uint64_t lo, hi, stamp; uint32_t frame; int8_t c; } pl_sc;   // c 0 static (valid while unwritten), 1 volatile (valid PL_VOL_REUSE frames)
+#define PL_VOL_REUSE 32
 static pl_sc g_plsc[PL_SCACHE];
 static inline pl_sc *pl_sc_slot(uint64_t lo, uint64_t hi) { uint64_t h = (lo >> 4) ^ (lo >> 21) ^ (hi * UINT64_C(0xc2b2ae3d27d4eb4f)); return &g_plsc[(h ^ (h >> 29)) & (PL_SCACHE - 1)]; }
 
 /* ---------- depth statistics: snapshot ring of small compute-written storage buffers (from TOTK_OVERLAP) ---------- */
 typedef struct {
     int state;   // 0 free, 1 candidate, 2 active, 3 retiring (whole bindings still use H; at the next submission H goes back to memory), 4 dead (buffers kept until dead_fence)
-    int hits, used_rw, base_valid, gone;
+    int hits, used_rw, base_valid, gone, inval, nmask;   // inval: the CPU invalidates it (published there, not at frame waits); nmask: CPU words to merge
     uint64_t lo, hi, last_sub, base_fence, pub_fence, dead_fence;
     __strong id<MTLBuffer> H, S[PLDS_RING]; uint64_t s_fence[PLDS_RING];
     uint64_t *base, *mval; uint8_t *mmask;   // guest words at the last sync; CPU words still to merge into H
@@ -192,6 +196,7 @@ static void plds_candidates(void) {
     for (int c = 0; c < g_plds_ncand; c++) {
         uint64_t lo = g_plds_cand_lo[c], hi = g_plds_cand_hi[c]; plds_t *f = NULL, *s = NULL;
         if (plds_blacklisted(lo, hi)) continue;
+        { int inside = 0; for (int i = 0; i < PLDS_SNAPS; i++) inside |= g_plds[i].state >= 2 && g_plds[i].state <= 3 && lo >= g_plds[i].lo && hi <= g_plds[i].hi; if (inside) continue; }   // already served
         for (int i = 0; i < PLDS_SNAPS && !s; i++) if (g_plds[i].state == 1 && g_plds[i].lo == lo && g_plds[i].hi == hi) s = &g_plds[i];
         for (int i = 0; i < PLDS_SNAPS && !s && !f; i++) if (g_plds[i].state == 0) f = &g_plds[i];
         if (!s && !f) continue;
@@ -204,7 +209,10 @@ static void plds_merge_into_h(plds_t *s) {   // CPU words written since the last
     size_t nw = (size_t)(s->hi - s->lo) / 8; const volatile uint64_t *g = (const volatile uint64_t *)(uintptr_t)s->lo;
     os_unfair_lock_lock(&g_plds_lk);
     if (!s->base_valid && pl_done_fn() >= s->base_fence) { for (size_t w = 0; w < nw; w++) s->base[w] = g[w]; s->base_valid = 1; }
-    if (s->base_valid) for (size_t w = 0; w < nw; w++) { uint64_t v = g[w]; if (v != s->base[w]) { s->mval[w] = v; s->mmask[w] = 1; s->base[w] = v; } }
+    if (s->base_valid && memcmp((const void *)g, s->base, nw * 8))   // the CPU wrote words since the last sync
+        for (size_t w = 0; w < nw; w++) { uint64_t v = g[w]; if (v != s->base[w]) { s->mval[w] = v; if (!s->mmask[w]) { s->mmask[w] = 1; s->nmask++; } s->base[w] = v; } }
+    if (!s->nmask) { os_unfair_lock_unlock(&g_plds_lk); return; }
+    s->nmask = 0;
     size_t w = 0; int runs = 0;
     while (w < nw) {
         if (!s->mmask[w]) { w++; continue; }
@@ -222,9 +230,18 @@ static void plds_begin(void) {   // mtl_sub_begin (command buffer open, nothing 
         uint64_t lo[16], hi[16]; int n = g_plds_nlearn; memcpy(lo, g_plds_learn_lo, sizeof lo); memcpy(hi, g_plds_learn_hi, sizeof hi); g_plds_nlearn = 0;
         os_unfair_lock_unlock(&g_plds_lk);
         for (int c = 0; c < n; c++) {
-            int known = 0; for (int i = 0; i < PLDS_SNAPS; i++) known |= g_plds[i].state >= 1 && g_plds[i].state <= 3 && lo[c] < g_plds[i].hi && hi[c] > g_plds[i].lo && (g_plds[i].state != 1 || (g_plds[i].lo == lo[c] && g_plds[i].hi == hi[c]));
-            if (known || plds_blacklisted(lo[c], hi[c])) continue;
-            for (int i = 0; i < PLDS_SNAPS; i++) if (g_plds[i].state == 0) { g_plds[i] = (plds_t){0}; g_plds[i].state = 1; g_plds[i].lo = lo[c]; g_plds[i].hi = hi[c]; g_plds[i].hits = 2; g_plds[i].last_sub = g_plds_sub; atomic_fetch_add(&g_plds_learned, 1); break; }
+            if (plds_blacklisted(lo[c], hi[c])) continue;
+            /* overlapping snapshots (e.g. the 64 KiB a storage pointer of unknown extent is taken to write, over a smaller
+               snapshot): one snapshot over the union, the old ones retire first (activation waits until they are gone) */
+            uint64_t ulo = lo[c] & ~15ull, uhi = (hi[c] + 15) & ~15ull; int same = 0;
+            for (int i = 0; i < PLDS_SNAPS; i++) { plds_t *o = &g_plds[i]; if (o->state >= 1 && o->state <= 3 && o->lo < uhi && o->hi > ulo) { if (o->lo < ulo) ulo = o->lo; if (o->hi > uhi) uhi = o->hi; } }
+            if (uhi - ulo > PLDS_MAX) continue;
+            for (int i = 0; i < PLDS_SNAPS; i++) { plds_t *o = &g_plds[i]; if (o->state >= 1 && o->state <= 3 && o->lo < uhi && o->hi > ulo) {
+                if (o->state == 1) { if (o->lo == ulo && o->hi == uhi) same = 1; else *o = (plds_t){0}; }
+                else if (o->lo != ulo || o->hi != uhi) { os_unfair_lock_lock(&g_plds_lk); if (o->state == 2) o->state = 3; os_unfair_lock_unlock(&g_plds_lk); }
+                else same = 1; } }
+            if (same) continue;
+            for (int i = 0; i < PLDS_SNAPS; i++) if (g_plds[i].state == 0) { g_plds[i] = (plds_t){0}; g_plds[i].state = 1; g_plds[i].lo = ulo; g_plds[i].hi = uhi; g_plds[i].hits = 2; g_plds[i].last_sub = g_plds_sub; atomic_fetch_add(&g_plds_learned, 1); break; }
         }
     }
     for (int i = 0; i < PLDS_SNAPS; i++) {
@@ -244,6 +261,7 @@ static void plds_begin(void) {   // mtl_sub_begin (command buffer open, nothing 
             for (int j = 0; j < PLDS_SNAPS; j++) { plds_t *o = &g_plds[j]; if (o != s && o->state == 1 && o->lo < hi && o->hi > lo) { if (o->lo < lo) lo = o->lo & ~15ull; if (o->hi > hi) hi = (o->hi + 15) & ~15ull; } }
             int clash = 0; for (int j = 0; j < PLDS_SNAPS; j++) { plds_t *o = &g_plds[j]; if (o->state >= 2 && o->state <= 4 && o->lo < hi && o->hi > lo) clash = 1; }
             void *mb; uint64_t mo;
+            if (clash && s->hits >= 2 && hi - lo <= PLDS_MAX) { s->last_sub = g_plds_sub; continue; }   // waits until the overlapping snapshots are gone
             if (clash || hi - lo > PLDS_MAX || !mtl_addr(lo, hi - lo, &mb, &mo)) { s->state = 0; continue; }
             for (int j = 0; j < PLDS_SNAPS; j++) { plds_t *o = &g_plds[j]; if (o != s && o->state == 1 && o->lo < hi && o->hi > lo) *o = (plds_t){0}; }
             size_t len = (size_t)(hi - lo), nw = len / 8;
@@ -273,18 +291,22 @@ static void plds_commit(uint64_t fence) {   // mtl_sub_commit, before the last c
         if (pick >= 0) s->s_fence[pick] = fence;
         os_unfair_lock_unlock(&g_plds_lk);
         if (pick < 0) { atomic_fetch_add(&g_plds_skip, 1); continue; }
-        id<MTL4ComputeCommandEncoder> b = blit(); enc_b_copy_buffer(b, s->H, 0, s->S[pick], 0, s->hi - s->lo); enc_b_end(g_blit); g_blit = nil;
+        enc_b_copy_buffer(blit(), s->H, 0, s->S[pick], 0, s->hi - s->lo);   // one encoder for all of them (ended by the commit)
     }
 }
 /* Game thread (frame wait return, pool invalidate): the newest completed copy of each snapshot goes into guest memory.
    Words the CPU wrote since the last sync are kept (and merged into H at the next submission). */
-static void plds_publish(void) {
+/* lo < hi: the snapshots over [lo, hi) (an invalidate; they are marked as invalidated); lo == hi: those never
+   invalidated (a frame wait: the CPU may read them without an invalidate). */
+static void plds_publish_x(uint64_t lo, uint64_t hi) {
     if (!atomic_load_explicit(&g_plds_live, memory_order_relaxed)) return;
     uint64_t done = pl_done_fn();
     os_unfair_lock_lock(&g_plds_lk);
     for (int i = 0; i < PLDS_SNAPS; i++) {
         plds_t *s = &g_plds[i];
         if (s->state != 2) continue;
+        if (lo < hi) { if (s->hi <= lo || s->lo >= hi) continue; s->inval = 1; }
+        else if (s->inval) continue;
         int k = -1;
         for (int j = 0; j < PLDS_RING; j++) if (s->s_fence[j] > s->pub_fence && s->s_fence[j] <= done && (k < 0 || s->s_fence[j] > s->s_fence[k])) k = j;
         if (k < 0) continue;
@@ -293,9 +315,10 @@ static void plds_publish(void) {
         void *tok = nvn_dirty_tracked((const void *)(uintptr_t)s->lo, len) ? nvn_dirty_gpu_write_begin((void *)(uintptr_t)s->lo, len) : NULL;
         if (!tok) dm_guest_write_prepare((void *)(uintptr_t)s->lo, len);
         const uint64_t *src = (const uint64_t *)s->S[k].contents;
-        for (size_t w = 0; w < nw; w++) {
+        if (!memcmp((const void *)g, s->base, nw * 8)) { memcpy((void *)g, src, nw * 8); memcpy(s->base, src, nw * 8); }   // no CPU word since the last sync
+        else for (size_t w = 0; w < nw; w++) {
             uint64_t cur = g[w];
-            if (cur != s->base[w]) { s->mval[w] = cur; s->mmask[w] = 1; }   // the CPU wrote it: its word stays (and goes into H)
+            if (cur != s->base[w]) { s->mval[w] = cur; if (!s->mmask[w]) { s->mmask[w] = 1; s->nmask++; } }   // the CPU wrote it: its word stays (and goes into H)
             else if (cur != src[w]) g[w] = src[w];
             s->base[w] = g[w];
         }
@@ -304,6 +327,7 @@ static void plds_publish(void) {
     }
     os_unfair_lock_unlock(&g_plds_lk);
 }
+static void plds_publish(void) { plds_publish_x(0, 0); }
 static void plds_pool_gone(uintptr_t lo, uintptr_t hi) {   // mtl_pool_del (the translation queue is drained)
     if (!atomic_load_explicit(&g_plds_live, memory_order_relaxed)) return;
     os_unfair_lock_lock(&g_plds_lk);
@@ -350,11 +374,13 @@ static int pl_decide(uint64_t a0, uint64_t n0, pl_dm **out) {
     uint64_t t0 = pl_now(); g_pls_st.decides++;
     int c; uint64_t done = pl_done_fn(); pl_sc *sc = pl_sc_slot(a, a + n);
     if (nvn_pl_gpu_written((const void *)(uintptr_t)a, (size_t)n, done)) c = -1;   // a GPU write in flight: read in place
-    else if (sc->lo == a && sc->hi == a + n && !nvn_dirty_since((const void *)(uintptr_t)a, (size_t)n, sc->stamp)) { c = 0; g_pls_st.cache_hits++; }
+    else if (sc->lo == a && sc->hi == a + n && sc->c == 1 && (uint32_t)g_sub_serial - sc->frame < PL_VOL_REUSE) { c = 1; g_pls_st.cache_hits++; }
+    else if (sc->lo == a && sc->hi == a + n && sc->c == 0 && !nvn_dirty_since((const void *)(uintptr_t)a, (size_t)n, sc->stamp)) { c = 0; g_pls_st.cache_hits++; }
     else {
         uint64_t stamp = nvn_dirty_now();
         c = nvn_pl_classify((const void *)(uintptr_t)a, (size_t)n, g_pl_keep, g_pl_probe, g_pl_first);
-        if (c == 0) { nvn_dirty_protect((const void *)(uintptr_t)a, (size_t)n); *sc = (pl_sc){a, a + n, stamp}; }   // static: every page protected, so a CPU write is seen
+        if (c == 0) nvn_dirty_protect((const void *)(uintptr_t)a, (size_t)n);   // static: every page protected, so a CPU write is seen
+        if (c >= 0) *sc = (pl_sc){a, a + n, stamp, (uint32_t)g_sub_serial, (int8_t)c};
     }
     if (d) *d = (pl_dm){a, a + n, g_plm_gen, g_pl_wep, (int8_t)c, 0};
     *out = d;
@@ -477,14 +503,13 @@ static int pl_commit(uint64_t fence, post_op *ops, int n) {
     int na = g_plr_all.n, nn = g_plr_ns.n, nw = g_plr_w.n;
     rng_sort((usnap_rng *)g_plr_all.r, na);
     uintptr_t *alo = malloc(sizeof *alo * (size_t)(na ? na : 1)), *ahi = malloc(sizeof *ahi * (size_t)(na ? na : 1));
-    uintptr_t *nlo = nn ? malloc(sizeof *nlo * (size_t)nn) : NULL, *nhi = nn ? malloc(sizeof *nhi * (size_t)nn) : NULL;
+    uintptr_t *nlo = NULL, *nhi = NULL;   // the non-static ranges were protected at their publication (nvn_pl_protect_span)
     uintptr_t *wlo = nw ? malloc(sizeof *wlo * (size_t)nw) : NULL, *whi = nw ? malloc(sizeof *whi * (size_t)nw) : NULL, *wmx = nw ? malloc(sizeof *wmx * (size_t)nw) : NULL;
-    if (!alo || !ahi || (nn && (!nlo || !nhi)) || (nw && (!wlo || !whi || !wmx))) MDIE("pipeline ranges");
+    if (!alo || !ahi || (nw && (!wlo || !whi || !wmx))) MDIE("pipeline ranges");
     int k = 0;
     for (int i = 0; i < na; i++) { const pl_rng *r = &g_plr_all.r[i]; if (k && r->lo <= ahi[k - 1]) { if (r->hi > ahi[k - 1]) ahi[k - 1] = r->hi; } else { alo[k] = r->lo; ahi[k++] = r->hi; } }
     nvn_pl_publish(fence, alo, ahi, k);
     free(alo); free(ahi);
-    for (int i = 0; i < nn; i++) { nlo[i] = g_plr_ns.r[i].lo; nhi[i] = g_plr_ns.r[i].hi; }
     if (nw > 1) rng_sort((usnap_rng *)g_plr_w.r, nw);
     uintptr_t run = 0; for (int i = 0; i < nw; i++) { wlo[i] = g_plr_w.r[i].lo; whi[i] = g_plr_w.r[i].hi; if (whi[i] > run) run = whi[i]; wmx[i] = run; }
     na = k;
@@ -494,7 +519,7 @@ static int pl_commit(uint64_t fence, post_op *ops, int n) {
     pl_slot *s = &g_plslot[fence % PL_SLOTS];
     while (s->fence && s->state == 2) pthread_cond_wait(&g_cv, &g_mu);   // its release is still applying (16 submissions back: never in practice)
     pl_slot_free_locked(s);
-    *s = (pl_slot){.fence = fence, .state = 1, .early = early, .nearly = ne, .qaddr = q, .nq = nq, .nlo = nlo, .nhi = nhi, .nn = nn, .wlo = wlo, .whi = whi, .wmx = wmx, .nw = nw};
+    *s = (pl_slot){.fence = fence, .state = 1, .early = early, .nearly = ne, .qaddr = q, .nq = nq, .nlo = nlo, .nhi = nhi, .nn = 0, .wlo = wlo, .whi = whi, .wmx = wmx, .nw = nw};
     pthread_mutex_unlock(&g_mu);
     g_pls_st.subs++; g_pls_st.ranges += (uint64_t)na; g_pls_st.nonstatic += (uint64_t)nn;
     g_pls_st.ns += pl_now() - t0; g_pls_st.t_commit += pl_now() - t0;
@@ -502,13 +527,21 @@ static int pl_commit(uint64_t fence, post_op *ops, int n) {
 }
 static uint64_t gpu_ticks(void);
 static void pl_apply_early(post_op *ops, int n) {   // event signals / constant counter reports, written for the GPU (not CPU writes)
+    /* the pages are made writable once each (most results of a frame lie in a few pages), then protected again */
+    enum { PGS = 64 }; uintptr_t pg[PGS]; void *tok[PGS]; int np = 0; uintptr_t pgm = (uintptr_t)getpagesize() - 1;
+    uint64_t t = gpu_ticks();
     for (int i = 0; i < n; i++) {
         void *at = ops[i].kind == 1 ? (void *)ops[i].val : (void *)(uintptr_t)ops[i].addr; size_t len = ops[i].kind == 1 ? 4 : 16;
-        void *tok = nvn_dirty_tracked(at, len) ? nvn_dirty_gpu_write_begin(at, len) : NULL;
+        uintptr_t p0 = (uintptr_t)at & ~pgm; int k = 0, one = (((uintptr_t)at + len - 1) & ~pgm) == p0;
+        while (k < np && pg[k] != p0) k++;
+        void *own = NULL;
+        if (k == np && one && np < PGS) { pg[np] = p0; tok[np] = nvn_dirty_tracked((const void *)p0, pgm + 1) ? nvn_dirty_gpu_write_begin((void *)p0, pgm + 1) : NULL; np++; }
+        else if (k == np) own = nvn_dirty_tracked(at, len) ? nvn_dirty_gpu_write_begin(at, len) : NULL;   // over a page border, or too many pages
         if (ops[i].kind == 1) { if (ops[i].mode == 1) *ops[i].val += ops[i].v; else *ops[i].val = ops[i].v; }
-        else { uint64_t rec[2] = {0, gpu_ticks()}; memcpy(at, rec, sizeof rec); }
-        nvn_dirty_gpu_write_end(tok);
+        else { uint64_t rec[2] = {0, t}; memcpy(at, rec, sizeof rec); }
+        nvn_dirty_gpu_write_end(own);
     }
+    for (int k = 0; k < np; k++) nvn_dirty_gpu_write_end(tok[k]);
 }
 static void cpend_done_known(uint64_t fence);
 /* Completion handler of fence: the early results to apply now (NULL: none, or the release applied them). */
@@ -548,6 +581,7 @@ void mtl_pl_release(uint64_t fence, uint64_t prev, int dry) {
     nvn_pl_set_released(fence, prev);
     int nn = 0; for (int i = 0; i < nt; i++) nn += take[i].nn;
     uintptr_t *nlo = nn ? malloc(sizeof *nlo * (size_t)nn) : NULL, *nhi = nn ? malloc(sizeof *nhi * (size_t)nn) : NULL; nn = 0;
+    uint64_t ta = pl_now();
     for (int i = 0; i < nt; i++) {
         if (take[i].nearly) { pl_apply_early(take[i].early, take[i].nearly); free(take[i].early); cpend_done_known(take[i].fence); }
         if (take[i].nq && !dry) for (int q = 0; q < take[i].nq; q++) {   // TOTK_PIPELINE_QUERY=visible
@@ -557,8 +591,11 @@ void mtl_pl_release(uint64_t fence, uint64_t prev, int dry) {
         if (take[i].nn && nlo && nhi) { memcpy(nlo + nn, take[i].nlo, sizeof *nlo * (size_t)take[i].nn); memcpy(nhi + nn, take[i].nhi, sizeof *nhi * (size_t)take[i].nn); nn += take[i].nn; }
         free(take[i].nlo); free(take[i].nhi); free(take[i].qaddr);
     }
-    nvn_pl_reprotect(done, fence, nlo, nhi, nn);
+    uint64_t tb = pl_now();
+    nvn_pl_reprotect(done, fence, NULL, NULL, 0);   // the non-static ranges were protected when published; CPU writes since: the ring
     free(nlo); free(nhi);
+    uint64_t tc = pl_now();
+    atomic_fetch_add(&g_pl_rel_t[0], tb - ta); atomic_fetch_add(&g_pl_rel_t[1], tc - tb);
     if (dry && g_pl_rwatch && g_sub_serial >= g_pl_rwatch) {   // TOTK_PIPELINE_RWATCH: the pages the released frame's GPU work wrote, until the next frame wait returns
         enum { WMAX = 4096 }; uintptr_t *w = malloc(sizeof *w * WMAX); int k = 0; uintptr_t pg = (uintptr_t)getpagesize();
         pthread_mutex_lock(&g_mu);
@@ -575,7 +612,9 @@ void mtl_pl_release(uint64_t fence, uint64_t prev, int dry) {
         atomic_fetch_add(&g_pl_early, 1);
         totk_tl(TL_EARLY, fence, prev);
     }
+    uint64_t td = pl_now();
     plds_publish();
+    atomic_fetch_add(&g_pl_rel_t[2], pl_now() - td);
     atomic_fetch_add(&g_pl_rel_ns, pl_now() - t0); atomic_fetch_add(&g_pl_rel_n, 1);
     if (g_pl_log > 0 && !dry) { g_pl_log--; MLOG("[pipeline] frame wait for fence %llu released at fence %llu (%d submissions in flight)", (unsigned long long)fence, (unsigned long long)prev, nt); }
 }
@@ -631,7 +670,7 @@ static void pl_invalidate(const void *ap, uint64_t n, uint64_t caller) {
           if (fresh || (hit && g_pl_log > 0)) MLOG("[pipeline] invalidate %#llx+%llu from main+%#llx%s", (unsigned long long)a, (unsigned long long)n, (unsigned long long)caller,
                hit ? [NSString stringWithFormat:@": GPU work of released fence %llu writes %#llx+%llu there, waited (snapshot from the next submission)", (unsigned long long)hf, (unsigned long long)wlo, (unsigned long long)(whi - wlo)].UTF8String : "");
       } else os_unfair_lock_unlock(&g_plivs_lk); }
-    plds_publish();
+    plds_publish_x(a, b > a ? b : a + 1);
 }
 uint64_t mtl_done_fence(void) { return pl_done_fn(); }
 
@@ -642,6 +681,9 @@ static void pl_stats_line(void) {
     uint64_t snaps = 0, lives = 0; for (int k = 0; k < PLK_N; k++) { snaps += g_pls_st.snaps[k]; lives += g_pls_st.live[k]; }
     static uint64_t last_gate_n, last_gate_ns, last_inval_gates, last_inval_n, last_rel_n, last_rel_ns;
     uint64_t gn = atomic_load(&g_pl_gate_n), gns = atomic_load(&g_pl_gate_ns), ig = atomic_load(&g_pl_inval_gates), in = atomic_load(&g_pl_inval_n), rn = atomic_load(&g_pl_rel_n), rns = atomic_load(&g_pl_rel_ns);
+    static uint64_t last_rt[3]; uint64_t rt[3]; for (int i = 0; i < 3; i++) { rt[i] = atomic_load(&g_pl_rel_t[i]) - last_rt[i]; last_rt[i] += rt[i]; }
+    double rdiv = rn > last_rel_n ? (double)(rn - last_rel_n) : 1.0;
+    MLOG("[pipeline] release on the game thread per frame wait: early results %.3f, protection %.3f, snapshots published %.3f ms", pl_ns(rt[0]) / rdiv / 1e6, pl_ns(rt[1]) / rdiv / 1e6, pl_ns(rt[2]) / rdiv / 1e6);
     MLOG("[pipeline] %llu submissions: frame waits %llu, released early %llu (lead %.2f ms avg, %.2f max before completion); last 600: release %.3f ms on the game thread, gate waits %llu (%.3f ms avg), invalidates %llu (%llu of them waited)",
          (unsigned long long)g_pls_st.subs, (unsigned long long)atomic_load(&g_pl_waits), (unsigned long long)atomic_load(&g_pl_early),
          atomic_load(&g_pl_lead_n) ? pl_ns(atomic_load(&g_pl_lead_ns)) / (double)atomic_load(&g_pl_lead_n) / 1e6 : 0.0, pl_ns(atomic_exchange(&g_pl_lead_max, 0)) / 1e6,
@@ -660,9 +702,10 @@ static void pl_stats_line(void) {
          g_pls_st.memo_hits / s, g_pls_st.cache_hits / s, lives / s, g_pls_st.live_static / s, g_pls_st.live_gpuw / s, g_pls_st.live_big / s, g_pls_st.over_budget / s, g_pls_st.live_noshot / s,
          g_pls_st.live[PLK_VB] / s, g_pls_st.live[PLK_IB] / s, g_pls_st.live[PLK_SB] / s, g_pls_st.live[PLK_UB] / s, g_pls_st.live[PLK_CP] / s, g_pls_st.live[PLK_TX] / s,
          g_pls_st.writes / s, g_pls_st.ranges / s, g_pls_st.nonstatic / s);
-    MLOG("[pipeline] last 600: holds %llu (host writes %llu, %.2f ms total, timed out %llu), passes (another part of the page) %llu, dry-run would-hold %llu, host threads not held %llu, watched GPU-written pages read %llu / written %llu; pages protected again at releases %llu (unprotect ring overflows %llu), put on probation %llu; readback snapshots: active %d (activated %llu, learned from invalidates %llu), published %llu, CPU merges %llu, conflicts %llu, ring full %llu, redirects %llu",
+    MLOG("[pipeline] last 600: holds %llu (host writes %llu, %.2f ms total, timed out %llu), passes (another part of the page) %llu, dry-run would-hold %llu, host threads not held %llu, watched GPU-written pages read %llu / written %llu; pages protected again at releases %llu (unprotect ring overflows %llu), put on probation %llu, protected at publication %llu, left writable after repeated passes %llu, spans over 16 MiB %llu; readback snapshots: active %d (activated %llu, learned from invalidates %llu), published %llu, CPU merges %llu, conflicts %llu, ring full %llu, redirects %llu",
          (unsigned long long)d[NVN_PLS_HOLD], (unsigned long long)d[NVN_PLS_HOLD_HOST], d[NVN_PLS_HOLD_NS] / 1e6, (unsigned long long)d[NVN_PLS_TIMEOUT], (unsigned long long)d[NVN_PLS_PASS], (unsigned long long)d[NVN_PLS_WOULD],
          (unsigned long long)d[NVN_PLS_HOSTSKIP], (unsigned long long)d[NVN_PLS_WATCH_READ], (unsigned long long)d[NVN_PLS_WATCH_WRITE], (unsigned long long)d[NVN_PLS_REPROT], (unsigned long long)d[NVN_PLS_URING_OVER], (unsigned long long)d[NVN_PLS_PROBATION],
+         (unsigned long long)d[NVN_PLS_SPANPROT], (unsigned long long)d[NVN_PLS_PASSKEEP], (unsigned long long)d[NVN_PLS_BIGSPAN],
          atomic_load(&g_plds_live), (unsigned long long)atomic_load(&g_plds_act), (unsigned long long)atomic_load(&g_plds_learned), (unsigned long long)atomic_load(&g_plds_pub), (unsigned long long)atomic_load(&g_plds_merge),
          (unsigned long long)atomic_load(&g_plds_conflict), (unsigned long long)atomic_load(&g_plds_skip), (unsigned long long)g_pls_st.dsnap_redirects);
     if (d[NVN_PLS_HOLD] || d[NVN_PLS_WOULD] || d[NVN_PLS_HOLD_HOST] || d[NVN_PLS_WATCH_READ] || d[NVN_PLS_WATCH_WRITE]) {   // who: the latest held / would-be held / watched accesses, with the code that called them
