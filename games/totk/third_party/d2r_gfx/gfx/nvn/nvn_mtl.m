@@ -193,14 +193,17 @@ static void bg_gate(void) {
     pthread_mutex_lock(&g_bg_mu); while (atomic_load(&g_app_inactive)) pthread_cond_wait(&g_bg_cv, &g_bg_mu); pthread_mutex_unlock(&g_bg_mu);
     MLOG("App 不在前台：GPU 提交暂停了 %.1f s，现在继续", (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e9);
 }
-static void q4_commit(id<MTL4CommandBuffer> cb, TotkCommitOptions *o) {
+/* One commit of n command buffers, executed in array order; the options' feedback handlers run once, when all of them
+   completed (TOTK_SIDE_CB commits a chunk's command buffers together). */
+static void q4_commit_n(const __strong id<MTL4CommandBuffer> *cbs, int n, TotkCommitOptions *o) {
     bg_gate();
     gpu_budget_check("提交命令缓冲");
     atomic_fetch_add(&g_q4_inflight, 1);
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { (void)f; if (atomic_fetch_sub(&g_q4_inflight, 1) == 1 && g_ka_idle) dispatch_semaphore_signal(g_ka_idle); }];
-    if (!nogpu()) { id<MTL4CommandBuffer> buffers[] = {cb}; [g_q4 commit:buffers count:1 options:o]; return; }
+    if (!nogpu()) { [g_q4 commit:cbs count:(NSUInteger)n options:o]; return; }
     for (MTL4CommitFeedbackHandler h in o->handlers) h(nil);
 }
+static void q4_commit(id<MTL4CommandBuffer> cb, TotkCommitOptions *o) { id<MTL4CommandBuffer> buffers[] = {cb}; q4_commit_n(buffers, 1, o); }
 static void cb_commit(id<MTLCommandBuffer> cb) { bg_gate(); if (!nogpu()) [cb commit]; }
 static void cb_wait(id<MTLCommandBuffer> cb) { if (!nogpu()) [cb waitUntilCompleted]; }
 static uint64_t g_fence;                        // 已提交的最大栅栏值（提交线程独占递增） | Highest committed fence value (incremented exclusively by the submit thread)
@@ -1030,6 +1033,16 @@ static zskip_zero g_zskip_cand[8]; static uint8_t g_zskip_cand_ok[8];
 static void zskip_clear(void);
 static int tbdr_on(void);
 static id g_cb;
+/* TOTK_SIDE_CB state (see cb_for_replay, defined after the encode stage). Allocator index 0 is the submission's own
+   allocator g_alloc4[g_alloc_cur], 1..SIDE_N its side allocators g_side_alloc[g_alloc_cur][i - 1], created on first use and
+   reset with the main one when the slot is picked again (mtl_sub_begin: the GPU has completed every command buffer of
+   that submission). g_side_cb: earlier command buffers of the chunk being encoded, in order (g_cb follows them); open =
+   still recording (the encode stage may still be on it until the FIFO position mark is consumed). */
+enum { SIDE_N = 4, SIDE_LIST = 32 };
+static id<MTL4CommandAllocator> g_side_alloc[ALLOC_MAX][SIDE_N]; static uint8_t g_side_used[ALLOC_MAX];
+static __strong id g_side_cb[SIDE_LIST]; static uint64_t g_side_mark[SIDE_LIST]; static uint8_t g_side_cba[SIDE_LIST], g_side_open[SIDE_LIST];
+static int g_side_n, g_cb_alloc; static unsigned g_side_busy = 1;   // busy: bit a = allocator a services a command buffer that is still recording
+static uint64_t g_side_switches, g_side_fallbacks, g_side_extra, g_side_idle;
 static id<MTL4ComputeCommandEncoder> g_blit;
 static int g_blit_alias; // shared encoder may have accessed aliased buffer storage
 static int g_copy_probe_no_alias; // probe-gpu-copy-alias negative control only: copies without alias visibility
@@ -1142,6 +1155,8 @@ void mtl_sub_begin(void) {
     if (alloc_i < 0) { alloc_i = 0; for (int i = 1; i < g_alloc_n; i++) if (g_alloc_fence[i] < g_alloc_fence[alloc_i]) alloc_i = i; g_alloc_waits++; mtl_wait(g_alloc_fence[alloc_i], UINT64_MAX); }
     g_alloc_cur = alloc_i;
     [g_alloc4[alloc_i] reset];
+    for (int j = 0; j < SIDE_N; j++) if (g_side_used[alloc_i] >> j & 1) [g_side_alloc[alloc_i][j] reset];   // TOTK_SIDE_CB: same lifetime as the main allocator
+    g_side_used[alloc_i] = 0; g_side_n = 0; g_cb_alloc = 0; g_side_busy = 1;
     [g_cb beginCommandBufferWithAllocator:g_alloc4[alloc_i]];
     g_commit_blocks = [NSMutableArray array];
     chunk_cfg(); g_sub_chunks = 0; g_chunk_mark = g_stat_draw;
@@ -1343,6 +1358,59 @@ static inline void es_begin(id e);   // render state cache, defined with the sta
    first (a Metal command buffer encodes one encoder at a time). */
 static inline void blit_close(void) { if (g_blit) { m4_end(g_blit); g_blit = nil; } }
 #include "nvn_render_stream.h"
+/* TOTK_SIDE_CB (opt-in: =1 on), 2026-10-23. A Metal command buffer records one encoder at a time, so an encoder the replay
+   thread opens itself (compute / copy) right after a render pass the encode stage owns waited in rs_sync until the encode
+   stage had finished that pass: 306 samples at dispatches plus 31 at copies in the Korok Forest profile, about 5.5% of the
+   translate thread. With the switch, such an encoder goes into a new command buffer instead (from another allocator: an
+   allocator serves one recording command buffer at a time), and the encode stage finishes the pass in the old one
+   meanwhile. The old one is ended once the encode stage has consumed everything queued for it (checked at the next
+   switch, at the latest at the chunk commit, which drains the encode stage as before), and every command buffer of the
+   chunk is committed in one commit, in recording order. Ordering on the GPU is unchanged: commands are the same and in
+   the same order; every replay encoder starts with a queue barrier, which orders it after all earlier work on the queue,
+   across command buffers (as for the mid-submission chunks); residency sets are attached to the queue
+   (addResidencySet), not to command buffers. The fence, feedback handlers, counter write-backs, arena and the
+   TOTK_PASS_GPU stamps stay on the commit of the submission's last chunk; no switch while TOTK_PASS_GPU is active (the
+   render stream is off then anyway). At most SIDE_N side allocators per submission slot and SIDE_LIST command buffers per
+   chunk; beyond that it waits as before (counted as a fallback). */
+static int side_cb_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_SIDE_CB"); v = e && atoi(e) > 0; if (v) MLOG("TOTK_SIDE_CB=1: compute / copy encoders after a streamed render pass open a new command buffer instead of waiting for the encode stage"); } return v; }
+static id<MTL4CommandAllocator> side_alloc(int a) {
+    if (!a) return g_alloc4[g_alloc_cur];
+    __strong id<MTL4CommandAllocator> *s = &g_side_alloc[g_alloc_cur][a - 1];
+    if (!*s) { NSError *e = nil; MTL4CommandAllocatorDescriptor *ad = [MTL4CommandAllocatorDescriptor new]; ad.label = [NSString stringWithFormat:@"nvn-mtl side allocator %d.%d", g_alloc_cur, a];
+               *s = [g_dev newCommandAllocatorWithDescriptor:ad error:&e]; if (!*s) MDIE("side MTL4CommandAllocator: %s", e.localizedDescription.UTF8String); }
+    g_side_used[g_alloc_cur] |= (uint8_t)(1u << (a - 1));
+    return *s;
+}
+/* End the earlier command buffers the encode stage is done with (consumed: its FIFO position). */
+static void side_reap(uint64_t consumed) {
+    for (int i = 0; i < g_side_n; i++) if (g_side_open[i] && g_side_mark[i] <= consumed) {
+        [(id<MTL4CommandBuffer>)g_side_cb[i] endCommandBuffer]; g_side_open[i] = 0; g_side_busy &= ~(1u << g_side_cba[i]);
+    }
+}
+/* Before an encoder the replay thread opens on g_cb itself (instead of rs_sync). */
+static void cb_for_replay(void) {
+    if (!g_rs_created) return;
+    if (!side_cb_on() || !g_cb || pt_active()) { rs_sync(); if (g_side_n) side_reap(g_rs_fifo.produced); return; }
+    if (g_rs_active) MDIE("render stream: the replay opens an encoder inside a streamed pass");   // as rs_sync
+    rs_publish();
+    uint64_t produced = g_rs_fifo.produced, consumed = atomic_load_explicit(&g_rs_fifo.consumed, memory_order_acquire);
+    if (g_side_n) side_reap(consumed);
+    if (consumed == produced) { g_side_idle++; return; }   // the encode stage has nothing of g_cb left
+    int a = -1;
+    for (int i = 0; i <= SIDE_N; i++) if (!(g_side_busy >> i & 1)) { a = i; break; }
+    if (a < 0 || g_side_n >= SIDE_LIST) { g_side_fallbacks++; rs_sync(); side_reap(g_rs_fifo.produced); return; }
+    g_side_cb[g_side_n] = g_cb; g_side_mark[g_side_n] = produced; g_side_cba[g_side_n] = (uint8_t)g_cb_alloc; g_side_open[g_side_n] = 1; g_side_n++;
+    id<MTL4CommandBuffer> cb = [g_dev newCommandBuffer];
+    [cb beginCommandBufferWithAllocator:side_alloc(a)];
+    g_cb = cb; g_cb_alloc = a; g_side_busy |= 1u << a; g_side_switches++;
+}
+/* Chunk / submission commit, after rs_sync: the earlier command buffers of the chunk, ended, in order (g_cb not included). */
+static int side_collect(__strong id<MTL4CommandBuffer> *out) {
+    int n = 0;
+    for (int i = 0; i < g_side_n; i++) { if (g_side_open[i]) [(id<MTL4CommandBuffer>)g_side_cb[i] endCommandBuffer]; out[n++] = g_side_cb[i]; g_side_cb[i] = nil; g_side_open[i] = 0; }
+    g_side_n = 0; g_side_busy = 1u << g_cb_alloc; g_side_extra += (uint64_t)n;
+    return n;
+}
 static inline id<MTL4RenderCommandEncoder> enc_r_begin(MTL4RenderPassDescriptor *d) { blit_close();
     int bm = bar_start_mode();
     if (hz_on() && g_hz_next && bm == 1) {   // TOTK_HZ: a replayed pass (rp_begin_ex described its attachments)
@@ -1420,7 +1488,7 @@ static inline void enc_r_draw(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p
 static inline void enc_r_draw_instanced(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger v, NSUInteger n, NSUInteger i, NSUInteger b) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_INSTANCED,.u={p,v,n,i,b}},1); else [e drawPrimitives:p vertexStart:v vertexCount:n instanceCount:i baseInstance:b]; }
 static inline void enc_r_draw_indexed(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger n, MTLIndexType t, uint64_t gpu, NSUInteger len, NSUInteger i, NSInteger bv, NSUInteger bi) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_INDEXED,.u={p,n,t,gpu,len,i,(uint64_t)bv,bi}},1); else [e drawIndexedPrimitives:p indexCount:n indexType:t indexBuffer:gpu indexBufferLength:len instanceCount:i baseVertex:bv baseInstance:bi]; }
 static inline void enc_r_store(id<MTL4RenderCommandEncoder> e, int depth, MTLStoreAction action, NSUInteger index) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_STORE,.u={(uint64_t)depth,action,index}},0); else if (depth == 1) [e setDepthStoreAction:action]; else if (depth == 2) [e setStencilStoreAction:action]; else [e setColorStoreAction:action atIndex:index]; }
-static inline id<MTL4ComputeCommandEncoder> enc_c_begin(MTLComputePassDescriptor *d) { (void)d; blit_close(); rs_sync(); pt_mark(g_cb, 'C', nil); id<MTL4ComputeCommandEncoder> e = [g_cb computeCommandEncoder]; if (bar_start_on()) [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:bar_vis()]; [e setArgumentTable:g_ct]; return e; }
+static inline id<MTL4ComputeCommandEncoder> enc_c_begin(MTLComputePassDescriptor *d) { (void)d; blit_close(); cb_for_replay(); pt_mark(g_cb, 'C', nil); id<MTL4ComputeCommandEncoder> e = [g_cb computeCommandEncoder]; if (bar_start_on()) [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:bar_vis()]; [e setArgumentTable:g_ct]; return e; }
 static inline id<MTLComputeCommandEncoder> enc_c_begin_concurrent(id<MTLCommandBuffer> cb) { return [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]; }
 static inline void enc_c_end(id e) { m4_end(e); }
 static inline void enc_c_pso(id e, id<MTLComputePipelineState> p) { [e setComputePipelineState:p]; }
@@ -1444,7 +1512,7 @@ static uint64_t g_blit_opens, g_blit_splits, g_upd_n, g_upd_split, g_copy_n, g_c
 static int blit_bar_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_BLIT_BAR"); v = !e || atoi(e); } return v; }
 static id<MTL4ComputeCommandEncoder> blit_kind(int buffer_alias) { blit_note(); if (!g_blit) { g_blit_opens++; g_blit_splits += g_enc != nil; } rp_end();
     if (buffer_alias && !g_copy_probe_no_alias) g_blit_alias = 1; // rp_end may itself open and close a copy encoder
-    if (!g_blit) { rs_sync(); ser_gate(); pt_mark(g_cb, 'B', nil); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:blit_vis()]; }
+    if (!g_blit) { cb_for_replay(); ser_gate(); pt_mark(g_cb, 'B', nil); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:blit_vis()]; }
     else if (blit_bar_on()) [g_blit barrierAfterEncoderStages:MTLStageBlit | MTLStageDispatch beforeEncoderStages:MTLStageBlit | MTLStageDispatch visibilityOptions:blit_vis()];
     return g_blit; }
 static id<MTL4ComputeCommandEncoder> blit(void) { return blit_kind(0); }
@@ -2195,10 +2263,11 @@ static void mtl_sub_split(void) {
     }];
     if (totk_tl_on()) { uint64_t tlid = totk_tl_commit_id(); totk_tl(TL_COMMIT, tlid, 0);
         [o addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { totk_tl_at(TL_GPU, (uint64_t)(fb.GPUStartTime * 1e9), tlid, (uint64_t)(fb.GPUEndTime * 1e9)); }]; }
-    [g_cb endCommandBuffer];
-    q4_commit(g_cb, o);
+    __strong id<MTL4CommandBuffer> list[SIDE_LIST + 1]; int nl = side_collect(list);   // TOTK_SIDE_CB: the chunk's earlier command buffers first
+    [g_cb endCommandBuffer]; list[nl++] = g_cb;
+    q4_commit_n(list, nl, o);
     g_cb = [g_dev newCommandBuffer];
-    [g_cb beginCommandBufferWithAllocator:g_alloc4[g_alloc_cur]];
+    [g_cb beginCommandBufferWithAllocator:g_alloc4[g_alloc_cur]]; g_cb_alloc = 0; g_side_busy = 1;
     g_sub_chunks++; g_chunk_commits++; g_chunk_mark = g_stat_draw;
     if (fc_first) { uint64_t fc4 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); g_fc_t[1] += fc0 - g_fc_snap_end; g_fc_t[2] += fc1 - fc0; g_fc_t[3] += fc2 - fc1; g_fc_t[4] += fc3 - fc2; g_fc_t[5] += fc4 - fc3; g_fc_n++; }
 }
@@ -2297,8 +2366,9 @@ uint64_t mtl_sub_commit(void) {
     res_commit();
     if (totk_tl_on()) { uint64_t tlid = totk_tl_commit_id(); totk_tl(TL_COMMIT, tlid, 1); totk_tl(TL_FENCE, tlid, fence);
         [o addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { totk_tl_at(TL_GPU, (uint64_t)(fb.GPUStartTime * 1e9), tlid, (uint64_t)(fb.GPUEndTime * 1e9)); }]; }
-    [g_cb endCommandBuffer];
-    q4_commit(g_cb, o);
+    __strong id<MTL4CommandBuffer> list[SIDE_LIST + 1]; int nl = side_collect(list);   // TOTK_SIDE_CB: the chunk's earlier command buffers first
+    [g_cb endCommandBuffer]; list[nl++] = g_cb;
+    q4_commit_n(list, nl, o);
     if (nogpu()) g_ev.signaledValue = fence; else [g_q4 signalEvent:g_ev value:fence];
     dead_put_flush();   // textures created for finalized serials: released once this submission completes
     stor_sweep(fence);   // TOTK: storage-shared textures nobody held for a while
@@ -4004,8 +4074,9 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     MLOG("[replay-fast] upd-filter=%d queries=%llu skipped=%llu | sig incremental=%llu full=%llu | tex-ser-fast steps=%llu",upd_fast_on(),(unsigned long long)g_upd_filter_q,(unsigned long long)g_upd_filter_skip,
          (unsigned long long)g_sig_incr_n,(unsigned long long)g_sig_full_n,(unsigned long long)g_tex_ser_fast_n);
     { int dfon; uint64_t dskip, dhash, dscan; nvn_dirty_fast_stats(&dfon, &dskip, &dhash, &dscan);
-      MLOG("[replay-fast2] dirty-fast=%d blocks-skipped=%llu range-table=%llu range-scans=%llu | cbuf-cache=%d hits=%llu misses=%llu verified=%llu | ab-same=%llu", dfon, (unsigned long long)dskip, (unsigned long long)dhash, (unsigned long long)dscan,
-           cbc_mode(), (unsigned long long)g_cbc_hits, (unsigned long long)g_cbc_misses, (unsigned long long)g_cbc_verified, (unsigned long long)g_ab_same); }
+      MLOG("[replay-fast2] dirty-fast=%d blocks-skipped=%llu range-table=%llu range-scans=%llu | cbuf-cache=%d hits=%llu misses=%llu verified=%llu | ab-same=%llu | side-cb=%d switches=%llu idle=%llu fallbacks=%llu extra-cbs=%llu", dfon, (unsigned long long)dskip, (unsigned long long)dhash, (unsigned long long)dscan,
+           cbc_mode(), (unsigned long long)g_cbc_hits, (unsigned long long)g_cbc_misses, (unsigned long long)g_cbc_verified, (unsigned long long)g_ab_same,
+           side_cb_on(), (unsigned long long)g_side_switches, (unsigned long long)g_side_idle, (unsigned long long)g_side_fallbacks, (unsigned long long)g_side_extra); }
     MLOG("[pkg-final-cache] enabled=%d kept=%llu", pkg_final_cache_on(), (unsigned long long)atomic_load(&g_pkg_final_kept));
     MLOG("贴图类型缓存已回收退役视图 %llu 个", (unsigned long long)g_type_retired_views);
     res_site_report(8);
@@ -12266,7 +12337,7 @@ static int g_disp_probe_nobar;   // probe-gpu-dispatch-chain negative control: n
 static id<MTL4ComputeCommandEncoder> disp_enc(void) {
     int open = g_blit != nil;
     g_disp_n++; g_disp_shared += open;
-    if (!open) { rs_sync(); ser_gate(); pt_mark(g_cb, 'C', nil); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:bar_vis()]; }
+    if (!open) { cb_for_replay(); ser_gate(); pt_mark(g_cb, 'C', nil); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:bar_vis()]; }
     else if (!g_disp_probe_nobar) [g_blit barrierAfterEncoderStages:MTLStageBlit | MTLStageDispatch beforeEncoderStages:MTLStageBlit | MTLStageDispatch visibilityOptions:bar_vis()];
     [g_blit setArgumentTable:g_ct]; args_dirty_all();
     if (g_disp_n % 20000 == 0) MLOG("[nvn] 计算派发 至 %llu 次：其中 %llu 次（%.0f%%）接在已开的计算编码器里，没有另开编码器", (unsigned long long)g_disp_n, (unsigned long long)g_disp_shared, 100.0 * (double)g_disp_shared / (double)g_disp_n);
