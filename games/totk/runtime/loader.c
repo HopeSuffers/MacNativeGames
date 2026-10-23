@@ -51,11 +51,9 @@ void *runtime_symbol(const char *name) {
  return NULL;
 }
 uint8_t *runtime_module_base(const char *name){for(unsigned i=0;i<NM;i++)if(!strcmp(modules[i].name,name))return modules[i].base;return NULL;}
-#ifdef GAME_BOTW
 /* Is pc in a module's original code (not in the patch area, where rewritten windows and gates are)? Called from a signal
-   handler (threads.c, asynchronous preemption): only reads the module table. */
+   handler (threads.c, asynchronous preemption; Tears of the Kingdom only with TOTK_ASYNC_PREEMPT=1): only reads the module table. */
 int runtime_guest_code_pc(uint64_t pc){for(unsigned i=0;i<NM;i++){uint64_t b=(uintptr_t)modules[i].base;if(b&&pc>=b&&pc-b<modules[i].text_end)return 1;}return 0;}
-#endif
 /* RELRO in newer SDKs protects relocated data after linking. Keep permissions at
  * the guest's 4 KiB granularity. A Darwin 16 KiB page receives the union of its
  * four guest permissions, so protecting an edge never removes access from an
@@ -506,6 +504,12 @@ static void boot(void) {
     runs on core 0 waited for the main thread's next SVC (botw.md). */
  if(!getenv("TOTK_MAIN_PREEMPT")||strcmp(getenv("TOTK_MAIN_PREEMPT"),"0")){extern void runtime_hle_stack_set(uintptr_t top);size_t n=8u<<20;void *hs=mmap(NULL,n,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
   need(hs!=MAP_FAILED&&mprotect(hs,0x4000,PROT_NONE)==0,"main thread host-service stack");runtime_hle_stack_set((uintptr_t)hs+n-64);}
+#else
+ /* Tears of the Kingdom: the same, only with TOTK_ASYNC_PREEMPT=1 (threads.c). Otherwise the main thread's host-stack slot
+    stays 0, its host functions run on its own stack as before, and the preemption signal never takes its core. */
+ {extern int runtime_async_preempt_active(void);
+  if(runtime_async_preempt_active()&&(!getenv("TOTK_MAIN_PREEMPT")||strcmp(getenv("TOTK_MAIN_PREEMPT"),"0"))){extern void runtime_hle_stack_set(uintptr_t top);size_t n=8u<<20;void *hs=mmap(NULL,n,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
+   need(hs!=MAP_FAILED&&mprotect(hs,0x4000,PROT_NONE)==0,"main thread host-service stack");runtime_hle_stack_set((uintptr_t)hs+n-64);fprintf(stderr,"[totk] main thread host-service stack on (asynchronous preemption)\n");}}
 #endif
 #ifdef GAME_BOTW160
  fprintf(stderr,"[totk] ENTER original nn::init::Start (SDK 7)\n");
