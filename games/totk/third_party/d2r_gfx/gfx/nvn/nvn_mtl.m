@@ -1779,6 +1779,37 @@ static upd_ent *g_upd; static int g_nupd, g_updcap; static uint64_t g_upd_lo = U
    in g_upd[0..i], so an overlap query is a binary search plus a backwards walk over actual overlaps: every uniform binding
    of the frame (over ten thousand) is checked, and most overlap nothing. */
 static uint64_t *g_upd_maxhi;
+/* TOTK: a 64 KiB-granule filter in front of that search. Each logged update sets the (hashed) bit of every granule it covers;
+   a query whose granules all have clear bits overlaps no logged update and returns 0 without the search. Vertex / index /
+   storage ranges checked before every draw (upd_guard_draw / upd_guard_stage) are mostly far from the uniform blocks the
+   game updates, yet inside the hull [g_upd_lo, g_upd_hi), so each went through the binary search (~3% of the replay).
+   A set bit (a collision, or a real overlap) falls through to the exact search, and the bits are cleared only together with
+   the log (upd_flush), so the answer is always the search's. An update over more than UPD_GRAN_MAX granules disables the
+   filter until the log is emptied; a query over more than that is searched. TOTK_UPD_FAST=0: off (with the guard plan). */
+#define UPD_BITS 16384
+#define UPD_GRAN_SHIFT 16
+#define UPD_GRAN_MAX 64
+static uint64_t g_upd_bits[UPD_BITS / 64]; static int g_upd_bits_any, g_upd_bits_all;
+static int upd_fast_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_UPD_FAST"); v = !(e && !atoi(e)); if (!v) MLOG("TOTK_UPD_FAST=0: uniform-update overlap checks search the log for every range and walk every binding"); }
+    return v;
+}
+static inline unsigned upd_gran_bit(uint64_t g) { return (unsigned)((g ^ (g >> 14) ^ (g >> 28)) & (UPD_BITS - 1)); }
+static void upd_bits_note(uint64_t lo, uint64_t hi) {
+    uint64_t g0 = lo >> UPD_GRAN_SHIFT, g1 = (hi - 1) >> UPD_GRAN_SHIFT;
+    g_upd_bits_any = 1;
+    if (g1 - g0 >= UPD_GRAN_MAX) { g_upd_bits_all = 1; return; }
+    for (uint64_t g = g0; g <= g1; g++) { unsigned b = upd_gran_bit(g); g_upd_bits[b >> 6] |= UINT64_C(1) << (b & 63); }
+}
+static void upd_bits_clear(void) { if (g_upd_bits_any) { memset(g_upd_bits, 0, sizeof g_upd_bits); g_upd_bits_any = g_upd_bits_all = 0; } }
+static inline int upd_bits_miss(uint64_t lo, uint64_t hi) {   // 1: no logged update can overlap [lo, hi)
+    if (g_upd_bits_all || hi <= lo) return 0;
+    uint64_t g0 = lo >> UPD_GRAN_SHIFT, g1 = (hi - 1) >> UPD_GRAN_SHIFT;
+    if (g1 - g0 >= UPD_GRAN_MAX) return 0;
+    for (uint64_t g = g0; g <= g1; g++) { unsigned b = upd_gran_bit(g); if (g_upd_bits[b >> 6] >> (b & 63) & 1) return 0; }
+    return 1;
+}
 static void upd_insert(uint64_t lo, uint64_t hi) {
     if (g_nupd == g_updcap) {
         g_updcap = g_updcap ? g_updcap * 2 : 256;
@@ -1790,10 +1821,12 @@ static void upd_insert(uint64_t lo, uint64_t hi) {
     g_upd[a] = (upd_ent){lo, hi, ++g_upd_seq}; g_nupd++;
     for (int i = a; i < g_nupd; i++) { uint64_t prev = i ? g_upd_maxhi[i - 1] : 0; g_upd_maxhi[i] = g_upd[i].hi > prev ? g_upd[i].hi : prev; }
     if (lo < g_upd_lo) g_upd_lo = lo; if (hi > g_upd_hi) g_upd_hi = hi;
+    upd_bits_note(lo, hi);   // always kept (cheap), consulted only with TOTK_UPD_FAST
 }
 // Newest seq among logged updates overlapping [lo, hi), 0 when none.
 static uint64_t upd_overlap_seq(uint64_t lo, uint64_t hi) {
     if (!g_nupd || hi <= g_upd_lo || lo >= g_upd_hi) return 0;
+    if (upd_fast_on() && upd_bits_miss(lo, hi)) return 0;
     int a = 0, b = g_nupd; while (a < b) { int m = (a + b) >> 1; if (g_upd[m].lo < hi) a = m + 1; else b = m; }   // entries [0, a) start below hi
     uint64_t last = 0;
     for (int i = a - 1; i >= 0 && g_upd_maxhi[i] > lo; i--) if (g_upd[i].hi > lo && g_upd[i].seq > last) last = g_upd[i].seq;
@@ -1866,7 +1899,7 @@ static void upd_flush(void) {
         i = j;
     }
     if (b) { enc_b_end(g_blit); g_blit = nil; }
-    g_nupd = 0; g_upd_lo = UINT64_MAX; g_upd_hi = 0; g_nshadow = 0;
+    g_nupd = 0; g_upd_lo = UINT64_MAX; g_upd_hi = 0; g_nshadow = 0; upd_bits_clear();
 }
 // Before a non-uniform access to [lo, hi): logged updates overlapping it must be in memory first.
 static int g_upd_guard_off;   // probe-gpu-ub-rename negative control only
@@ -5027,6 +5060,7 @@ static void shmap_load(void) {
 @implementation NvFunctionCache @end
 @interface NvShader : NSObject { @public id<MTLFunction> fn; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, writes_depth, lay_ok; uint8_t drv_scanned[3];   /* drv_scanned (TOTK): driver segment c0 / c2 reads found by drv_scan in the MSL but missing from the reflection json */ /* lay_ok (TOTK): vertex MSL can write the layer (1) or not (-1), 0 = not checked yet; writes_depth (TOTK): the fragment function has a [[depth(...)]] output, so its pipeline needs a depth attachment */ const char *builtin; uint64_t logged; char key[80]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
     uint16_t texture_slots[NVN_REFL_MAXB]; uint8_t texture_count, texture_plan_ready;
+    uint8_t guard_idx[NVN_REFL_MAXB], guard_count, guard_plan_ready;   // TOTK: the bindings upd_guard_stage looks at (storage / typed buffers), from the reflection once
     // 上次编好的参数缓冲
     // The argument buffer encoded last time
     arg_epoch_key ab_epoch; int ab_epoch_ok;
@@ -11141,9 +11175,21 @@ static void upd_dirty_stages(uint64_t lo, uint64_t hi) {
     }
 }
 // TOTK: non-uniform buffer accesses of one stage that may touch renamed uniform updates (checked before an encoder opens).
+/* TOTK (TOTK_UPD_FAST): only the storage / typed-buffer bindings can need a guard; most shaders have none, and the loop over
+   every binding of both stages ran before each draw while updates were logged (~3% of the replay). Same bindings, same order. */
+static void upd_guard_plan(NvShader *sh) {
+    unsigned n = 0;
+    for (int i = 0; i < sh->rf.nb && i < NVN_REFL_MAXB; i++) { const nvn_rbind *b = &sh->rf.b[i];
+        if (((b->kind == NVN_RB_SBUFP || b->kind == NVN_RB_SBUFU) && b->reg < 16) || (b->kind == NVN_RB_TBUF && b->reg < 128)) sh->guard_idx[n++] = (uint8_t)i; }
+    sh->guard_count = (uint8_t)n; sh->guard_plan_ready = 1;
+}
 static void upd_guard_stage(NvShader *sh, int st) {
     if (!g_nupd || !sh || st < 0 || st > 5) return;
-    for (int i = 0; i < sh->rf.nb && g_nupd; i++) {
+    int planned = upd_fast_on();
+    if (planned && !sh->guard_plan_ready) upd_guard_plan(sh);
+    int count = planned ? sh->guard_count : sh->rf.nb;
+    for (int j = 0; j < count && g_nupd; j++) {
+        int i = planned ? sh->guard_idx[j] : j;
         const nvn_rbind *b = &sh->rf.b[i]; int reg = b->reg;
         if (b->kind == NVN_RB_SBUFP && reg < 16) { const p_bind_buf *u = &S.ssbo[st][reg]; if (u->addr) upd_guard(u->addr, u->addr + (u->size ? u->size : 1)); }
         else if (b->kind == NVN_RB_SBUFU && reg < 16) {
