@@ -210,6 +210,7 @@ static void pl_write(uint64_t a, uint64_t n);
 static int pl_read(uint64_t a, uint64_t n, int kind, void **buf, uint64_t *off, uint64_t *gpu);
 static int pl_bind(uint64_t a, uint64_t n, int rw, int kind, int compute, void **buf, uint64_t *gpu);
 static void plds_touch(uint64_t a, uint64_t n, const char *what);
+static int plds_redirect_off(uint64_t a, uint64_t n, int rw, void **buf, uint64_t *off);
 static void plds_pool_gone(uintptr_t lo, uintptr_t hi);
 static void pl_sub_begin(void);
 static void pl_invalidate(const void *a, uint64_t n, uint64_t caller);
@@ -1735,7 +1736,9 @@ void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
     void *sb, *db; uint64_t so, dof;
     if (!mtl_addr(src, n, &sb, &so) || !mtl_addr(dst, n, &db, &dof))
         MDIE("缓冲拷贝地址不在任何内存池内 src=%#llx dst=%#llx n=%#llx", (unsigned long long)src, (unsigned long long)dst, (unsigned long long)n);
-    if (g_pl > 0) { uint64_t pg; plds_touch(src, n, "buffer copy source"); plds_touch(dst, n, "buffer copy target"); pl_read(src, n, PLK_CP, &sb, &so, &pg); }   // TOTK_PIPELINE: a recently CPU-written source is copied from its snapshot
+    if (g_pl > 0) { uint64_t pg;   // TOTK_PIPELINE: readback snapshots (host buffers) as source / target; a recently CPU-written source is copied from its snapshot
+        if (!plds_redirect_off(dst, n, 1, &db, &dof)) {}
+        if (!plds_redirect_off(src, n, 0, &sb, &so)) pl_read(src, n, PLK_CP, &sb, &so, &pg); }
     enc_b_copy_buffer(blit_buffer((__bridge id<MTLBuffer>)sb, so, (__bridge id<MTLBuffer>)db, dof, n), (__bridge id<MTLBuffer>)sb, so, (__bridge id<MTLBuffer>)db, dof, n);
 }
 
@@ -9188,7 +9191,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             void *tv = NULL; uint64_t trid = tid ? tex_fast_rid(tid, &tv) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
             if (passdump()) PD("W %llu st%d reg%d tid=%d %s ser=%llu", g_stat_pass, nvn_stage, reg, tid, t ? "实" : "哑", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull);
             if (t && !(t.usage & MTLTextureUsageShaderWrite)) { RED_ONCE(32, "图像槽绑的贴图没有可写用途（贴图号 %d）", tid); t = nil; }
-            if (t && g_pl > 0 && tid < g_ntreg && g_treg[tid].t.d.target == 10 && g_treg[tid].t.mem) { int bw_, bh_, bpb_ = nvn_fmt_bpb(g_treg[tid].t.d.format, &bw_, &bh_); pl_write((uint64_t)(uintptr_t)g_treg[tid].t.mem, (uint64_t)g_treg[tid].t.d.width * (uint64_t)(bpb_ ? bpb_ : 16)); }   // TOTK_PIPELINE: an image store into a buffer texture writes memory
+            if (t && g_pl > 0 && tid < g_ntreg && g_treg[tid].t.d.target == 10 && g_treg[tid].t.mem) { int bw_, bh_, bpb_ = nvn_fmt_bpb(g_treg[tid].t.d.format, &bw_, &bh_); plds_touch((uint64_t)(uintptr_t)g_treg[tid].t.mem, (uint64_t)g_treg[tid].t.d.width * (uint64_t)(bpb_ ? bpb_ : 16), "image store into a buffer texture"); pl_write((uint64_t)(uintptr_t)g_treg[tid].t.mem, (uint64_t)g_treg[tid].t.d.width * (uint64_t)(bpb_ ? bpb_ : 16)); }   // TOTK_PIPELINE: an image store into a buffer texture writes memory (a readback snapshot there retires)
             if (!t) { t = dummy_img(b->dtt, b->dpf); trid = g_dummy_img_rid[b->dtt & 7][b->dpf & 3]; }   // 未绑：D3D 语义写入丢弃——写进专用哑贴图，不污染读出 0 的那套 | Unbound: D3D semantics discard the write - write into a dedicated dummy texture so the set that reads 0 is not polluted
             slots[aid] = trid;
             USE(t, MTLResourceUsageRead | MTLResourceUsageWrite);
@@ -9198,7 +9201,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             if (t && treg_view_type(tid, t) != MTLTextureTypeTextureBuffer) { RED_ONCE(40, "类型化缓冲槽绑的不是缓冲贴图（贴图号 %d 类型 %lu）", tid, (unsigned long)t.textureType); t = nil; }
             if (bl) PD("B %llu st%d tbuf reg%d tid=%d %s ser=%llu", g_stat_pass, nvn_stage, reg, tid, t ? "实" : "哑", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull);
             if (!t) { t = dummy_tbuf(b->dpf); trid = g_dummy_tbuf_rid[b->dpf & 3]; }
-            else if (g_pl > 0 && tid < g_ntreg && g_treg[tid].t.mem) { int bw_, bh_, bpb_ = nvn_fmt_bpb(g_treg[tid].t.d.format, &bw_, &bh_); pl_live_read((uint64_t)(uintptr_t)g_treg[tid].t.mem, (uint64_t)g_treg[tid].t.d.width * (uint64_t)(bpb_ ? bpb_ : 16), PLK_TX); }   // TOTK_PIPELINE: a buffer texture reads memory
+            else if (g_pl > 0 && tid < g_ntreg && g_treg[tid].t.mem) { int bw_, bh_, bpb_ = nvn_fmt_bpb(g_treg[tid].t.d.format, &bw_, &bh_); plds_touch((uint64_t)(uintptr_t)g_treg[tid].t.mem, (uint64_t)g_treg[tid].t.d.width * (uint64_t)(bpb_ ? bpb_ : 16), "buffer texture"); pl_live_read((uint64_t)(uintptr_t)g_treg[tid].t.mem, (uint64_t)g_treg[tid].t.d.width * (uint64_t)(bpb_ ? bpb_ : 16), PLK_TX); }   // TOTK_PIPELINE: a buffer texture reads memory
             slots[aid] = trid;
             USE(t, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_SBUFU) {   // TOTK: the shader loads this storage buffer's address from a user uniform block (slot reg, byte offset off); resolve that pointer now
@@ -11864,20 +11867,21 @@ static uint16_t vertex_stream_mask(NvShader *vs) {
 static const p_draw *g_pl_dw; static const p_draw_idx *g_pl_di;
 /* The largest index of a draw, kept per (index buffer, count, type) while no page of the indices is written (their pages
    are write-protected for that); a GPU write in flight over them: unknown. */
-typedef struct { uint64_t ibuf, stamp; int32_t count, itype; uint32_t mx; } pl_mi;
+typedef struct { uint64_t ibuf, stamp, sub; int32_t count, itype; uint32_t mx; } pl_mi;
 static pl_mi g_pl_mi[4096];
 static int pl_max_index(const p_draw_idx *di, uint32_t *mx) {
     if (!di->ibuf || di->count <= 0 || di->count > (1 << 20) || di->itype < 0 || di->itype > 2) return 0;
     void *mb; uint64_t mo; size_t isz = di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4, len = (size_t)di->count * isz;
     if (!mtl_addr(di->ibuf, len, &mb, &mo)) return 0;
-    if (nvn_pl_gpu_written((const void *)(uintptr_t)di->ibuf, len, pl_done_fn())) return 0;
     pl_mi *c = &g_pl_mi[((di->ibuf >> 4) ^ (di->ibuf >> 17) ^ (uint64_t)di->count * 31) & 4095];
-    if (c->ibuf == di->ibuf && c->count == di->count && c->itype == di->itype && !nvn_dirty_since((const void *)(uintptr_t)di->ibuf, len, c->stamp)) { *mx = c->mx; return 1; }
+    if (c->sub == g_sub_serial && c->ibuf == di->ibuf && c->count == di->count && c->itype == di->itype) { *mx = c->mx; return 1; }   // checked this submission
+    if (nvn_pl_gpu_written((const void *)(uintptr_t)di->ibuf, len, pl_done_fn())) return 0;
+    if (c->ibuf == di->ibuf && c->count == di->count && c->itype == di->itype && !nvn_dirty_since((const void *)(uintptr_t)di->ibuf, len, c->stamp)) { c->sub = g_sub_serial; *mx = c->mx; return 1; }
     uint64_t stamp = nvn_dirty_now(); nvn_dirty_protect((const void *)(uintptr_t)di->ibuf, len);
     uint32_t m = 0, restart = di->itype == 0 ? 0xff : di->itype == 1 ? 0xffff : 0xffffffffu;
     const uint8_t *p = (const uint8_t *)(uintptr_t)di->ibuf;
     for (int i = 0; i < di->count; i++) { uint32_t v = isz == 1 ? p[i] : isz == 2 ? ((const uint16_t *)p)[i] : ((const uint32_t *)p)[i]; if (v != restart && v > m) m = v; }
-    *c = (pl_mi){di->ibuf, stamp, di->count, di->itype, m};
+    *c = (pl_mi){di->ibuf, stamp, g_sub_serial, di->count, di->itype, m};
     *mx = m; return 1;
 }
 static uint64_t pl_vb_extent(unsigned stream, uint64_t size) {
@@ -12724,7 +12728,7 @@ static void copy_t2b(const p_copy_b2t *c) {
     void *mb; uint64_t mo;
     upd_guard(c->src, c->src + img * nz);   // TOTK: renamed uniform updates before a GPU write to the range
     if (!mtl_addr(c->src, img * nz, &mb, &mo)) { RED_ONCE(31, "贴图→缓冲拷贝的目标不在内存池里"); return; }
-    if (g_pl > 0) plds_touch(c->src, img * nz, "texture-to-buffer copy");   // TOTK_PIPELINE (the write itself: usnap_drop)
+    if (g_pl > 0) plds_redirect_off(c->src, img * nz, 1, &mb, &mo);   // TOTK_PIPELINE: a readback snapshot receives the copy in its host buffer (the write itself: usnap_drop)
     usnap_drop(c->src, img * nz);   // TOTK: a GPU write: no uniform copy of these bytes from here on
     id<MTL4ComputeCommandEncoder> b = blit(); BOTW_T2B_NOTE(c, t, mb, mo, img * nz) BOTW_GPU_COPY_SUPERSEDES(mb, mo, img * nz)
     if (is3d)
@@ -12928,7 +12932,7 @@ static void copy_b2t(const p_copy_b2t *c) {
         defer_obj_release(tb);   // 本次提交跑完再放（并撤驻留） | Release after this submit has finished running (and remove from residency)
         return;
     }
-    if (g_pl > 0) { uint64_t pg; plds_touch(c->src, img * nz, "buffer-to-texture copy"); pl_read(c->src, img * nz, PLK_CP, &mb, &mo, &pg); }   // TOTK_PIPELINE: a recently CPU-written source is copied from its snapshot
+    if (g_pl > 0) { uint64_t pg; if (!plds_redirect_off(c->src, img * nz, 0, &mb, &mo)) pl_read(c->src, img * nz, PLK_CP, &mb, &mo, &pg); }   // TOTK_PIPELINE: a recently CPU-written source is copied from its snapshot
     id<MTL4ComputeCommandEncoder> b = blit();
     if (is3d)
         enc_b_copy_buffer_texture(b, (__bridge id<MTLBuffer>)mb, mo, row, img, MTLSizeMake(c->r.width, c->r.height, nz), t, 0, level, MTLOriginMake(c->r.xoffset, c->r.yoffset, c->r.zoffset));
