@@ -23,9 +23,9 @@ void nvn_dirty_fast_stats(int *on, uint64_t *blk_skips, uint64_t *hash_hits, uin
    the deeper frame wait. Mode: 0 off, 1 on, 2 dry run (TOTK_PIPELINE, read once). */
 enum { NVN_PLS_HOLD, NVN_PLS_HOLD_HOST, NVN_PLS_HOLD_NS, NVN_PLS_TIMEOUT, NVN_PLS_WOULD, NVN_PLS_HOSTSKIP, NVN_PLS_PROBATION,
        NVN_PLS_REPROT, NVN_PLS_UNTRACKED, NVN_PLS_WATCH_READ, NVN_PLS_WATCH_WRITE, NVN_PLS_PASS, NVN_PLS_URING_OVER,
-       NVN_PLS_PASSKEEP, NVN_PLS_SPANPROT, NVN_PLS_BIGSPAN, NVN_PLS_N };
+       NVN_PLS_PASSKEEP, NVN_PLS_SPANPROT, NVN_PLS_BIGSPAN, NVN_PLS_WWPASS, NVN_PLS_N };
 enum { NVN_PL_BT = 3 };
-typedef struct { uint64_t pc, addr; uint32_t frame, host; uint64_t rfence, released, bt[NVN_PL_BT]; } nvn_pl_hold_rec;   // bt: lr, then the frame chain   // host: 0 guest write fault, 1 announced host write, 2 / 3 read / write of a watched GPU-written page
+typedef struct { uint64_t pc, addr; uint32_t frame, host; uint64_t rfence, released, bt[NVN_PL_BT]; uint32_t kinds; } nvn_pl_hold_rec;   // kinds: 1 met a read range, 2 a GPU write range   // bt: lr, then the frame chain   // host: 0 guest write fault, 1 announced host write, 2 / 3 read / write of a watched GPU-written page
 uint64_t nvn_dirty_range_gen(void);   // changes whenever a tracked range goes live or dies
 int nvn_pl_mode(void);
 void nvn_pl_set_done(uint64_t (*done)(void));                   // completed fence, signal-safe
@@ -35,7 +35,7 @@ int nvn_pl_classify(const void *addr, size_t len, uint32_t keep, uint32_t probe,
 void nvn_pl_gpu_write(const void *addr, size_t len, uint64_t fence);
 int nvn_pl_gpu_written(const void *addr, size_t len, uint64_t done);
 int nvn_pl_inflight(const void *addr, size_t len, uint64_t done, uint64_t released);   // overlaps an in-place range of a submission in (done, released]
-void nvn_pl_publish(uint64_t fence, const uintptr_t *lo, const uintptr_t *hi, int n);       // in-place ranges, sorted by start
+void nvn_pl_publish(uint64_t fence, const uintptr_t *lo, const uintptr_t *hi, int n, int writes);   // in-place reads (writes 0) or GPU writes (1), sorted by start
 int nvn_pl_reprotect(uint64_t done, uint64_t released, const uintptr_t *nlo, const uintptr_t *nhi, int nn);
 void nvn_pl_protect_span(const void *addr, size_t len);   // translate thread: a non-static in-place range, protected at its publication
 void nvn_pl_stats(uint64_t v[NVN_PLS_N]);

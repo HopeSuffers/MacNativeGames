@@ -102,61 +102,15 @@ typedef struct { uintptr_t lo, hi; int kind; } pl_wrng;
 static struct { pl_wrng *r; int n, cap; } g_plr_w;   // its GPU writes, with what wrote them (g_pl_wk)
 static const char *const g_plw_name[PLW_N] = {"other", "inline uniform update", "renamed uniform updates (flush)", "buffer copy", "texture-to-buffer copy", "storage buffer", "storage pointer (64 KiB taken)", "built-in kernel", "image store"};
 static uint64_t *g_plq; static int g_plq_n, g_plq_cap;   // occlusion report addresses (TOTK_PIPELINE_QUERY=visible)
-/* Write protection of spans the replay decided on (static spans, probation runs, non-static in-place ranges) runs on a
-   helper thread, not on the translate thread (the mprotect calls of new data were the slow translations of streaming
-   frames). A release first makes sure every span queued up to its submission is done (pl_protq_sync). */
-static pthread_mutex_t g_plpq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_plpq_cv = PTHREAD_COND_INITIALIZER;
-static pl_rng *g_plpq; static int g_plpq_n, g_plpq_cap; static uint64_t g_plpq_seq, g_plpq_done, g_plpq_busy_to; static int g_plpq_busy;
-static _Atomic uint64_t g_plpq_inline, g_plpq_spans;
-static void pl_protq_run(pl_rng *v, int n) { for (int i = 0; i < n; i++) nvn_pl_protect_span((const void *)v[i].lo, (size_t)(v[i].hi - v[i].lo)); atomic_fetch_add(&g_plpq_spans, (uint64_t)n); }
-static void *pl_protq_main(void *arg) {
-    (void)arg; pthread_setname_np("totk-pl-protect"); pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
-    pl_rng *own = NULL; int cap = 0;
-    for (;;) {
-        pthread_mutex_lock(&g_plpq_mu);
-        while (!g_plpq_n) pthread_cond_wait(&g_plpq_cv, &g_plpq_mu);
-        pl_rng *v = g_plpq; int n = g_plpq_n; g_plpq = own; g_plpq_cap = cap; g_plpq_n = 0; own = v; cap = n > cap ? n : cap;   // swap: the producer fills the other one
-        uint64_t to = g_plpq_seq; g_plpq_busy = 1; g_plpq_busy_to = to;
-        pthread_mutex_unlock(&g_plpq_mu);
-        pl_protq_run(v, n);
-        pthread_mutex_lock(&g_plpq_mu); g_plpq_busy = 0; if (to > g_plpq_done) g_plpq_done = to; pthread_cond_broadcast(&g_plpq_cv); pthread_mutex_unlock(&g_plpq_mu);
-    }
-    return NULL;
-}
-static void pl_protq_push(uintptr_t lo, uintptr_t hi) {   // translate thread
-    static int started; if (!started) { started = 1; pthread_t t; if (pthread_create(&t, NULL, pl_protq_main, NULL)) MDIE("pipeline protection thread"); pthread_detach(t); }
-    pthread_mutex_lock(&g_plpq_mu);
-    if (g_plpq_n == g_plpq_cap) { g_plpq_cap = g_plpq_cap ? g_plpq_cap * 2 : 1024; g_plpq = realloc(g_plpq, sizeof *g_plpq * (size_t)g_plpq_cap); if (!g_plpq) MDIE("pipeline protection queue"); }
-    g_plpq[g_plpq_n++] = (pl_rng){lo, hi}; g_plpq_seq++;
-    if (g_plpq_n == 1) pthread_cond_broadcast(&g_plpq_cv);
-    pthread_mutex_unlock(&g_plpq_mu);
-}
-static void pl_protq_cb(uintptr_t lo, uintptr_t hi) { pl_protq_push(lo, hi); }
-static uint64_t pl_protq_seq(void) { pthread_mutex_lock(&g_plpq_mu); uint64_t q = g_plpq_seq; pthread_mutex_unlock(&g_plpq_mu); return q; }
-/* the spans queued up to seq are protected (the release of a submission: seq at its commit); what is still queued is
-   done here, a batch the helper is working on is waited for */
-static void pl_protq_sync(uint64_t seq) {
-    pthread_mutex_lock(&g_plpq_mu);
-    while (g_plpq_done < seq) {
-        if (g_plpq_n) {   // still queued: take it (the helper swaps in the empty buffer next time)
-            pl_rng *v = malloc(sizeof *v * (size_t)g_plpq_n); int n = g_plpq_n; uint64_t to = g_plpq_seq;
-            if (!v) MDIE("pipeline protection queue");
-            memcpy(v, g_plpq, sizeof *v * (size_t)n); g_plpq_n = 0;
-            pthread_mutex_unlock(&g_plpq_mu);
-            pl_protq_run(v, n); free(v); atomic_fetch_add(&g_plpq_inline, (uint64_t)n);
-            pthread_mutex_lock(&g_plpq_mu);
-            while (g_plpq_busy && g_plpq_busy_to < to) pthread_cond_wait(&g_plpq_cv, &g_plpq_mu);   // an older batch still in the helper
-            if (to > g_plpq_done) g_plpq_done = to;
-        } else pthread_cond_wait(&g_plpq_cv, &g_plpq_mu);   // the helper is protecting the last batch
-    }
-    pthread_mutex_unlock(&g_plpq_mu);
-}
+#define PL_PROTQ_RUN(lo, hi) nvn_pl_protect_span((const void *)(lo), (size_t)((hi) - (lo)))
+#define PL_PROTQ_DIE(m) MDIE(m)
+#include "totk_pl_protq.h"   // write protection of decided spans on a helper thread
 static void pl_rvec_add(pl_rvec *v, uintptr_t lo, uintptr_t hi) {
     if (v->n == v->cap) { v->cap = v->cap ? v->cap * 2 : 4096; v->r = realloc(v->r, (size_t)v->cap * sizeof *v->r); if (!v->r) MDIE("pipeline ranges"); }
     v->r[v->n++] = (pl_rng){lo, hi};
 }
 static void pl_rng_add(uintptr_t lo, uintptr_t hi, int nonstatic, int write) {
-    pl_rvec_add(&g_plr_all, lo, hi);
+    if (!write) pl_rvec_add(&g_plr_all, lo, hi);   // reads; the writes are published as their own set
     if (nonstatic) { pl_rvec_add(&g_plr_ns, lo, hi); pl_protq_push(lo, hi); }   // protected before the release (helper); CPU writes until the release then go through the ring
     if (write) {
         if (g_plr_w.n == g_plr_w.cap) { g_plr_w.cap = g_plr_w.cap ? g_plr_w.cap * 2 : 1024; g_plr_w.r = realloc(g_plr_w.r, (size_t)g_plr_w.cap * sizeof *g_plr_w.r); if (!g_plr_w.r) MDIE("pipeline ranges"); }
@@ -617,10 +571,11 @@ static int pl_commit(uint64_t fence, post_op *ops, int n) {
     if (!alo || !ahi || (nw && (!wlo || !whi || !wmx || !wk))) MDIE("pipeline ranges");
     int k = 0;
     for (int i = 0; i < na; i++) { const pl_rng *r = &g_plr_all.r[i]; if (k && r->lo <= ahi[k - 1]) { if (r->hi > ahi[k - 1]) ahi[k - 1] = r->hi; } else { alo[k] = r->lo; ahi[k++] = r->hi; } }
-    nvn_pl_publish(fence, alo, ahi, k);
+    nvn_pl_publish(fence, alo, ahi, k, 0);
     free(alo); free(ahi);
     if (nw > 1) qsort(g_plr_w.r, (size_t)nw, sizeof *g_plr_w.r, pl_wrng_cmp);
     uintptr_t run = 0; for (int i = 0; i < nw; i++) { wlo[i] = g_plr_w.r[i].lo; whi[i] = g_plr_w.r[i].hi; wk[i] = (uint8_t)g_plr_w.r[i].kind; if (whi[i] > run) run = whi[i]; wmx[i] = run; }
+    nvn_pl_publish(fence, wlo, whi, nw, 1);
     na = k;
     uint64_t *q = NULL; int nq = g_plq_n;
     if (nq) { q = malloc(sizeof *q * (size_t)nq); memcpy(q, g_plq, sizeof *q * (size_t)nq); }
@@ -834,8 +789,8 @@ static void pl_stats_line(void) {
          g_pls_st.memo_hits / s, g_pls_st.cache_hits / s, lives / s, g_pls_st.live_static / s, g_pls_st.live_gpuw / s, g_pls_st.live_big / s, g_pls_st.over_budget / s, g_pls_st.live_noshot / s,
          g_pls_st.live[PLK_VB] / s, g_pls_st.live[PLK_IB] / s, g_pls_st.live[PLK_SB] / s, g_pls_st.live[PLK_UB] / s, g_pls_st.live[PLK_CP] / s, g_pls_st.live[PLK_TX] / s,
          g_pls_st.writes / s, g_pls_st.ranges / s, g_pls_st.nonstatic / s);
-    MLOG("[pipeline] last 600: holds %llu (host writes %llu, %.2f ms total, timed out %llu), passes (another part of the page) %llu, dry-run would-hold %llu, host threads not held %llu, watched GPU-written pages read %llu / written %llu; pages protected again at releases %llu (unprotect ring overflows %llu), put on probation %llu, protected at publication %llu, left writable after repeated passes %llu, spans over 16 MiB %llu; readback snapshots: active %d (activated %llu, learned from invalidates %llu, grown to a binding %llu), published %llu, CPU merges %llu, conflicts %llu, ring full %llu, redirects %llu",
-         (unsigned long long)d[NVN_PLS_HOLD], (unsigned long long)d[NVN_PLS_HOLD_HOST], d[NVN_PLS_HOLD_NS] / 1e6, (unsigned long long)d[NVN_PLS_TIMEOUT], (unsigned long long)d[NVN_PLS_PASS], (unsigned long long)d[NVN_PLS_WOULD],
+    MLOG("[pipeline] last 600: holds %llu (host writes %llu, %.2f ms total, timed out %llu), passes (another part of the page) %llu, writes over GPU writes only (not held) %llu, dry-run would-hold %llu, host threads not held %llu, watched GPU-written pages read %llu / written %llu; pages protected again at releases %llu (unprotect ring overflows %llu), put on probation %llu, protected at publication %llu, left writable after repeated passes %llu, spans over 16 MiB %llu; readback snapshots: active %d (activated %llu, learned from invalidates %llu, grown to a binding %llu), published %llu, CPU merges %llu, conflicts %llu, ring full %llu, redirects %llu",
+         (unsigned long long)d[NVN_PLS_HOLD], (unsigned long long)d[NVN_PLS_HOLD_HOST], d[NVN_PLS_HOLD_NS] / 1e6, (unsigned long long)d[NVN_PLS_TIMEOUT], (unsigned long long)d[NVN_PLS_PASS], (unsigned long long)d[NVN_PLS_WWPASS], (unsigned long long)d[NVN_PLS_WOULD],
          (unsigned long long)d[NVN_PLS_HOSTSKIP], (unsigned long long)d[NVN_PLS_WATCH_READ], (unsigned long long)d[NVN_PLS_WATCH_WRITE], (unsigned long long)d[NVN_PLS_REPROT], (unsigned long long)d[NVN_PLS_URING_OVER], (unsigned long long)d[NVN_PLS_PROBATION],
          (unsigned long long)d[NVN_PLS_SPANPROT], (unsigned long long)d[NVN_PLS_PASSKEEP], (unsigned long long)d[NVN_PLS_BIGSPAN],
          atomic_load(&g_plds_live), (unsigned long long)atomic_load(&g_plds_act), (unsigned long long)atomic_load(&g_plds_learned), (unsigned long long)atomic_load(&g_plds_grown), (unsigned long long)atomic_load(&g_plds_pub), (unsigned long long)atomic_load(&g_plds_merge),
@@ -843,13 +798,13 @@ static void pl_stats_line(void) {
     if (d[NVN_PLS_HOLD] || d[NVN_PLS_WOULD] || d[NVN_PLS_HOLD_HOST] || d[NVN_PLS_WATCH_READ] || d[NVN_PLS_WATCH_WRITE]) {   // who: the latest held / would-be held / watched accesses, with the code that called them
         extern int runtime_module_offset(uint64_t pc, const char **name, uint64_t *off);
         nvn_pl_hold_rec h[64]; int nh = nvn_pl_holds(h, 64);
-        struct { uint64_t pc, bt[NVN_PL_BT]; int n; uint32_t kind; } by[10]; int nb = 0;
+        struct { uint64_t pc, bt[NVN_PL_BT]; int n; uint32_t kind, kinds; } by[10]; int nb = 0;
         static const char *const kn[4] = {"write", "host write", "READ of GPU result", "write of GPU result"};
         for (int i = 0; i < nh; i++) { int j = 0; while (j < nb && (by[j].pc != h[i].pc || by[j].kind != h[i].host || by[j].bt[0] != h[i].bt[0])) j++;
-            if (j == nb) { if (nb == 10) continue; by[nb].pc = h[i].pc; memcpy(by[nb].bt, h[i].bt, sizeof by[nb].bt); by[nb].n = 0; by[nb].kind = h[i].host; nb++; } by[j].n++; }
+            if (j == nb) { if (nb == 10) continue; by[nb].pc = h[i].pc; memcpy(by[nb].bt, h[i].bt, sizeof by[nb].bt); by[nb].n = 0; by[nb].kind = h[i].host; by[nb].kinds = 0; nb++; } by[j].n++; by[j].kinds |= h[i].kinds; }
         char line[2400]; size_t o = 0;
         for (int j = 0; j < nb && o < sizeof line - 300; j++) {
-            o += (size_t)snprintf(line + o, sizeof line - o, " [%s x%d:", kn[by[j].kind & 3], by[j].n);
+            o += (size_t)snprintf(line + o, sizeof line - o, " [%s%s x%d:", kn[by[j].kind & 3], by[j].kinds == 1 ? " over a GPU read" : by[j].kinds == 2 ? " over a GPU write" : by[j].kinds == 3 ? " over a GPU read and write" : "", by[j].n);
             for (int q = -1; q < NVN_PL_BT && o < sizeof line - 120; q++) {
                 uint64_t pc = q < 0 ? by[j].pc : by[j].bt[q]; if (!pc) break;
                 const char *nm = "?"; uint64_t off = 0; Dl_info di;

@@ -132,6 +132,7 @@ static uint64_t fence_now(int *token);
 static int fence_wait(uint64_t k, uint64_t timeout_ns);
 static int fence_wait_to(uint64_t k, uint64_t kg, uint64_t timeout_ns);
 static int pl_hle_mode(void);   // TOTK_PIPELINE ("one frame deeper" below)
+static _Atomic uint64_t g_lf_sub_cpu_ns, g_lf_gwait_ns;   // per frame for the long-frame line: the replay's CPU time, the game's frame wait
 static _Thread_local int t_drain_reason = 6;   // TOTK_PIPELINE gate reason of this thread's next x_drain (PLG_* in nvn_mtl.m: 6 finish / suspend; -1 no gate)
 static void x_drain(void);
 static int async_replay(void);
@@ -701,6 +702,7 @@ static NVNsyncWaitResult pl_frame_wait(const NVNsync *s, const sync_t *o, uint64
     }
     if (ok && !rel) mtl_pl_publish();   // depth statistics of the newest completed frame (the release publishes them itself)
     totk_tl(TL_WAIT_OUT, k, ok);
+    atomic_fetch_add(&g_lf_gwait_ns, now_ns() - t0);
     if (ok) survey_after_wait(s);
     return ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
 }
@@ -736,7 +738,9 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     uint64_t t0 = lg ? now_ns() : 0;
     totk_tl(TL_WAIT_IN, o->fence, o->fence == mtl_last_fence());
     if (sync_chain_left(1)) { char w[96]; snprintf(w, sizeof w, "SyncWait sync=%p fence=%llu newest=%d", (const void *)s, (unsigned long long)o->fence, o->fence == mtl_last_fence()); guest_chain(w); }
+    uint64_t tw0 = now_ns();
     int ok = tok ? fence_wait_to(o->fence, want, timeout) : mtl_wait(want, timeout);
+    if (!k) atomic_fetch_add(&g_lf_gwait_ns, now_ns() - tw0);   // a queue fence (the frame wait without TOTK_PIPELINE): long-frame line
     totk_tl(TL_WAIT_OUT, o->fence, ok);
     if (lg) { atomic_fetch_add(&g_sw_blocked[k], 1); atomic_fetch_add(&g_sw_ns[k], now_ns() - t0); }
     if (ok) { survey_after_wait(s); mtl_wb_fence_done(); }
@@ -2392,7 +2396,7 @@ static void submit_exec(int n, const uint64_t *h, void *ucap) {
     atomic_fetch_add(&g_nvn_ns, dw); atomic_fetch_add(&g_sub_wall_ns, dw);
     uint64_t i1, y1; thr_counts(&i1, &y1); uint64_t dc = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - c0, di = i1 - i0;
     atomic_fetch_add(&g_cum_sub_cyc, y1 - y0); atomic_fetch_add(&g_cum_sub_sys_ns, thr_sys_ns() - s0); atomic_fetch_add(&g_cum_sub_wall_ns, dw);
-    atomic_fetch_add(&g_sub_cpu_ns, dc); atomic_fetch_add(&g_cum_sub_cpu_ns, dc);
+    atomic_fetch_add(&g_sub_cpu_ns, dc); atomic_fetch_add(&g_cum_sub_cpu_ns, dc); atomic_fetch_add(&g_lf_sub_cpu_ns, dc);
     atomic_fetch_add(&g_sub_instr, di); atomic_fetch_add(&g_cum_sub_instr, di);
     totk_tl(TL_REP_END, 0, 0);
     gfx_leave();
@@ -2685,7 +2689,7 @@ __attribute__((weak)) int dm_thermal_now(void) { return -1; }   // 缺省（Mac�
 // 长帧日志的逐帧环（GPU 时间滞后 8 帧才有，所以先存后判）
 // Per-frame ring for the long-frame log (GPU time only arrives 8 frames late, so store first and judge later)
 #define LFN 16
-typedef struct { uint64_t f; double fr, nv, t_s, make_ms, up_mb, up_ms; unsigned pso, lib, up, rup, draws, passes, views, variants, variants_pre, variants_bg, plain_draws; double variant_ms; int ls; } lf_rec;   // ls：这一帧出图时读取画面是否盖着 | ls: whether the loading screen was covering the picture when this frame was presented
+typedef struct { uint64_t f; double fr, nv, t_s, make_ms, up_mb, up_ms; unsigned pso, lib, up, rup, draws, passes, views, variants, variants_pre, variants_bg, plain_draws; double variant_ms; int ls; double sub_cpu, gwait, hold_ms; unsigned holds; } lf_rec;   // sub_cpu: the replay's thread CPU time; gwait: the game's frame wait; holds (TOTK_PIPELINE)   // ls：这一帧出图时读取画面是否盖着 | ls: whether the loading screen was covering the picture when this frame was presented
 static lf_rec g_lf[LFN];
 __attribute__((weak)) void dm_longframe_note(const char *what) { LOG("[长帧] %s", what); }   // 缺省（图形单测）；宿主 diag.c 的强定义补上场景上下文并写 perf.txt | Default (graphics unit tests); the strong definition in the host's diag.c adds scene context and writes perf.txt
 extern void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns); extern uint64_t mtl_upload_bytes(void); extern void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads);
@@ -3152,6 +3156,8 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         {   // 长帧日志：本帧各项先记进环，等 8 帧后 GPU 时间到了再决定打不打（见下） | long-frame log: this frame's items are first recorded into the ring; whether to print is decided 8 frames later, once the GPU time has arrived (see below)
             static uint64_t plns, ppns, pup, prup, pub; uint64_t lns, pns, up, rup, ub; mtl_create_ns(&lns, &pns); mtl_pkg_stats(&up, &rup); ub = mtl_upload_bytes();
             lf_rec *r = &g_lf[f % LFN]; r->f = f; r->fr = fr; r->nv = nv; r->ls = g_nvn_loadscreen_up ? g_nvn_loadscreen_up() : 0; r->t_s = (now_ns() - g_t0_ns) / 1e9; r->pso = (unsigned)(pso_ - ppso); r->lib = (unsigned)(lib_ - plib);
+            r->sub_cpu = atomic_exchange(&g_lf_sub_cpu_ns, 0) / 1e6; r->gwait = atomic_exchange(&g_lf_gwait_ns, 0) / 1e6;
+            { static uint64_t ph, phn; uint64_t v[NVN_PLS_N]; nvn_pl_stats(v); r->holds = (unsigned)(v[NVN_PLS_HOLD] - ph); r->hold_ms = (v[NVN_PLS_HOLD_NS] - phn) / 1e6; ph = v[NVN_PLS_HOLD]; phn = v[NVN_PLS_HOLD_NS]; }
             r->make_ms = ((lns - plns) + (pns - ppns)) / 1e6; r->up = (unsigned)(up - pup); r->rup = (unsigned)(rup - prup); r->up_mb = (ub - pub) / 1048576.0; r->up_ms = up_ms;
             plns = lns; ppns = pns; pup = up; prup = rup; pub = ub;
             static uint64_t pviews; uint64_t views = mtl_view_stats();
@@ -3178,6 +3184,8 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
               // Visibility: during the time a long frame "comes out late", what stays on screen is the previous frame; if the previous frame was a loading screen (or this frame itself is one), all the player sees is the loading screen staying a bit longer, with no motion interrupted
               const lf_rec *pv = &g_lf[(f - 9) % LFN]; int hidden = r->ls || (f >= 9 && pv->f == f - 9 && pv->ls);
               if (hidden) strlcat(b, "；接读取画面，不可见", sizeof b);
+              { char e[200]; snprintf(e, sizeof e, "；replay on CPU %.1f ms (of the submit+present above), the game's frame wait %.1f ms, pipeline holds %u (%.1f ms)", r->sub_cpu, r->gwait, r->holds, r->hold_ms);
+                strlcat(b, e, sizeof b); }
               if (lf_detail()) { char d[384]; snprintf(d, sizeof d, "；绘制 %u 次、渲染通道 %u 个、新建贴图视图 %u 个；当场编译补丁变体 %u 个共 %.1f ms，读预编的补丁变体 %u 个，后台编补丁变体 %u 个，边框补丁没好先用原管线画 %u 次", r->draws, r->passes, r->views, r->variants, r->variant_ms, r->variants_pre, r->variants_bg, r->plain_draws); strlcat(b, d, sizeof b); }
               dm_longframe_note(b); } }
         uint64_t g0, g1; if (frame_rec() && mtl_gpu_span(f - 8, &g0, &g1)) { trow(f - 8, "@gpu_beg_ms", (g0 - g_t0_ns) / 1e6); trow(f - 8, "@gpu_end_ms", (g1 - g_t0_ns) / 1e6); } }

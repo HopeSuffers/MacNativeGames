@@ -348,6 +348,13 @@ probe-pipeline-hold:
 	build/pipeline-hold-probe dry | tee -a analysis/pipeline-hold-probe.log
 	TOTK_PROBE_NEGATIVE=1 build/pipeline-hold-probe | tee -a analysis/pipeline-hold-probe.log
 
+.PHONY: probe-pipeline-stress
+# CPU only, AddressSanitizer: TOTK_PIPELINE protection queue (helper thread) and range index rebuilds under concurrent use.
+probe-pipeline-stress:
+	@mkdir -p build analysis
+	xcrun clang -std=gnu11 -O1 -g -fsanitize=address,undefined -Wall -Wextra -Wno-unused-function -Ithird_party/d2r_gfx/gfx/nvn tests/pipeline_stress/stress.c -o build/pipeline-stress
+	build/pipeline-stress | tee analysis/pipeline-stress.log
+
 .PHONY: probe-pool-index
 # CPU only: memory pool address index vs the old linear scan, with two negative controls and a timing line.
 probe-pool-index:
