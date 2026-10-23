@@ -426,6 +426,24 @@ static _Thread_local unsigned g_ptls_next, g_ptls_last;   // next slot to fill; 
 static _Atomic uint64_t g_pool_gen = 1;
 static _Atomic int g_pool_tls_on = -1, g_pool_tls_check;
 static uint64_t g_pool_tls_hits, g_pool_tls_misses, g_pool_tls_verified;   // statistics (the replay thread does nearly all lookups)
+/* TOTK: the 8 recent pools above miss about one lookup in ten in the world (~22k lookups a frame over vertex, index and
+   uniform buffers of many pools; Korok Forest: 56M misses of 625M), and a miss of the last-hit slot scans all 8 (pool_tls_find
+   was ~5% of the replay, its misses into the locked search another ~2%). Each thread also keeps a direct-mapped table by 4 KiB
+   page of the looked-up address: a hit there skips the scan, and a pool found by the scan or the locked search is entered
+   for that page. Entries are the same records under the same rules as the recent list (generation, whole range inside one
+   pool that no other pool overlaps), so a hit answers exactly what the locked search answers. TOTK_POOL_HASH=0: off. */
+#define POOL_HASH_N 256
+static _Thread_local pool_tls_ent g_phash[POOL_HASH_N];
+static _Atomic int g_pool_hash_on = -1;
+static uint64_t g_pool_hash_hits;
+static int pool_hash_on(void) {
+    int v = atomic_load_explicit(&g_pool_hash_on, memory_order_relaxed);
+    if (v < 0) { const char *e = getenv("TOTK_POOL_HASH"); int want = !(e && !atoi(e)), expected = -1;
+        atomic_compare_exchange_strong(&g_pool_hash_on, &expected, want); v = atomic_load(&g_pool_hash_on);
+        if (!v) MLOG("TOTK_POOL_HASH=0: pool lookups use the 8 recent pools only"); }
+    return v;
+}
+static inline unsigned pool_hash_slot(uintptr_t a) { uintptr_t pg = a >> 12; return (unsigned)(pg ^ (pg >> 8) ^ (pg >> 16)) & (POOL_HASH_N - 1); }
 static int pool_tls_on(void) {
     int v = atomic_load_explicit(&g_pool_tls_on, memory_order_relaxed);
     if (v < 0) { const char *e = getenv("TOTK_POOL_TLS"); int want = !(e && !atoi(e)), expected = -1;
@@ -751,24 +769,28 @@ static const pool_tls_ent *pool_tls_find(uintptr_t a, uint64_t len) {
     uint64_t gen = atomic_load_explicit(&g_pool_gen, memory_order_acquire);
     const pool_tls_ent *e = &g_ptls[g_ptls_last];
     if (e->gen == gen && e->lo <= a && a < e->hi && end <= e->hi) return e;   // a < hi: an address at the end may also start the next pool
+    int hashed = pool_hash_on(); pool_tls_ent *h = hashed ? &g_phash[pool_hash_slot(a)] : NULL;
+    if (h && h->gen == gen && h->lo <= a && a < h->hi && end <= h->hi) { g_pool_hash_hits++; return h; }
     for (unsigned i = 0; i < POOL_TLS_N; i++) {
         e = &g_ptls[i];
-        if (e->gen == gen && e->lo <= a && a < e->hi && end <= e->hi) { g_ptls_last = i; return e; }
+        if (e->gen == gen && e->lo <= a && a < e->hi && end <= e->hi) { g_ptls_last = i; if (h) *h = *e; return e; }
     }
     return NULL;
 }
-static void pool_tls_keep(const pidx_ent *p) {   // caller holds g_mu; p was just made resident
+static void pool_tls_keep(const pidx_ent *p, uintptr_t a) {   // caller holds g_mu; p was just made resident; a: the address looked up
     int i = (int)(p - g_pools.e);
     if (i < 0 || i >= g_pools.n) return;
     if (i > 0 && g_pools.maxhi[i - 1] > p->lo) return;          // an earlier pool reaches into this one
     if (i + 1 < g_pools.n && g_pools.e[i + 1].lo < p->hi) return; // a later pool starts inside this one
-    g_ptls[g_ptls_next++ % POOL_TLS_N] = (pool_tls_ent){p->lo, p->hi, p->base, p->buf, p->gpu, atomic_load_explicit(&g_pool_gen, memory_order_relaxed)};
+    pool_tls_ent ent = {p->lo, p->hi, p->base, p->buf, p->gpu, atomic_load_explicit(&g_pool_gen, memory_order_relaxed)};
+    g_ptls[g_ptls_next++ % POOL_TLS_N] = ent;
+    if (pool_hash_on()) g_phash[pool_hash_slot(a)] = ent;
 }
 // The locked search; with keep, a pool it finds is remembered by this thread.
 static int pool_lookup_locked(uint64_t addr, uint64_t len, void **buf, uint64_t *base, uint64_t *gpu, int keep) {
     pthread_mutex_lock(&g_mu);
     pidx_ent *p = pool_query((uintptr_t)addr, len);
-    if (p) { pool_res(p); *buf = p->buf; *base = p->base; *gpu = p->gpu; if (keep) pool_tls_keep(p); }
+    if (p) { pool_res(p); *buf = p->buf; *base = p->base; *gpu = p->gpu; if (keep) pool_tls_keep(p, (uintptr_t)addr); }
     pthread_mutex_unlock(&g_mu);
     return p != NULL;
 }
@@ -792,7 +814,7 @@ static int mtl_addr_range(uint64_t addr, uint64_t len, uintptr_t *lo, uintptr_t 
     if (pool_tls_on()) { const pool_tls_ent *e = pool_tls_find((uintptr_t)addr, len); if (e) { *lo = e->lo; *hi = e->hi; return 1; } }
     pthread_mutex_lock(&g_mu);
     pidx_ent *p = pool_query((uintptr_t)addr, len);
-    if (p) { pool_res(p); *lo = p->lo; *hi = p->hi; if (pool_tls_on()) pool_tls_keep(p); }
+    if (p) { pool_res(p); *lo = p->lo; *hi = p->hi; if (pool_tls_on()) pool_tls_keep(p, (uintptr_t)addr); }
     pthread_mutex_unlock(&g_mu);
     return p != NULL;
 }
@@ -3891,7 +3913,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     { uint64_t hits, misses, checked;
       pthread_mutex_lock(&g_mu); hits=g_pool_queries.hits; misses=g_pool_queries.misses; checked=g_pool_query_checked; pthread_mutex_unlock(&g_mu);
       MLOG("[pool-query-cache] enabled=%d hits=%llu misses=%llu checked=%llu",pool_query_on(),(unsigned long long)hits,(unsigned long long)misses,(unsigned long long)checked); }
-    MLOG("[pool-tls] enabled=%d hits=%llu misses=%llu verified=%llu",pool_tls_on(),(unsigned long long)g_pool_tls_hits,(unsigned long long)g_pool_tls_misses,(unsigned long long)g_pool_tls_verified);
+    MLOG("[pool-tls] enabled=%d hits=%llu misses=%llu verified=%llu page-table=%d page-hits=%llu",pool_tls_on(),(unsigned long long)g_pool_tls_hits,(unsigned long long)g_pool_tls_misses,(unsigned long long)g_pool_tls_verified,pool_hash_on(),(unsigned long long)g_pool_hash_hits);
     MLOG("[shadow-index] enabled=%d hit=%llu miss=%llu verified=%llu",shadow_index_on(),(unsigned long long)g_shadow_index_hits,(unsigned long long)g_shadow_index_misses,(unsigned long long)g_shadow_index_verified);
     MLOG("[pkg-final-cache] enabled=%d kept=%llu", pkg_final_cache_on(), (unsigned long long)atomic_load(&g_pkg_final_kept));
     MLOG("贴图类型缓存已回收退役视图 %llu 个", (unsigned long long)g_type_retired_views);
