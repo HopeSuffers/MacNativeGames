@@ -5831,7 +5831,8 @@ void mtl_prog_release(prog_t *p) { if (p->serial) serial_del(p->serial); }
 // view_pkg: the texture mirrors CPU pool memory (only then do guest writes matter); dead_pending: the serial was finalised
 // and no live texture was found at its storage yet, so every serial-table step re-checks it (see tex_by_id).
 typedef struct { tex_t t; int ok; view_t v; int has_v; void *view; uint64_t view_id, view_rid, view_ser, view_dirty;
-    uint64_t indexed_serial, used; int view_prev, view_next; uint8_t view_pkg, dead_pending; } treg_t;   // used (TOTK): last submission that resolved this id
+    uint64_t indexed_serial, used; int view_prev, view_next; uint8_t view_pkg, dead_pending;
+    void *view_parent; } treg_t;   // used (TOTK): last submission that resolved this id; view_parent (TOTK_TEX_SUB_FAST): view.parentTexture, read when the view was stored
 static treg_t *g_treg; static int g_ntreg;
 /* Only slots with a cached Metal view need work when an NVN texture is finalized. A linear
    scan of the entire descriptor pool on every finalize dominated the game's render thread. */
@@ -5858,7 +5859,7 @@ static void treg_clear_view_locked(int tid) {
     treg_t *r = &g_treg[tid];
     treg_unlink_locked(tid);
     if (r->view) { defer_obj_unref((__bridge id)r->view); CFRelease(r->view); r->view = NULL; }
-    r->view_id = r->view_rid = r->view_ser = r->view_dirty = 0; r->view_pkg = r->dead_pending = 0;
+    r->view_id = r->view_rid = r->view_ser = r->view_dirty = 0; r->view_pkg = r->dead_pending = 0; r->view_parent = NULL;
 }
 // 贴图号 → 序号的无锁副本（回放热路径只要序号：写回前瞻索引、纯清除前提的绑定集合）：贴图号 20 位，固定 1M 项（BSS，只占碰过的页），
 // 登记时 release 写、读端 relaxed 原子读，不进 g_rmu（原 h_ser 每次查表加解锁，营地每帧数千次）
@@ -6091,6 +6092,14 @@ static void life_use(int tid, const tex_t *t, const char *how) {
 /* What a texture-ID view of this kind was validated against: 1 = CPU-pool texture tracked by page protection (guest-write
    generation), 2 = small CPU-pool texture checked by content once per submission (pkg_hashed). */
 static int tex_check_once(void);
+/* TOTK_TEX_SUB_FAST (default on; =0 off, =2 also compares the remembered view parent with parentTexture), 2026-10-23: the
+   per-submission re-check of a CPU-mirrored texture's view in tex_by_id (see there). */
+static int tex_sub_fast_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_TEX_SUB_FAST"); v = e ? atoi(e) : 1; if (v < 0 || v > 2) v = 1;
+                 if (v != 1) MLOG("TOTK_TEX_SUB_FAST=%d: %s", v, v ? "texture view re-checks verified" : "texture view re-checks scan the serial steps and ask the view for its parent"); }
+    return v;
+}
 static inline uint64_t treg_stamp(int kind) { return kind == 2 || (kind == 1 && tex_check_once()) ? g_sub_serial : nvn_dirty_now(); }
 static uint8_t treg_kind(const tex_t *t) { return tex_mirrored(t) ? (pkg_hashed(t) ? 2 : 1) : 0; }
 /* TOTK: plain pointer (the macro bridges it): every view returned is held by g_treg[tid].view, whose release goes through the
@@ -6105,8 +6114,16 @@ static void *tex_by_id_p(int tid) {   // 调用方持 g_rmu | Caller holds g_rmu
     if (totk_life_on() && totk_life_match(&rp->t)) life_use(tid, &rp->t, "registered");
     uint64_t sg = g_ser_gen, dg = nvn_dirty_now();   // 先取代号再查：期间若有变更，下次必走慢路 | Take the generations first and then look up: if a change happens in between, the next time must take the slow path
     /* TOTK: serial-table steps since validation that were all for other serials leave this view as it was; then only a
-       CPU-mirrored texture still has to look at guest writes (tex_mtl below). */
-    int ser_same = rp->view && !rp->dead_pending && (rp->view_ser == sg || ser_unaffected(rp->view_ser, sg, rp->t.serial));
+       CPU-mirrored texture still has to look at guest writes (tex_mtl below).
+       TOTK_TEX_SUB_FAST: the O(1) per-serial step record (ser_unaffected_since, as tex_view_valid uses it) answers first;
+       the scan of every step since validation runs only when it says "maybe". It cost ~20 of ~1460 busy samples in the
+       Kakariko profile: each CPU-mirrored texture comes here once a submission (its per-submission check), a frame of
+       steps after its last validation. Both answer "unaffected" only when no step since view_ser was for this serial or
+       for everything; the scan also says "affected" when more than SER_CHG_N steps passed, and then the path below does
+       what the early return does (dead_pending is 0, so `dead` is computed for a live serial and stays 0). */
+    int ser_same = rp->view && !rp->dead_pending && (rp->view_ser == sg || (tex_sub_fast_on() && ser_unaffected_since(rp->view_ser, rp->t.serial)) || ser_unaffected(rp->view_ser, sg, rp->t.serial));
+    if (ser_same && tex_sub_fast_on() == 2 && rp->view_ser != sg && sg - rp->view_ser < SER_CHG_N && !ser_unaffected(rp->view_ser, sg, rp->t.serial))   // the record said unaffected, the scan disagrees
+        MDIE("texture id %d: serial %llu step record says unaffected since %llu, the step scan to %llu says affected", tid, (unsigned long long)rp->t.serial, (unsigned long long)rp->view_ser, (unsigned long long)sg);
     if (ser_same && (!rp->view_pkg || rp->view_dirty == treg_stamp(rp->view_pkg))) { rp->view_ser = sg; return rp->view; }
     /* TOTK: the registered texture was finalised and re-initialised at the same storage (per-frame transient textures):
        follow the memory to the live texture, as the NVN descriptor does on hardware. */
@@ -6129,7 +6146,10 @@ static void *tex_by_id_p(int tid) {   // 调用方持 g_rmu | Caller holds g_rmu
     if (v) {   // 序号表或客体内存有过变动：核基贴图是否被重传换新，换了则视图作废 | The serial table or guest memory has changed: check whether the base texture was re-uploaded and replaced; if so the view is invalidated
         __unsafe_unretained id<MTLTexture> cur = tex_mtl(&rp->t);   // held by the serial table / its NvPkg
         if (g_tex_prepare_split) return NULL;
-        if (cur == v || v.parentTexture == cur) { rp->view_ser = sg; rp->view_pkg = treg_kind(&rp->t); rp->view_dirty = rp->view_pkg == 2 || (rp->view_pkg == 1 && tex_check_once()) ? g_sub_serial : dg; return rp->view; }
+        /* TOTK_TEX_SUB_FAST: the parent read when the view was stored instead of an objc_msgSend per check (a texture's
+           parentTexture never changes, and the view retains it, so the pointer cannot name another texture meanwhile). */
+        if (tex_sub_fast_on() == 2 && (__bridge void *)v.parentTexture != rp->view_parent) MDIE("texture id %d: remembered view parent differs", tid);
+        if (cur == v || (tex_sub_fast_on() ? rp->view_parent == (__bridge void *)cur : v.parentTexture == cur)) { rp->view_ser = sg; rp->view_pkg = treg_kind(&rp->t); rp->view_dirty = rp->view_pkg == 2 || (rp->view_pkg == 1 && tex_check_once()) ? g_sub_serial : dg; return rp->view; }
         treg_clear_view_locked(tid); v = nil;
     }
     treg_t r = *rp;
@@ -6177,7 +6197,7 @@ static void *tex_by_id_p(int tid) {   // 调用方持 g_rmu | Caller holds g_rmu
         atomic_fetch_add_explicit(&g_stat_views, 1, memory_order_relaxed);
         if (!v) { RED_ONCE(11, "贴图视图建不出 id %d", tid); v = base; }
     }
-    rp->view = (void *)CFBridgingRetain(v); rp->view_rid = v.gpuResourceID._impl; rp->view_ser = sg; rp->view_pkg = treg_kind(&rp->t); rp->view_dirty = rp->view_pkg == 2 || (rp->view_pkg == 1 && tex_check_once()) ? g_sub_serial : dg;
+    rp->view = (void *)CFBridgingRetain(v); rp->view_parent = (__bridge void *)v.parentTexture; rp->view_rid = v.gpuResourceID._impl; rp->view_ser = sg; rp->view_pkg = treg_kind(&rp->t); rp->view_dirty = rp->view_pkg == 2 || (rp->view_pkg == 1 && tex_check_once()) ? g_sub_serial : dg;
     treg_link_locked(tid);
     return rp->view;
 }
