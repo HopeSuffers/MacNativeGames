@@ -1859,6 +1859,7 @@ static uint64_t g_upd_filter_q, g_upd_filter_skip;           // overlap queries 
 static uint64_t g_sig_incr_n, g_sig_full_n, g_tex_ser_fast_n;  // stage_sig incremental / full walks; tex_view_valid steps taken inline
 static uint64_t g_cbc_hits, g_cbc_misses, g_cbc_verified; static int cbc_mode(void);   // TOTK_CBUF_CACHE (defined before encode_args)
 static uint64_t g_pso_memo_hits, g_pso_memo_misses; static int pso_memo_on(void);   // TOTK_PSO_MEMO (defined with g_pso)
+static uint64_t g_vbm_hits, g_vbm_misses, g_vbm_verified; static int vbm_mode(void);   // TOTK_VB_MEMO (defined with bind_vertex_streams)
 static uint64_t g_ab_same;   // TOTK_AB_SAME: argument blocks bound again because the new bytes equal the shader's previous block
 static int upd_fast_on(void) {
     static int v = -1;
@@ -4053,6 +4054,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
            cbc_mode(), (unsigned long long)g_cbc_hits, (unsigned long long)g_cbc_misses, (unsigned long long)g_cbc_verified, (unsigned long long)g_ab_same,
            side_cb_on(), (unsigned long long)g_side_switches, (unsigned long long)g_side_idle, (unsigned long long)g_side_fallbacks, (unsigned long long)g_side_extra,
            pso_memo_on(), (unsigned long long)g_pso_memo_hits, (unsigned long long)g_pso_memo_misses); }
+    MLOG("[replay-fast3] vb-memo=%d hits=%llu misses=%llu verified=%llu", vbm_mode(), (unsigned long long)g_vbm_hits, (unsigned long long)g_vbm_misses, (unsigned long long)g_vbm_verified);
     MLOG("[pkg-final-cache] enabled=%d kept=%llu", pkg_final_cache_on(), (unsigned long long)atomic_load(&g_pkg_final_kept));
     MLOG("贴图类型缓存已回收退役视图 %llu 个", (unsigned long long)g_type_retired_views);
     res_site_report(8);
@@ -11329,6 +11331,51 @@ static uint16_t vertex_stream_mask(NvShader *vs) {
     }
     return mask;
 }
+/* TOTK_VB_MEMO (default on; =0 off, =2 verify every hit against the lookup), 2026-10-23: every draw resolved the GPU address
+   of each vertex stream the shader reads and of its index buffer through the pool lookup (per-thread recent list and page
+   table: pool_tls_find, pool_query on its misses), and asked the index buffer's Metal buffer for its length (an
+   objc_msgSend): bind_vertex_streams ~80 samples of ~1460 busy in the Kakariko translate profile, ~50 of them the lookups.
+   Most draws bind the same addresses as the draw before. Each vertex-stream slot and the index buffer keep the last address
+   resolved with the pool generation read before its lookup (g_pool_gen, bumped under g_mu on every pool add / remove), and
+   an equal address under the same generation takes the remembered answer: the answer of mtl_gpu_addr(addr, 1) depends only
+   on the pool table, as for the per-thread pool records (a pool the lookup found is resident; only its removal, which bumps
+   the generation, takes it out). Failed lookups are not remembered. Replay thread only. */
+typedef struct { uint64_t addr, gen, mo, gpu, blen; void *mb; } vbm_ent;   // blen: [mb length], 0 = not asked yet
+static vbm_ent g_vbm[17];   // vertex streams 0-15, index buffer 16
+static int vbm_mode(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_VB_MEMO"); v = e ? atoi(e) : 1; if (v < 0 || v > 2) v = 1;
+                 if (v != 1) MLOG("TOTK_VB_MEMO=%d: %s", v, v ? "vertex / index buffer addresses remembered, every hit verified" : "every vertex / index buffer address looked up"); }
+    return v;
+}
+static inline int vbm_gpu_addr(int slot, uint64_t addr, void **mb, uint64_t *mo, uint64_t *gpu) {
+    int m = vbm_mode();
+    if (!m) return mtl_gpu_addr(addr, 1, mb, mo, gpu);
+    vbm_ent *e = &g_vbm[slot];
+    uint64_t gen = atomic_load_explicit(&g_pool_gen, memory_order_acquire);
+    if (addr && e->addr == addr && e->gen == gen) {
+        if (m == 2) {
+            void *b2; uint64_t o2, g2;
+            if (!mtl_gpu_addr(addr, 1, &b2, &o2, &g2) || b2 != e->mb || o2 != e->mo || g2 != e->gpu)
+                MDIE("vertex / index buffer memo disagrees at %#llx (slot %d)", (unsigned long long)addr, slot);
+            g_vbm_verified++;
+        }
+        g_vbm_hits++; *mb = e->mb; *mo = e->mo; *gpu = e->gpu; return 1;
+    }
+    g_vbm_misses++;
+    if (!mtl_gpu_addr(addr, 1, mb, mo, gpu)) { e->addr = 0; return 0; }
+    *e = (vbm_ent){addr, gen, *mo, *gpu, 0, *mb};
+    return 1;
+}
+static inline uint64_t vbm_index_len(void *mb, uint64_t mo) {   // [mb length] - mo for the index buffer just resolved (slot 16)
+    vbm_ent *e = &g_vbm[16];
+    if (vbm_mode() && e->addr && e->mb == mb) {
+        if (!e->blen) e->blen = ((__bridge id<MTLBuffer>)mb).length;
+        else if (vbm_mode() == 2 && e->blen != ((__bridge id<MTLBuffer>)mb).length) MDIE("index buffer length memo disagrees");
+        return e->blen - mo;
+    }
+    return ((__bridge id<MTLBuffer>)mb).length - mo;
+}
 static void bind_vertex_streams(id<MTL4RenderCommandEncoder> en, NvShader *vs) {
     uint16_t mask=vertex_streams_on()?vertex_stream_mask(vs):UINT16_MAX;
     uint64_t bound=0,omitted=0;
@@ -11337,7 +11384,7 @@ static void bind_vertex_streams(id<MTL4RenderCommandEncoder> en, NvShader *vs) {
         if(!S.vbuf[stream].address)continue;
         if(!(mask&(1u<<stream))){omitted++;continue;}
         void *mb;uint64_t mo,gpu;
-        if(mtl_gpu_addr(S.vbuf[stream].address,1,&mb,&mo,&gpu)) {
+        if(vbm_gpu_addr((int)stream,S.vbuf[stream].address,&mb,&mo,&gpu)) {   // TOTK_VB_MEMO
             enc_r_vbuf(en,16+stream,gpu);use_rec("buf",S.vbuf[stream].address,S.vbuf[stream].size,0,NULL);bound++;
         }
     }
@@ -11913,7 +11960,7 @@ frz_plain:;
         if (prim == 7) { RED_ONCE(20, "带索引的四边形未实现"); return; }
         void *mb; uint64_t mo;
         uint64_t gpu;
-        if (!mtl_gpu_addr(di->ibuf, 1, &mb, &mo, &gpu)) { RED_ONCE(22, "索引缓冲不在内存池里"); return; }
+        if (!vbm_gpu_addr(16, di->ibuf, &mb, &mo, &gpu)) { RED_ONCE(22, "索引缓冲不在内存池里"); return; }   // TOTK_VB_MEMO
         if (di->itype == 0) {   // TOTK: Metal has no 8-bit indices; widen to 16 bits in this submit's arena (restart 0xFF -> 0xFFFF)
             id<MTLBuffer> wide; size_t woff;
             int wi = wide_find(di);
@@ -11943,7 +11990,7 @@ frz_plain:;
               for (size_t t = 0; t < n; t += 3) { memcpy(dst + t * es, src + (t + 2) * es, es); memcpy(dst + (t + 1) * es, src + t * es, es); memcpy(dst + (t + 2) * es, src + (t + 1) * es, es); }
               enc_r_draw_indexed(en, mp, n, es == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32, rot.gpuAddress + roff, n * es, di->instances ? di->instances : 1, di->base_vertex, di->base_instance);
               goto drawn; } }
-        if (di->count) enc_r_draw_indexed(en, mp, di->count, di->itype == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32, gpu, ((__bridge id<MTLBuffer>)mb).length - mo,
+        if (di->count) enc_r_draw_indexed(en, mp, di->count, di->itype == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32, gpu, vbm_index_len(mb, mo),
                 di->instances ? di->instances : 1, di->base_vertex, di->base_instance);
         drawn:;
     }
