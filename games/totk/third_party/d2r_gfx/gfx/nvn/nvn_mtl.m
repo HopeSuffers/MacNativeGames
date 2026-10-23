@@ -206,6 +206,8 @@ static uint64_t g_done;                         // 已完成的最大栅栏值�
    reads / writes in place and reads snapshots of recently CPU-written ranges (pl_read / pl_bind / pl_write). */
 static int g_pl = -1;
 enum { PLK_VB, PLK_IB, PLK_SB, PLK_UB, PLK_CP, PLK_TX, PLK_N };   // kinds of GPU reads (statistics)
+enum { PLW_OTHER, PLW_UPDATE, PLW_UPDFLUSH, PLW_COPY, PLW_T2B, PLW_STORAGE, PLW_STORAGE64, PLW_KERNEL, PLW_IMAGE, PLW_N };   // kinds of GPU writes (the invalidate log)
+static int g_pl_wk;   // the kind of the GPU write being noted, set by the call site
 static void pl_write(uint64_t a, uint64_t n);
 static int pl_read(uint64_t a, uint64_t n, int kind, void **buf, uint64_t *off, uint64_t *gpu);
 static int pl_bind(uint64_t a, uint64_t n, int rw, int kind, int compute, void **buf, uint64_t *gpu);
@@ -1731,7 +1733,7 @@ void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
     g_copy_n++; g_copy_split += g_enc != nil;
     upd_guard(src, src + n); upd_guard(dst, dst + n);
     pend_note(dst, n, (const void *)(uintptr_t)src, 1); pd_xfer("copy", src, dst, n);
-    usnap_drop(dst, n);   // TOTK: later readers see the copied bytes (memory, on the GPU timeline)
+    g_pl_wk = PLW_COPY; usnap_drop(dst, n); g_pl_wk = 0;   // TOTK: later readers see the copied bytes (memory, on the GPU timeline)
     anom_note_xfer('Y', src, dst, n, NULL);   // TOTK_ANOMALY
     void *sb, *db; uint64_t so, dof;
     if (!mtl_addr(src, n, &sb, &so) || !mtl_addr(dst, n, &db, &dof))
@@ -1881,7 +1883,7 @@ static void upd_flush(void) {
         for (; j < g_nupd && g_upd[j].lo <= hi; j++) if (g_upd[j].hi > hi) hi = g_upd[j].hi;   // merge overlapping / touching ranges
         void *db; uint64_t dof;
         if (!mtl_addr(lo, hi - lo, &db, &dof)) MDIE("renamed uniform update %#llx+%#llx is no longer in one memory pool", (unsigned long long)lo, (unsigned long long)(hi - lo));
-        usnap_drop(lo, hi - lo);   // TOTK: from here on the update is in memory (GPU timeline): later readers read it there
+        g_pl_wk = PLW_UPDFLUSH; usnap_drop(lo, hi - lo); g_pl_wk = 0;   // TOTK: from here on the update is in memory (GPU timeline): later readers read it there
         __unsafe_unretained id<MTLBuffer> sb; uint8_t *scpu; size_t so = arena_alloc_u((size_t)(hi - lo), &sb, &scpu, NULL);
         pend_materialize(lo, scpu, (size_t)(hi - lo), 0);   // every byte here is covered by a logged update: the newest one wins
         if (!b) b = blit();
@@ -1931,7 +1933,7 @@ static uint64_t upd_shadow(uint64_t lo, uint64_t size) {
 static void mtl_sub_update(const void *data, uint64_t dst, uint64_t n) {
     void *db; uint64_t dof;
     g_upd_n++;
-    if (g_pl > 0) { plds_touch(dst, n, "inline uniform update"); pl_write(dst, n); }   // TOTK_PIPELINE: written on the GPU timeline (also when renamed: flushed at the end)
+    if (g_pl > 0) { plds_touch(dst, n, "inline uniform update"); g_pl_wk = PLW_UPDATE; pl_write(dst, n); g_pl_wk = 0; }   // TOTK_PIPELINE: written on the GPU timeline (also when renamed: flushed at the end)
     pd_update_bytes(data, dst, n, g_upd_n);
     if (!mtl_addr(dst, n, &db, &dof)) MDIE("uniform update target not in any memory pool dst=%#llx n=%#llx", (unsigned long long)dst, (unsigned long long)n);
     __unsafe_unretained id<MTLBuffer> sb; uint8_t *scpu; size_t so = arena_alloc_u((size_t)n, &sb, &scpu, NULL);
@@ -9191,7 +9193,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             void *tv = NULL; uint64_t trid = tid ? tex_fast_rid(tid, &tv) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
             if (passdump()) PD("W %llu st%d reg%d tid=%d %s ser=%llu", g_stat_pass, nvn_stage, reg, tid, t ? "实" : "哑", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull);
             if (t && !(t.usage & MTLTextureUsageShaderWrite)) { RED_ONCE(32, "图像槽绑的贴图没有可写用途（贴图号 %d）", tid); t = nil; }
-            if (t && g_pl > 0 && tid < g_ntreg && g_treg[tid].t.d.target == 10 && g_treg[tid].t.mem) { int bw_, bh_, bpb_ = nvn_fmt_bpb(g_treg[tid].t.d.format, &bw_, &bh_); plds_touch((uint64_t)(uintptr_t)g_treg[tid].t.mem, (uint64_t)g_treg[tid].t.d.width * (uint64_t)(bpb_ ? bpb_ : 16), "image store into a buffer texture"); pl_write((uint64_t)(uintptr_t)g_treg[tid].t.mem, (uint64_t)g_treg[tid].t.d.width * (uint64_t)(bpb_ ? bpb_ : 16)); }   // TOTK_PIPELINE: an image store into a buffer texture writes memory (a readback snapshot there retires)
+            if (t && g_pl > 0 && tid < g_ntreg && g_treg[tid].t.d.target == 10 && g_treg[tid].t.mem) { int bw_, bh_, bpb_ = nvn_fmt_bpb(g_treg[tid].t.d.format, &bw_, &bh_); plds_touch((uint64_t)(uintptr_t)g_treg[tid].t.mem, (uint64_t)g_treg[tid].t.d.width * (uint64_t)(bpb_ ? bpb_ : 16), "image store into a buffer texture"); g_pl_wk = PLW_IMAGE; pl_write((uint64_t)(uintptr_t)g_treg[tid].t.mem, (uint64_t)g_treg[tid].t.d.width * (uint64_t)(bpb_ ? bpb_ : 16)); g_pl_wk = 0; }   // TOTK_PIPELINE: an image store into a buffer texture writes memory (a readback snapshot there retires)
             if (!t) { t = dummy_img(b->dtt, b->dpf); trid = g_dummy_img_rid[b->dtt & 7][b->dpf & 3]; }   // 未绑：D3D 语义写入丢弃——写进专用哑贴图，不污染读出 0 的那套 | Unbound: D3D semantics discard the write - write into a dedicated dummy texture so the set that reads 0 is not polluted
             slots[aid] = trid;
             USE(t, MTLResourceUsageRead | MTLResourceUsageWrite);
@@ -9214,7 +9216,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             }
             void *mb; uint64_t mo, gpu;
             if (va && g_nupd && upd_overlap_seq(va, va + 65536)) { g_ren_late++; RED_ONCE(60, "uniform 槽里的存储缓冲指针 %#llx 在编码器打开后才发现与待写入的 uniform 更新重叠", (unsigned long long)va); }
-            if (va && b->rw) usnap_drop(va, 65536);   // TOTK: the shader may write there (extent unknown: 64 KiB as for the update check)
+            if (va && b->rw) { g_pl_wk = PLW_STORAGE64; usnap_drop(va, 65536); g_pl_wk = 0; }   // TOTK: the shader may write there (extent unknown: 64 KiB as for the update check)
             if (va && g_pl > 0 && plds_redirect(va, 1, b->rw, &mb, &gpu)) { slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); }   // TOTK_PIPELINE: the depth statistics host buffer
             else if (va && mtl_gpu_addr(va, 1, &mb, &mo, &gpu)) { use_rec("buf", va, 1, 0, NULL); slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead);
                 if (g_pl > 0 && !b->rw) pl_live_read(va, 65536, PLK_SB); }   // TOTK_PIPELINE: extent unknown (64 KiB as above): read in place, pages noted
@@ -9237,7 +9239,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
                 if (b->kind == NVN_RB_UBOP) ren = upd_shadow(u->addr, u->size);
                 else if (upd_overlap_seq(u->addr, u->addr + (u->size ? u->size : 1))) { g_ren_late++; RED_ONCE(59, "存储缓冲 %#llx 在编码器打开后才发现与待写入的 uniform 更新重叠", (unsigned long long)u->addr); }
             }
-            if (b->kind == NVN_RB_SBUFP && b->rw && u && u->addr) usnap_drop(u->addr, u->size ? u->size : 1);   // TOTK: the shader may write it: no stale uniform copy from here on
+            if (b->kind == NVN_RB_SBUFP && b->rw && u && u->addr) { g_pl_wk = PLW_STORAGE; usnap_drop(u->addr, u->size ? u->size : 1); g_pl_wk = 0; }   // TOTK: the shader may write it: no stale uniform copy from here on
             const usnap_t *usc = !ren && b->kind == NVN_RB_UBOP && u && u->addr ? usnap_find(u->addr, u->size ? u->size : 1) : NULL;   // TOTK: compute uniforms as of the submit call
             if (ren) { slots[aid] = ren; USE(dummy_buf(), MTLResourceUsageRead); }
             else if (usc) { slots[aid] = usc->gpu + (u->addr - usc->lo); USE(dummy_buf(), MTLResourceUsageRead); }
@@ -12658,7 +12660,7 @@ static void dispatch(const p_dispatch *dp) {
         if (!mtl_addr(u->addr, 4, &ub, &uo) || !mtl_addr(a0->addr, 8, &sb, &so) || !mtl_addr(a1->addr, 8, &db, &dof)) { RED_ONCE(30, "内嵌计算核 %s 的缓冲没绑全", cs->builtin); return; }
         if (g_pl > 0) {   // TOTK_PIPELINE: the kernel reads its uniform and source and writes its target in memory
             plds_touch(u->addr, 16, "built-in kernel uniform"); plds_touch(a0->addr, a0->size ? a0->size : 8, "built-in kernel source"); plds_touch(a1->addr, a1->size ? a1->size : 8, "built-in kernel target");
-            uint64_t pg; pl_write(a1->addr, a1->size ? a1->size : 8);
+            uint64_t pg; g_pl_wk = PLW_KERNEL; pl_write(a1->addr, a1->size ? a1->size : 8); g_pl_wk = 0;
             if (u->size) pl_read(u->addr, u->size, PLK_UB, &ub, &uo, &pg); else pl_live_read(u->addr, 16, PLK_UB);
             if (a0->size) pl_read(a0->addr, a0->size, PLK_SB, &sb, &so, &pg); else pl_live_read(a0->addr, 65536, PLK_SB); }
         if (!cs->logged++) {
@@ -12729,7 +12731,7 @@ static void copy_t2b(const p_copy_b2t *c) {
     upd_guard(c->src, c->src + img * nz);   // TOTK: renamed uniform updates before a GPU write to the range
     if (!mtl_addr(c->src, img * nz, &mb, &mo)) { RED_ONCE(31, "贴图→缓冲拷贝的目标不在内存池里"); return; }
     if (g_pl > 0) plds_redirect_off(c->src, img * nz, 1, &mb, &mo);   // TOTK_PIPELINE: a readback snapshot receives the copy in its host buffer (the write itself: usnap_drop)
-    usnap_drop(c->src, img * nz);   // TOTK: a GPU write: no uniform copy of these bytes from here on
+    g_pl_wk = PLW_T2B; usnap_drop(c->src, img * nz); g_pl_wk = 0;   // TOTK: a GPU write: no uniform copy of these bytes from here on
     id<MTL4ComputeCommandEncoder> b = blit(); BOTW_T2B_NOTE(c, t, mb, mo, img * nz) BOTW_GPU_COPY_SUPERSEDES(mb, mo, img * nz)
     if (is3d)
         enc_b_copy_texture_buffer(b, t, 0, level, MTLOriginMake(c->r.xoffset, c->r.yoffset, c->r.zoffset), MTLSizeMake(c->r.width, c->r.height, nz), (__bridge id<MTLBuffer>)mb, mo, row, img);

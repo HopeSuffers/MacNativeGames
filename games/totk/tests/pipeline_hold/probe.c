@@ -163,6 +163,17 @@ int main(int argc, char **argv) {
         EXPECT("write to a watched read-only page finishes", 4, g_mem[13 * P]);
         EXPECT("watch over", 0, nvn_pl_watch(NULL, 0));
     }
+    {   // range lookups through the sorted index: 3000 ranges added in reverse order, every third removed, random addresses
+        int N = 3000; uint8_t *m = mmap(NULL, P * 3 * N, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0); int bad = 0;
+        for (int i = 0; i < N; i++) nvn_dirty_add_range(m + (size_t)(N - 1 - i) * 3 * P, 2 * P);
+        for (int i = 0; i < N; i += 3) nvn_dirty_remove_range(m + (size_t)i * 3 * P);
+        for (int k = 0; k < 20000; k++) {
+            size_t off = (size_t)arc4random_uniform((uint32_t)(3 * N)) * P + arc4random_uniform((uint32_t)P); range_t *r = find((uintptr_t)m + off);
+            size_t idx = off / (3 * P); int live = off % (3 * P) < 2 * P && idx % 3 != 0;
+            bad += !!r != live || (r && ((uintptr_t)m + off < r->base || (uintptr_t)m + off >= r->end));
+        }
+        EXPECT("indexed range lookups agree (20000 random addresses)", 0, bad);
+    }
     printf("%d checks, %d failed\n", g_checks, g_fail);
     return g_fail != 0;
 }

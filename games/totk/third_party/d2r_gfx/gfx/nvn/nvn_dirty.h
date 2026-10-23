@@ -26,6 +26,7 @@ enum { NVN_PLS_HOLD, NVN_PLS_HOLD_HOST, NVN_PLS_HOLD_NS, NVN_PLS_TIMEOUT, NVN_PL
        NVN_PLS_PASSKEEP, NVN_PLS_SPANPROT, NVN_PLS_BIGSPAN, NVN_PLS_N };
 enum { NVN_PL_BT = 3 };
 typedef struct { uint64_t pc, addr; uint32_t frame, host; uint64_t rfence, released, bt[NVN_PL_BT]; } nvn_pl_hold_rec;   // bt: lr, then the frame chain   // host: 0 guest write fault, 1 announced host write, 2 / 3 read / write of a watched GPU-written page
+uint64_t nvn_dirty_range_gen(void);   // changes whenever a tracked range goes live or dies
 int nvn_pl_mode(void);
 void nvn_pl_set_done(uint64_t (*done)(void));                   // completed fence, signal-safe
 void nvn_pl_set_frame(uint32_t frame);                          // the frame CPU writes are stamped with (pl_wfr)
