@@ -1861,6 +1861,7 @@ static uint64_t g_cbc_hits, g_cbc_misses, g_cbc_verified; static int cbc_mode(vo
 static uint64_t g_pso_memo_hits, g_pso_memo_misses; static int pso_memo_on(void);   // TOTK_PSO_MEMO (defined with g_pso)
 static uint64_t g_vbm_hits, g_vbm_misses, g_vbm_verified; static int vbm_mode(void);   // TOTK_VB_MEMO (defined with bind_vertex_streams)
 static uint64_t g_ugm_hits, g_ugm_misses, g_ugm_verified; static int ugm_mode(void);   // TOTK_GUARD_MEMO (defined with upd_guard_draw)
+static uint64_t g_cbc2_epoch, g_cbc2_kept; static int cbc_upd_on(void);   // TOTK_CBUF_UPD (defined before encode_args)
 static uint64_t g_ab_same;   // TOTK_AB_SAME: argument blocks bound again because the new bytes equal the shader's previous block
 static int upd_fast_on(void) {
     static int v = -1;
@@ -4055,8 +4056,8 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
            cbc_mode(), (unsigned long long)g_cbc_hits, (unsigned long long)g_cbc_misses, (unsigned long long)g_cbc_verified, (unsigned long long)g_ab_same,
            side_cb_on(), (unsigned long long)g_side_switches, (unsigned long long)g_side_idle, (unsigned long long)g_side_fallbacks, (unsigned long long)g_side_extra,
            pso_memo_on(), (unsigned long long)g_pso_memo_hits, (unsigned long long)g_pso_memo_misses); }
-    MLOG("[replay-fast3] vb-memo=%d hits=%llu misses=%llu verified=%llu | guard-memo=%d hits=%llu misses=%llu verified=%llu", vbm_mode(), (unsigned long long)g_vbm_hits, (unsigned long long)g_vbm_misses, (unsigned long long)g_vbm_verified,
-         ugm_mode(), (unsigned long long)g_ugm_hits, (unsigned long long)g_ugm_misses, (unsigned long long)g_ugm_verified);
+    MLOG("[replay-fast3] vb-memo=%d hits=%llu misses=%llu verified=%llu | guard-memo=%d hits=%llu misses=%llu verified=%llu | cbuf-upd=%d kept=%llu epochs=%llu", vbm_mode(), (unsigned long long)g_vbm_hits, (unsigned long long)g_vbm_misses, (unsigned long long)g_vbm_verified,
+         ugm_mode(), (unsigned long long)g_ugm_hits, (unsigned long long)g_ugm_misses, (unsigned long long)g_ugm_verified, cbc_upd_on(), (unsigned long long)g_cbc2_kept, (unsigned long long)g_cbc2_epoch);
     MLOG("[pkg-final-cache] enabled=%d kept=%llu", pkg_final_cache_on(), (unsigned long long)atomic_load(&g_pkg_final_kept));
     MLOG("贴图类型缓存已回收退役视图 %llu 个", (unsigned long long)g_type_retired_views);
     res_site_report(8);
@@ -8550,6 +8551,31 @@ static inline void cbc_ctx_now(cbc_ctx *c) {
     c->sub = g_sub_serial; c->drops = g_usnap_drops; c->nupd = g_nupd; c->nusnap = g_nusnap;
 }
 static int ab_same_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_AB_SAME"); v = !(e && !atoi(e)); if (!v) MLOG("TOTK_AB_SAME=0: every rebuilt argument block gets a new copy"); } return v; }
+/* TOTK_CBUF_UPD (default on; =0 the context above), 2026-10-23: every logged inline uniform update (~200 a frame) raised
+   g_upd_seq and g_nupd and so dropped every remembered binding, also of ranges no update touched (cbuf-cache misses ~31%
+   of lookups in the bench log; a miss resolves in full: pool lookup, update-log query, snapshot lookup, ~90 samples of
+   ~1460 busy in the Kakariko translate profile plus the miss path itself). The update log enters the answer only through
+   upd_shadow: the newest logged update overlapping the range (0 = none: snapshot or memory) and, for a non-zero one, the
+   private copy made for (range, that update), which stays in the copy list until the list wraps (g_shadow_wraps, in the
+   context) or the log is flushed (then no logged update overlaps any more, and later ones have higher numbers). So an entry
+   now keeps that newest overlapping update number instead of the log's state, and is valid while it is unchanged; the
+   rest of the context (pool generation, copy-list wraps, submission, snapshot drops and entries) is compared as one epoch
+   number (raised whenever it differs from the last one seen). The log state at the entry's last check (g_upd_seq, g_nupd)
+   is kept as well: unchanged, the overlap query is skipped. Entries are 48 bytes instead of 72. TOTK_CBUF_CACHE=2 still
+   resolves every hit in full and compares. */
+typedef struct { uint64_t addr, gpu, epoch, useq, lseq; uint32_t size, ln; } cbc2_ent;
+static cbc2_ent g_cbc2[CBC_N];
+static cbc_ctx g_cbc2_base; static uint64_t g_cbc2_epoch = 1, g_cbc2_kept;   // kept: hits after the log changed (the overlap query said unchanged)
+static int cbc_upd_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_CBUF_UPD"); v = !(e && !atoi(e)); if (!v) MLOG("TOTK_CBUF_UPD=0: every logged uniform update drops every remembered uniform binding"); } return v; }
+static inline uint64_t cbc2_epoch_now(void) {   // the context without the update log, as one number
+    uint64_t pool = atomic_load_explicit(&g_pool_gen, memory_order_acquire);
+    if (pool != g_cbc2_base.pool || g_shadow_wraps != g_cbc2_base.shadow_wraps || g_sub_serial != g_cbc2_base.sub || g_usnap_drops != g_cbc2_base.drops || g_nusnap != g_cbc2_base.nusnap) {
+        g_cbc2_base.pool = pool; g_cbc2_base.shadow_wraps = g_shadow_wraps; g_cbc2_base.sub = g_sub_serial; g_cbc2_base.drops = g_usnap_drops; g_cbc2_base.nusnap = g_nusnap;
+        g_cbc2_epoch++;
+    }
+    return g_cbc2_epoch;
+}
+static inline uint64_t cbc2_useq(uint64_t addr, uint64_t size) { return g_nupd && size ? upd_overlap_seq(addr, addr + size) : 0; }   // what upd_shadow keys its copy on
 static inline unsigned cbc_slot(uint64_t addr, uint64_t size) { uint64_t h = (addr >> 4) ^ (addr >> 17) ^ (size * UINT64_C(0x9e3779b97f4a7c15)); return (unsigned)(h ^ (h >> 29)) & (CBC_N - 1); }
 static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
     if (!sh->ae) return 1;
@@ -8616,10 +8642,23 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
         if (b->kind == NVN_RB_CBUF) {
             const p_bind_buf *u = reg < 16 ? &S.ubo[nvn_stage][reg] : NULL;
             cbc_ent *ce = NULL; cbc_ctx cx; int ce_hit = 0;   // TOTK_CBUF_CACHE
+            cbc2_ent *c2 = NULL; cbc2_ent n2 = {0};           // TOTK_CBUF_UPD
             if (cbc && u && u->addr && !(nvn_stage == 0 && reg == 0 && g_ui_moff != 0)) {
+                if (cbc_upd_on()) {
+                    if (u->size <= UINT32_MAX) {
+                        uint64_t ep = cbc2_epoch_now(); c2 = &g_cbc2[cbc_slot(u->addr, u->size)];
+                        if (c2->addr == u->addr && c2->size == (uint32_t)u->size && c2->epoch == ep) {
+                            if (c2->lseq == g_upd_seq && c2->ln == (uint32_t)g_nupd) ce_hit = 1;
+                            else if (cbc2_useq(u->addr, u->size) == c2->useq) { ce_hit = 1; c2->lseq = g_upd_seq; c2->ln = (uint32_t)g_nupd; g_cbc2_kept++; }
+                        }
+                        if (ce_hit) { g_cbc_hits++; if (cbc < 2) { slots[aid] = c2->gpu; continue; } }
+                        else { g_cbc_misses++; n2 = (cbc2_ent){u->addr, 0, ep, cbc2_useq(u->addr, u->size), g_upd_seq, (uint32_t)u->size, (uint32_t)g_nupd}; }   // context read before the lookup
+                    }
+                } else {
                 cbc_ctx_now(&cx); ce = &g_cbc[cbc_slot(u->addr, u->size)];
                 ce_hit = ce->addr == u->addr && ce->size == u->size && !memcmp(&ce->cx, &cx, sizeof cx);
                 if (ce_hit) { g_cbc_hits++; if (cbc < 2) { slots[aid] = ce->gpu; continue; } } else g_cbc_misses++;
+                }
             }
             void *mb; uint64_t mo, gpu;
             if (!u || !u->addr || !mtl_gpu_addr(u->addr, 1, &mb, &mo, &gpu)) { RED_ONCE(16, "阶段 %d cb%d 没有绑定 uniform 缓冲", nvn_stage, reg); continue; }
@@ -8654,6 +8693,11 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
                 if (ce_hit) { if (ce->gpu != gpu) MDIE("uniform binding cache mismatch: shader %s stage %d cb%d %#llx+%llu cached %#llx resolved %#llx", sh->key, nvn_stage, reg,
                                                        (unsigned long long)u->addr, (unsigned long long)u->size, (unsigned long long)ce->gpu, (unsigned long long)gpu); g_cbc_verified++; }
                 else *ce = (cbc_ent){u->addr, u->size, gpu, cx};
+            }
+            if (c2) {   // TOTK_CBUF_UPD
+                if (ce_hit) { if (c2->gpu != gpu) MDIE("uniform binding cache (update-overlap keyed) mismatch: shader %s stage %d cb%d %#llx+%llu cached %#llx resolved %#llx (update %llu)", sh->key, nvn_stage, reg,
+                                                       (unsigned long long)u->addr, (unsigned long long)u->size, (unsigned long long)c2->gpu, (unsigned long long)gpu, (unsigned long long)c2->useq); g_cbc_verified++; }
+                else { n2.gpu = gpu; *c2 = n2; }
             }
             USE((__bridge id<MTLBuffer>)mb, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_SAMP || b->kind == NVN_RB_SAMPT) {   // SAMPT：合并句柄（贴图号 | 采样器号 << 20）的采样器部分 | SAMPT: the sampler part of a combined handle (texture ID | sampler ID << 20)
