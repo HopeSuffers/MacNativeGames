@@ -28,6 +28,7 @@ enum { NVN_PL_BT = 3 };
 typedef struct { uint64_t pc, addr; uint32_t frame, host; uint64_t rfence, released, bt[NVN_PL_BT]; uint32_t kinds; } nvn_pl_hold_rec;   // kinds: 1 met a read range, 2 a GPU write range   // bt: lr, then the frame chain   // host: 0 guest write fault, 1 announced host write, 2 / 3 read / write of a watched GPU-written page
 uint64_t nvn_dirty_range_gen(void);   // changes whenever a tracked range goes live or dies
 int nvn_pl_mode(void);
+int nvn_pl_wwhold(void);   // TOTK_PIPELINE_WWHOLD=1
 void nvn_pl_set_done(uint64_t (*done)(void));                   // completed fence, signal-safe
 void nvn_pl_set_frame(uint32_t frame);                          // the frame CPU writes are stamped with (pl_wfr)
 void nvn_pl_set_released(uint64_t released, uint64_t vdone);    // newest fence released early; dry run: the fence treated as complete

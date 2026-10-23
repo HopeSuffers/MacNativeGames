@@ -11886,7 +11886,7 @@ static int pl_max_index(const p_draw_idx *di, uint32_t *mx) {
     if (c->sub == g_sub_serial && c->ibuf == di->ibuf && c->count == di->count && c->itype == di->itype) { *mx = c->mx; return 1; }   // checked this submission
     if (nvn_pl_gpu_written((const void *)(uintptr_t)di->ibuf, len, pl_done_fn())) return 0;
     if (c->ibuf == di->ibuf && c->count == di->count && c->itype == di->itype && !nvn_dirty_since((const void *)(uintptr_t)di->ibuf, len, c->stamp)) { c->sub = g_sub_serial; *mx = c->mx; return 1; }
-    uint64_t stamp = nvn_dirty_now(); nvn_dirty_protect((const void *)(uintptr_t)di->ibuf, len);
+    uint64_t stamp = nvn_dirty_now(); nvn_dirty_protect((const void *)(uintptr_t)di->ibuf, len); g_plmi_scans++; g_plmi_idx += (uint64_t)di->count;
     uint32_t m = 0, restart = di->itype == 0 ? 0xff : di->itype == 1 ? 0xffff : 0xffffffffu;
     const uint8_t *p = (const uint8_t *)(uintptr_t)di->ibuf;
     for (int i = 0; i < di->count; i++) { uint32_t v = isz == 1 ? p[i] : isz == 2 ? ((const uint16_t *)p)[i] : ((const uint32_t *)p)[i]; if (v != restart && v > m) m = v; }

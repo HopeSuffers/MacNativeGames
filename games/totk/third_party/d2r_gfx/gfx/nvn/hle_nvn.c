@@ -45,6 +45,9 @@
 #endif
 #include <pthread/qos.h>
 #include <sys/resource.h>
+#if TARGET_OS_OSX
+#include <libproc.h>   // proc_pid_rusage (the "cores" line; not in the iOS SDK)
+#endif
 #include <mach/thread_policy.h>
 #include <assert.h>
 #include <stdatomic.h>
@@ -2171,6 +2174,14 @@ static uint64_t thr_sys_ns(void) {
     mach_port_deallocate(mach_task_self(), me); return r;
 }
 static _Atomic uint64_t g_cum_sub_cyc, g_cum_sub_sys_ns, g_cum_sub_wall_ns;
+/* Per core type (thread_selfcounts 4: {instructions, cycles, system time, user time} for the performance cores, then the
+   efficiency cores; mach time units; checked on an M4: level 0 = P, level 1 = E): which cores the submit path ran on and
+   at what clock. 0 when the kernel does not have it. */
+typedef struct { uint64_t instr, cyc, sys, user; } thr_lv;
+static int thr_levels(thr_lv lv[2]) { memset(lv, 0, sizeof(thr_lv) * 2); return thread_selfcounts(4, lv, sizeof(thr_lv) * 2) == 0; }
+static double mach_ns(uint64_t t) { static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb); return (double)t * tb.numer / tb.denom; }
+static _Atomic uint64_t g_cum_sub_lv[4];   // P cycles, P ticks, E cycles, E ticks (submit path, translate thread)
+static _Atomic int g_x_rt_live = -1;       // the translate thread's time-constraint policy in effect (checked at presents)
 static int frame_rec(void);
 static _Atomic uint64_t g_nvn_ns;   // 本帧在提交 / 出图里花的宿主时间（回放编码 + 出图），计时埋点用 | Host time spent in submit / present this frame (replay encoding + present), used by the timing instrumentation
 
@@ -2241,7 +2252,23 @@ static void *x_thread(void *unused) {
             // Real-time like the game's render thread that used to replay (set at acquire): otherwise the game's ~50
             // worker threads preempt the replay (measured: replay 6.6 -> 13 ms, 10 fps). Half the period is declared.
             static uint64_t rt; uint64_t per = (uint64_t)(j.period * 1e9);
-            if (per && rt != per) { rt = per; void set_time_constraint_comp_x(uint64_t, uint64_t); set_time_constraint_comp_x(per, per / 2); }
+            /* TOTK_PIPELINE=1: the translation runs back to back with the GPU (no frame wait in between) and took
+               5-6 ms per submission at full clock, more than the half period declared at 120 Hz (4.2 ms). In the
+               full bench (p-ple-pipe*) its clock fell from 3.9 to 1.52 GHz right when the early releases began, and
+               stayed there (base: 3.9 GHz until the machine got warm, 10000 frames later): the under-declared
+               real-time thread is moved off the performance cores (nxnative saw the same on an iPhone, see
+               rt_comp_fixed_ms). With the pipeline the translate thread declares TOTK_PIPELINE_XCOMP percent of the
+               period (default 90), and the encode stage gets a time-constraint policy too (TOTK_PIPELINE_ECOMP
+               percent, default 50; 0 = it stays a user-interactive thread). */
+            if (per && rt != per) { rt = per; void set_time_constraint_comp_x(uint64_t, uint64_t); void mtl_rs_rt(uint64_t, uint64_t);
+                static int xc = -1, ec = -1;
+                if (xc < 0) { const char *e = getenv("TOTK_PIPELINE_XCOMP"), *f = getenv("TOTK_PIPELINE_ECOMP"); xc = e && atoi(e) > 0 && atoi(e) <= 95 ? atoi(e) : 90; ec = f ? atoi(f) : 50; if (ec < 0 || ec > 95) ec = 50; }
+                int pl = pl_hle_mode() == 1;
+                set_time_constraint_comp_x(per, pl ? per * (uint64_t)xc / 100 : per / 2);
+                if (pl && ec > 0) mtl_rs_rt(per, per * (uint64_t)ec / 100); }
+            { static unsigned k; if (!(k++ & 63)) {   // is the policy still in effect? (default = 1: not set, or taken away)
+                thread_time_constraint_policy_data_t tp; mach_msg_type_number_t tc = THREAD_TIME_CONSTRAINT_POLICY_COUNT; boolean_t def = 0;
+                atomic_store(&g_x_rt_live, thread_policy_get(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&tp, &tc, &def) == KERN_SUCCESS && !def); } }
             present_exec(j.win, j.idx, j.period, j.crop, j.frame);
             if (xs) { pres_n++; pres_ns += now_ns() - tj;
                 if (pres_n == 600) { LOG("[translate] the translation thread's queue: a submission waited %.3f ms before its replay began; a present took %.3f ms there (600 presents)",
@@ -2381,6 +2408,7 @@ static void submit_exec(int n, const uint64_t *h, void *ucap) {
         LOG("[cmd] Submit %d/%d handle=%#llx ops=%u draws=%u calls=%u", i, n, (unsigned long long)h[i], ops, draws, calls); }
     if (getenv("TOTK_CHAIN_LOG")) { static int k; if (k++ < 20) guest_chain("Submit"); }
     uint64_t t0 = now_ns(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), i0, y0, s0 = thr_sys_ns(); thr_counts(&i0, &y0);
+    thr_lv lv0[2]; int lvok = thr_levels(lv0);
     /* TOTK diagnostic (TOTK_WATCH_ADDR): submissions in progress, and their start / end times, to line up guest writes with replay */
     atomic_fetch_add(&dm_submit_busy, 1);
     { static int wl = -1; if (wl < 0) wl = getenv("TOTK_WATCH_ADDR") != NULL; if (wl) LOG("[sub] F%llu start t_us=%llu", (unsigned long long)g_frame_pub, (unsigned long long)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000)); }
@@ -2396,6 +2424,8 @@ static void submit_exec(int n, const uint64_t *h, void *ucap) {
     atomic_fetch_add(&g_nvn_ns, dw); atomic_fetch_add(&g_sub_wall_ns, dw);
     uint64_t i1, y1; thr_counts(&i1, &y1); uint64_t dc = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - c0, di = i1 - i0;
     atomic_fetch_add(&g_cum_sub_cyc, y1 - y0); atomic_fetch_add(&g_cum_sub_sys_ns, thr_sys_ns() - s0); atomic_fetch_add(&g_cum_sub_wall_ns, dw);
+    { thr_lv lv1[2]; if (lvok && thr_levels(lv1)) for (int l = 0; l < 2; l++) {
+          atomic_fetch_add(&g_cum_sub_lv[2 * l], lv1[l].cyc - lv0[l].cyc); atomic_fetch_add(&g_cum_sub_lv[2 * l + 1], (lv1[l].sys + lv1[l].user) - (lv0[l].sys + lv0[l].user)); } }
     atomic_fetch_add(&g_sub_cpu_ns, dc); atomic_fetch_add(&g_cum_sub_cpu_ns, dc); atomic_fetch_add(&g_lf_sub_cpu_ns, dc);
     atomic_fetch_add(&g_sub_instr, di); atomic_fetch_add(&g_cum_sub_instr, di);
     totk_tl(TL_REP_END, 0, 0);
@@ -2752,6 +2782,26 @@ static void tsummary(uint64_t frame) {
           static uint64_t pyn, pyns; uint64_t yn = 0, yns = 0; dm_main_yield_stats(&yn, &yns);
           LOG("[nvn] 翻译细项 至帧 %llu：每帧提交 周期 %.2f M（每条指令 %.2f 周期）、CPU %.3f ms 其中内核态 %.3f ms、墙钟 %.3f ms；平均主频 %.2f GHz（周期 / CPU 时间）；本线程 QoS %#x；分配器池 %d 个、累计等 GPU %llu 次；实时声明计算 %.2f ms；主线程让出 每帧 %.0f 次 / %.3f ms", frame,
               cyc / 1e6 / nf, cyc / (double)(ci - pi), cpu / 1e6 / nf, (double)(ck - pk) / 1e6 / nf, (double)(cw - pw) / 1e6 / nf, cpu > 0 ? cyc / cpu : 0, (unsigned)qc, an, (unsigned long long)aw, g_rt_comp_ms, (double)(yn - pyn) / nf, (double)(yns - pyns) / 1e6 / nf); pyn = yn; pyns = yns; }
+        { /* Core types (thread_selfcounts 4 / RUSAGE_INFO_V6): submit path of the translate thread, the encode stage, the
+             whole process (CPU time, its share on P-cores, clocks, time runnable but waiting for a core, CPU energy). */
+          static uint64_t pl_[4], pe[5], pr[8], pfr; uint64_t lv[4], ev[5] = {0}; void mtl_rs_cores(uint64_t[5]); mtl_rs_cores(ev);
+          for (int i = 0; i < 4; i++) lv[i] = atomic_load(&g_cum_sub_lv[i]);
+          uint64_t rv[8] = {0};
+#if TARGET_OS_OSX
+          struct rusage_info_v6 ru;
+          if (proc_pid_rusage(getpid(), RUSAGE_INFO_V6, (rusage_info_t *)&ru) == 0) { rv[0] = ru.ri_user_time + ru.ri_system_time; rv[1] = ru.ri_user_ptime + ru.ri_system_ptime; rv[2] = ru.ri_cycles; rv[3] = ru.ri_pcycles; rv[4] = ru.ri_energy_nj; rv[5] = ru.ri_runnable_time; }
+#endif
+          if (pfr && frame > pfr) { double nf = (double)(frame - pfr), pc = (double)(lv[0] - pl_[0]), pt = mach_ns(lv[1] - pl_[1]), ec_ = (double)(lv[2] - pl_[2]), et = mach_ns(lv[3] - pl_[3]);
+            double bpc = (double)(ev[0] - pe[0]), bpt = mach_ns(ev[1] - pe[1]), bec = (double)(ev[2] - pe[2]), bet = mach_ns(ev[3] - pe[3]);
+            double cpu = mach_ns(rv[0] - pr[0]), pcpu = mach_ns(rv[1] - pr[1]), cyc = (double)(rv[2] - pr[2]), pcyc = (double)(rv[3] - pr[3]), run = mach_ns(rv[5] - pr[5]);
+            LOG("[nvn] cores to frame %llu: translate submit path P %.3f ms @ %.2f GHz + E %.3f ms @ %.2f GHz per frame (E %.0f%%), real-time policy %s; encode stage P %.3f ms @ %.2f GHz + E %.3f ms @ %.2f GHz (E %.0f%%), real-time policy %s; process CPU %.2f ms per frame, %.0f%% on P-cores (P %.2f GHz, E %.2f GHz), runnable but not running %.2f ms, CPU energy %.1f mJ per frame",
+                frame, pt / 1e6 / nf, pt > 0 ? pc / pt : 0.0, et / 1e6 / nf, et > 0 ? ec_ / et : 0.0, pt + et > 0 ? 100.0 * et / (pt + et) : 0.0,
+                atomic_load(&g_x_rt_live) < 0 ? "not checked" : atomic_load(&g_x_rt_live) ? "in effect" : "NOT in effect",
+                bpt / 1e6 / nf, bpt > 0 ? bpc / bpt : 0.0, bet / 1e6 / nf, bet > 0 ? bec / bet : 0.0, bpt + bet > 0 ? 100.0 * bet / (bpt + bet) : 0.0,
+                ev[4] == 0 ? "not set" : ev[4] == 1 ? "in effect" : "NOT in effect",
+                cpu / 1e6 / nf, cpu > 0 ? 100.0 * pcpu / cpu : 0.0, pcpu > 0 ? pcyc / pcpu : 0.0, cpu > pcpu ? (cyc - pcyc) / (cpu - pcpu) : 0.0,
+                run > cpu ? (run - cpu) / 1e6 / nf : 0.0, (double)(rv[4] - pr[4]) / 1e6 / nf); }
+          memcpy(pl_, lv, sizeof pl_); memcpy(pe, ev, sizeof pe); memcpy(pr, rv, sizeof pr); pfr = frame; }
         { static uint64_t pun, puns; uint64_t un = 0, uns = 0; void mtl_upload_wait_stats(uint64_t *, uint64_t *); mtl_upload_wait_stats(&un, &uns);
           if (pf && frame > pf) LOG("[nvn] 上传槽等待 至帧 %llu：每帧 %.2f 次 / %.3f ms", frame, (double)(un - pun) / (double)(frame - pf), (double)(uns - puns) / 1e6 / (double)(frame - pf));
           pun = un; puns = uns; }
