@@ -11474,6 +11474,7 @@ static inline uint64_t vbm_index_len(void *mb, uint64_t mo) {   // [mb length] -
     }
     return ((__bridge id<MTLBuffer>)mb).length - mo;
 }
+static int enc_lock1_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_ENC_LOCK1"); v = !(e && !atoi(e)); if (!v) MLOG("TOTK_ENC_LOCK1=0: each stage's argument block takes the registry lock itself"); } return v; }
 static void bind_vertex_streams(id<MTL4RenderCommandEncoder> en, NvShader *vs) {
     uint16_t mask=vertex_streams_on()?vertex_stream_mask(vs):UINT16_MAX;
     uint64_t bound=0,omitted=0;
@@ -11956,8 +11957,15 @@ frz_plain:;
     enc_r_blend_color(en, S.blend_color[0], S.blend_color[1], S.blend_color[2], S.blend_color[3]);
     bind_vertex_streams((id<MTL4RenderCommandEncoder>)en,pr->sh[0]);
     if (g_lay.active) enc_r_vbuf(en, LAY_BUF_INDEX, lay_gpu(g_lay_probe_neg == 1 ? 0 : g_lay.cur - g_lay.base));   // TOTK: this draw's layer within the layered pass
+    /* TOTK_ENC_LOCK1 (default on; =0 off), 2026-10-23: both stages' argument blocks under one registry-lock span. Each
+       encode_args takes the lock twice (epoch key, then the binding loop), four lock / unlock pairs a draw (atomics on the
+       lock word the game's recording threads also take: ~40 samples of ~1460 busy in the Kakariko translate profile with
+       the waits); nested, the inner ones only count the thread's depth. Nothing between the two calls waits for another
+       thread that takes this lock; the bindings are resolved from the same state, with no registration between the stages. */
+    int lock1 = enc_lock1_on(); if (lock1) registry_lock();
     if (pr->sh[0]) encode_args((id<MTLCommandEncoder>)en, pr->sh[0], 0, 1);
     if (pr->sh[1]) encode_args((id<MTLCommandEncoder>)en, pr->sh[1], 1, 0);
+    if (lock1) registry_unlock();
     // 参数绑定在登记表锁内捕获实际资源；资格判断到绑定期间有版本变化，则在任何GPU draw前切开重试。
     // Parameter binding captures the actual resources under the registry lock; if the version changed between the eligibility check and the binding, split and retry before any GPU draw.
     if (g_rt_range_active && (g_pass.reg_gen != g_reg_gen || g_pass.ser_gen != g_ser_gen || g_pass.range_dirty != nvn_dirty_now())) { rp_end(); draw(dw, di); return; }
