@@ -6286,6 +6286,14 @@ static int cls_of(int f) { switch (f) {
     case 0x04: case 0x09: case 0x0C: case 0x10: case 0x15: case 0x18: case 0x1C: case 0x21: case 0x24: case 0x28: case 0x2D: case 0x30: return 2;
     default: return 0; } }
 static const treg_t *bound_tex(uint64_t h);
+/* stage_sig (TOTK_SIG_INCR): take the registry lock; keep it and answer 1 when no registration happened since gen was read
+   (texture / sampler registrations bump g_reg_gen while holding it), so the per-slot answers kept for gen still hold. */
+static int g_sig_incr_locked;
+static int sig_incr_locked(uint64_t gen) {
+    g_sig_incr_locked = registry_lock();
+    if (g_reg_gen == gen) return 1;
+    registry_unlock(); return 0;
+}
 static uint64_t stage_sig(int st) {
     uint64_t sg = 0;
     if (st == 1 && R.has_rt) for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i])
@@ -6295,18 +6303,38 @@ static uint64_t stage_sig(int st) {
        so a program first translated with other bindings is re-fitted at draw time. */
     /* The depth-slot mask only changes with this stage's bound handles or a descriptor registration (g_reg_gen): it is
        kept per stage and recomputed when either changed (it was a lookup per bound slot on every draw, about 7%). */
+    /* TOTK_SIG_INCR (default on): when only the handles changed (same registration generation), look up just the slots whose
+       handle differs from the last one seen; every other slot keeps its depth answer, which depends only on (handle,
+       generation). The mask is the XOR of the depth slots' constants, so it is the same value the full walk computes. Material
+       draws rebind a few textures each, and the full walk (a registry lookup per bound slot under the lock) ran on most draws
+       (stage_sig ~3% of the replay). Cached only when this call took the registry lock itself, as before. */
     { static uint64_t last_tex[6][128], last_gen[6] = {~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull}, last_tg[6] = {~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull}, last_dm[6];
+      static uint64_t inc_dep[6][2]; static int inc_hi[6];   // depth slot bits of last_tex[st][0, inc_hi) for last_gen[st]; inc_hi 0 = none
+      static int incr = -1; if (incr < 0) { const char *e = getenv("TOTK_SIG_INCR"); incr = !(e && !atoi(e)); if (!incr) MLOG("TOTK_SIG_INCR=0: the depth-slot mask is recomputed over every bound slot"); }
       uint64_t dm; uint64_t gen = g_reg_gen;
       int hi = st >= 0 && st < 6 ? g_tex_hi[st] : 128;
       if (st >= 0 && st < 6 && gen == last_gen[st] && S.tex_gen[st] == last_tg[st]) {
           if (tex_gen_check() && memcmp(last_tex[st], S.tex[st], sizeof(uint64_t) * hi)) MDIE("texture slot generation %llu of stage %d kept, handles changed", (unsigned long long)S.tex_gen[st], st);
           dm = last_dm[st]; }
-      else {
-          dm = 0; int locked = registry_lock();
-          for (int r = 0; r < hi; r++) if (S.tex[st][r]) { const treg_t *t = bound_tex(S.tex[st][r]); if (!t) continue;
-              int f = t->has_v && t->v.set_format ? t->v.format : t->t.d.format; if (f >= 0x32 && f <= 0x36) dm ^= 0x9E3779B97F4A7C15ull * (uint64_t)(r + 1); }
+      else if (incr && st >= 0 && st < 6 && gen == last_gen[st] && inc_hi[st] >= hi && sig_incr_locked(gen)) {
+          int locked = g_sig_incr_locked;   // the registry lock is held (taken by sig_incr_locked); registrations bump g_reg_gen under it
+          for (int r = 0; r < hi; r++) { uint64_t h = S.tex[st][r]; if (h == last_tex[st][r]) continue;
+              int d = 0; const treg_t *t = h ? bound_tex(h) : NULL;
+              if (t) { int f = t->has_v && t->v.set_format ? t->v.format : t->t.d.format; d = f >= 0x32 && f <= 0x36; }
+              if (d) inc_dep[st][r >> 6] |= UINT64_C(1) << (r & 63); else inc_dep[st][r >> 6] &= ~(UINT64_C(1) << (r & 63));
+              last_tex[st][r] = h; }
           registry_unlock();
-          if (st >= 0 && st < 6 && locked) { if (tex_gen_check()) memcpy(last_tex[st], S.tex[st], sizeof(uint64_t) * hi); last_gen[st] = gen; last_tg[st] = S.tex_gen[st]; last_dm[st] = dm; }
+          dm = 0; for (int w = 0; w < 2; w++) for (uint64_t m = inc_dep[st][w]; m; m &= m - 1) { int r = w * 64 + __builtin_ctzll(m); if (r < hi) dm ^= 0x9E3779B97F4A7C15ull * (uint64_t)(r + 1); }
+          if (locked) { last_tg[st] = S.tex_gen[st]; last_dm[st] = dm; } else inc_hi[st] = 0;
+      }
+      else {
+          dm = 0; int locked = registry_lock(); uint64_t dep[2] = {0, 0};
+          for (int r = 0; r < hi; r++) if (S.tex[st][r]) { const treg_t *t = bound_tex(S.tex[st][r]); if (!t) continue;
+              int f = t->has_v && t->v.set_format ? t->v.format : t->t.d.format; if (f >= 0x32 && f <= 0x36) { dm ^= 0x9E3779B97F4A7C15ull * (uint64_t)(r + 1); dep[r >> 6] |= UINT64_C(1) << (r & 63); } }
+          registry_unlock();
+          if (st >= 0 && st < 6 && locked) { if (tex_gen_check() || incr) memcpy(last_tex[st], S.tex[st], sizeof(uint64_t) * hi); last_gen[st] = gen; last_tg[st] = S.tex_gen[st]; last_dm[st] = dm;
+              inc_dep[st][0] = dep[0]; inc_dep[st][1] = dep[1]; inc_hi[st] = hi; }
+          else if (st >= 0 && st < 6) inc_hi[st] = 0;
       }
       if (dm) sg ^= dm | 1ull << 63; }
     return sg;
