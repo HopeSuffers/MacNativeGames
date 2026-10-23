@@ -1862,6 +1862,7 @@ static uint64_t g_pso_memo_hits, g_pso_memo_misses; static int pso_memo_on(void)
 static uint64_t g_vbm_hits, g_vbm_misses, g_vbm_verified; static int vbm_mode(void);   // TOTK_VB_MEMO (defined with bind_vertex_streams)
 static uint64_t g_ugm_hits, g_ugm_misses, g_ugm_verified; static int ugm_mode(void);   // TOTK_GUARD_MEMO (defined with upd_guard_draw)
 static uint64_t g_cbc2_epoch, g_cbc2_kept; static int cbc_upd_on(void);   // TOTK_CBUF_UPD (defined before encode_args)
+static uint64_t g_pso_memo2_verified; static int pso_memo2_on(void);   // TOTK_PSO_MEMO2 (defined with pso_lookup)
 static uint64_t g_ab_same;   // TOTK_AB_SAME: argument blocks bound again because the new bytes equal the shader's previous block
 static int upd_fast_on(void) {
     static int v = -1;
@@ -4056,8 +4057,10 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
            cbc_mode(), (unsigned long long)g_cbc_hits, (unsigned long long)g_cbc_misses, (unsigned long long)g_cbc_verified, (unsigned long long)g_ab_same,
            side_cb_on(), (unsigned long long)g_side_switches, (unsigned long long)g_side_idle, (unsigned long long)g_side_fallbacks, (unsigned long long)g_side_extra,
            pso_memo_on(), (unsigned long long)g_pso_memo_hits, (unsigned long long)g_pso_memo_misses); }
-    MLOG("[replay-fast3] vb-memo=%d hits=%llu misses=%llu verified=%llu | guard-memo=%d hits=%llu misses=%llu verified=%llu | cbuf-upd=%d kept=%llu epochs=%llu", vbm_mode(), (unsigned long long)g_vbm_hits, (unsigned long long)g_vbm_misses, (unsigned long long)g_vbm_verified,
-         ugm_mode(), (unsigned long long)g_ugm_hits, (unsigned long long)g_ugm_misses, (unsigned long long)g_ugm_verified, cbc_upd_on(), (unsigned long long)g_cbc2_kept, (unsigned long long)g_cbc2_epoch);
+    MLOG("[replay-fast3] vb-memo=%d hits=%llu misses=%llu verified=%llu | guard-memo=%d hits=%llu misses=%llu verified=%llu | cbuf-upd=%d kept=%llu epochs=%llu | pso-memo2=%d verified=%llu",
+         vbm_mode(), (unsigned long long)g_vbm_hits, (unsigned long long)g_vbm_misses, (unsigned long long)g_vbm_verified,
+         ugm_mode(), (unsigned long long)g_ugm_hits, (unsigned long long)g_ugm_misses, (unsigned long long)g_ugm_verified, cbc_upd_on(), (unsigned long long)g_cbc2_kept, (unsigned long long)g_cbc2_epoch,
+         pso_memo2_on(), (unsigned long long)g_pso_memo2_verified);
     MLOG("[pkg-final-cache] enabled=%d kept=%llu", pkg_final_cache_on(), (unsigned long long)atomic_load(&g_pkg_final_kept));
     MLOG("贴图类型缓存已回收退役视图 %llu 个", (unsigned long long)g_type_retired_views);
     res_site_report(8);
@@ -5153,8 +5156,11 @@ static int sh_has_src(NvShader *s) { return s && (s->src || s->src_path); }
     void *udc_sh[6]; uint8_t udc_ok, udc_img, udc_imgw; uint32_t udc_cmask;   // udc_*: udc_note_draw's summary of sh[] (valid while sh[] is the same)
     void *ar_sh[6]; uint8_t ar_n, ar_st[32], ar_reg[32], ar_img[32];   // ar_*: draw_att_reads' sampled texture / image slots of sh[] (valid while sh[] is the same; ar_n 255 = more than 32, scan the bindings)
     int missing, miss_has[2]; uint64_t miss_sig[2]; int exp_skip;
-    int keeps; uint64_t miss_gen; } @end   // TOTK (iOS, Mac async shaders): missing = stages whose variant is not translated yet; miss_sig: signature whose variant is missing (prog_fit); exp_skip: TOTK_EXP_SKIP_FS decision (0 unknown, 1 keep, 2 skip); keeps: a stage stores to memory or streams out (sph_keeps_memory), its draws are never skipped; miss_gen: totk_rt_ready_gen() when a stage was last found missing
-@implementation NvProg @end
+    int keeps; uint64_t miss_gen;
+    void *pmemo; uint8_t pmemo_next; } @end   // TOTK (iOS, Mac async shaders): missing = stages whose variant is not translated yet; miss_sig: signature whose variant is missing (prog_fit); exp_skip: TOTK_EXP_SKIP_FS decision (0 unknown, 1 keep, 2 skip); keeps: a stage stores to memory or streams out (sph_keeps_memory), its draws are never skipped; miss_gen: totk_rt_ready_gen() when a stage was last found missing
+@implementation NvProg
+- (void)dealloc { free(pmemo); }   // TOTK_PSO_MEMO2: the program's remembered pipelines (plain C, the pipelines are held by g_pso)
+@end
 /* TOTK_EXP_SKIP_FS=<fragment key prefix>[,<prefix>...] (measurement only, 2026-10-16): drop every draw whose fragment shader key
    starts with one of the prefixes. A render pass whose draws are all dropped is never opened, so the GPU time saved is the
    whole cost of those passes (fixed per-pass overhead included): the upper bound of merging them away. Not for normal play. */
@@ -6760,8 +6766,36 @@ typedef struct { const void *pr; uint64_t gen; pso_key k; void *ps; } pso_memo_e
 #define PSO_MEMO_N 256
 static pso_memo_ent g_pso_memo[PSO_MEMO_N]; static uint64_t g_pso_gen = 1;
 static int pso_memo_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PSO_MEMO"); v = !(e && !atoi(e)); if (!v) MLOG("TOTK_PSO_MEMO=0: every pipeline lookup hashes the key"); } return v; }
+/* TOTK_PSO_MEMO2 (default on with TOTK_PSO_MEMO; =0 the shared table above), 2026-10-23: the shared 256-slot table is indexed
+   by the program pointer, so programs that share a slot evict each other: pso-memo hits 1.87M / misses 3.15M in the bench
+   log, every miss hashing the whole key (nvn_hm_get + memcmp ~40 samples of ~1460 busy in the Kakariko translate profile).
+   Each program now keeps its own two most recent (key, pipeline) pairs (a program draws into one or two pass layouts in a
+   frame). Same rule as the shared table: a pair counts only under the g_pso_gen it was found with (any put into g_pso, which
+   may replace and release a pipeline, drops it) and for a byte-equal key, the comparison g_pso itself makes; only found
+   pipelines are kept. */
+typedef struct { uint64_t gen; pso_key k; void *ps; } pso_pm_ent;
+static uint64_t g_pso_memo2_verified;
+static int pso_memo2_on(void) {   // 0 off, 1 on, 2 on and every hit compared with the g_pso lookup
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_PSO_MEMO2"); v = e ? atoi(e) : 1; if (v < 0 || v > 2) v = 1;
+                 if (v != 1) MLOG("TOTK_PSO_MEMO2=%d: %s", v, v ? "per-program pipeline memo, every hit verified" : "pipelines remembered in the shared table by program pointer"); }
+    return v;
+}
 static inline void *pso_lookup(const void *pr, const pso_key *k) {
     if (!pso_memo_on()) return hm_get_ptr(&g_pso, k);
+    if (pr && pso_memo2_on()) {
+        __unsafe_unretained NvProg *p = (__bridge NvProg *)pr; pso_pm_ent *m = (pso_pm_ent *)p->pmemo;
+        if (m) for (int i = 0; i < 2; i++) if (m[i].ps && m[i].gen == g_pso_gen && !memcmp(&m[i].k, k, sizeof *k)) {
+            if (pso_memo2_on() == 2) { if (hm_get_ptr(&g_pso, k) != m[i].ps) MDIE("per-program pipeline memo disagrees with the pipeline table"); g_pso_memo2_verified++; }
+            p->pmemo_next = (uint8_t)(i ^ 1); g_pso_memo_hits++; return m[i].ps; }   // the other pair is now the older one
+        void *ps = hm_get_ptr(&g_pso, k); g_pso_memo_misses++;
+        if (ps) {
+            if (!m) { m = calloc(2, sizeof *m); if (!m) MDIE("pipeline memo"); p->pmemo = m; }
+            pso_pm_ent *e = &m[p->pmemo_next & 1]; p->pmemo_next ^= 1;   // replaces the older (least recently used) pair
+            e->gen = g_pso_gen; e->k = *k; e->ps = ps;
+        }
+        return ps;
+    }
     uintptr_t h = (uintptr_t)pr; pso_memo_ent *e = &g_pso_memo[((h >> 4) ^ (h >> 13)) & (PSO_MEMO_N - 1)];
     if (e->pr == pr && e->gen == g_pso_gen && !memcmp(&e->k, k, sizeof *k)) { g_pso_memo_hits++; return e->ps; }
     void *ps = hm_get_ptr(&g_pso, k); g_pso_memo_misses++;
