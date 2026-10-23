@@ -1790,6 +1790,7 @@ static uint64_t g_upd_bits[UPD_BITS / 64]; static int g_upd_bits_any, g_upd_bits
 static uint64_t g_upd_filter_q, g_upd_filter_skip;           // overlap queries past the hull test / answered by the filter
 static uint64_t g_sig_incr_n, g_sig_full_n, g_tex_ser_fast_n;  // stage_sig incremental / full walks; tex_view_valid steps taken inline
 static uint64_t g_cbc_hits, g_cbc_misses, g_cbc_verified; static int cbc_mode(void);   // TOTK_CBUF_CACHE (defined before encode_args)
+static uint64_t g_ab_same;   // TOTK_AB_SAME: argument blocks bound again because the new bytes equal the shader's previous block
 static int upd_fast_on(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("TOTK_UPD_FAST"); v = !(e && !atoi(e)); if (!v) MLOG("TOTK_UPD_FAST=0: uniform-update overlap checks search the log for every range and walk every binding"); }
@@ -3967,8 +3968,8 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     MLOG("[replay-fast] upd-filter=%d queries=%llu skipped=%llu | sig incremental=%llu full=%llu | tex-ser-fast steps=%llu",upd_fast_on(),(unsigned long long)g_upd_filter_q,(unsigned long long)g_upd_filter_skip,
          (unsigned long long)g_sig_incr_n,(unsigned long long)g_sig_full_n,(unsigned long long)g_tex_ser_fast_n);
     { int dfon; uint64_t dskip, dhash, dscan; nvn_dirty_fast_stats(&dfon, &dskip, &dhash, &dscan);
-      MLOG("[replay-fast2] dirty-fast=%d blocks-skipped=%llu range-table=%llu range-scans=%llu | cbuf-cache=%d hits=%llu misses=%llu verified=%llu", dfon, (unsigned long long)dskip, (unsigned long long)dhash, (unsigned long long)dscan,
-           cbc_mode(), (unsigned long long)g_cbc_hits, (unsigned long long)g_cbc_misses, (unsigned long long)g_cbc_verified); }
+      MLOG("[replay-fast2] dirty-fast=%d blocks-skipped=%llu range-table=%llu range-scans=%llu | cbuf-cache=%d hits=%llu misses=%llu verified=%llu | ab-same=%llu", dfon, (unsigned long long)dskip, (unsigned long long)dhash, (unsigned long long)dscan,
+           cbc_mode(), (unsigned long long)g_cbc_hits, (unsigned long long)g_cbc_misses, (unsigned long long)g_cbc_verified, (unsigned long long)g_ab_same); }
     MLOG("[pkg-final-cache] enabled=%d kept=%llu", pkg_final_cache_on(), (unsigned long long)atomic_load(&g_pkg_final_kept));
     MLOG("贴图类型缓存已回收退役视图 %llu 个", (unsigned long long)g_type_retired_views);
     res_site_report(8);
@@ -5044,7 +5045,7 @@ typedef struct { uint64_t gen; int ok, ns; int32_t sig[16]; border_in in; __stro
     // The argument buffer encoded last time
     arg_epoch_key ab_epoch; int ab_epoch_ok;
     tex_slot_cache tex_slots;
-    id<MTLBuffer> ab_buf; uint64_t ab_gpu; size_t ab_off; uint64_t ab_pass;   // ab_pass：编这块参数的渲染通道序号——只在同一通道内复用（跨通道 / 跨提交的块所在 arena 可能已回收重写） | ab_pass: serial of the render pass that encoded this argument block - reused only within the same pass (the arena holding a block from another pass / another submission may already have been reclaimed and rewritten)
+    id<MTLBuffer> ab_buf; uint64_t ab_gpu; size_t ab_off; uint64_t ab_pass; const uint8_t *ab_cpu; uint64_t ab_arena;   // ab_cpu / ab_arena (TOTK_AB_SAME): the block's bytes and the arena epoch it was allocated in; ab_pass：编这块参数的渲染通道序号——只在同一通道内复用（跨通道 / 跨提交的块所在 arena 可能已回收重写） | ab_pass: serial of the render pass that encoded this argument block - reused only within the same pass (the arena holding a block from another pass / another submission may already have been reclaimed and rewritten)
     id<MTLLibrary> bflib; int bflib_tried; NSMutableDictionary<NSString *, id<MTLFunction>> *bffn; id<MTLFunction> no_depth_fn;
     NSString *src, *src_path; NSDictionary<NSNumber *, NSString *> *io; NSMutableDictionary<NSString *, id<MTLFunction>> *vpatch; id<MTLFunction> mfx_fn[8]; uint8_t mfx_tried[8]; NSMutableDictionary<NSString *, id<MTLFunction>> *bpatch; int border_seen; border_cache bkc[2]; NvShader *vf_fs; NSString *vf_bkey; id<MTLFunction> vf_fn; int vf_layered, vf_ok; NSString *bf_key; id<MTLFunction> bf_fn; int bf_nd, bf_ok; } @end   // TOTK: MSL source, user varyings (locn -> type), patched vertex functions   // bflib：可读 tile 版本 <键>_bf（合并 B 第 2 步） | bflib: readable-tile version <key>_bf (merge B step 2)
 @implementation NvShader @end
@@ -8415,6 +8416,7 @@ static inline void cbc_ctx_now(cbc_ctx *c) {
     c->pool = atomic_load_explicit(&g_pool_gen, memory_order_acquire); c->upd_seq = g_upd_seq; c->shadow_wraps = g_shadow_wraps;
     c->sub = g_sub_serial; c->drops = g_usnap_drops; c->nupd = g_nupd; c->nusnap = g_nusnap;
 }
+static int ab_same_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_AB_SAME"); v = !(e && !atoi(e)); if (!v) MLOG("TOTK_AB_SAME=0: every rebuilt argument block gets a new copy"); } return v; }
 static inline unsigned cbc_slot(uint64_t addr, uint64_t size) { uint64_t h = (addr >> 4) ^ (addr >> 17) ^ (size * UINT64_C(0x9e3779b97f4a7c15)); return (unsigned)(h ^ (h >> 29)) & (CBC_N - 1); }
 static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
     if (!sh->ae) return 1;
@@ -8678,10 +8680,22 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
         return 1;
     }
     NSUInteger arg_len = sh->arg_len ? sh->arg_len : sh->ae.encodedLength;
+    /* TOTK_AB_SAME (default on; =0 off), 2026-10-23: the bytes just resolved are the ones of this shader's previous block
+       (a binding generation or guest-write step that changed nothing this stage reads, the same handles bound again).
+       That block lives in this submission's arena, which nothing rewrites before the submission completes, so it is bound
+       again instead of a copy: the GPU reads the same bytes, and the unchanged address lets the render encoder's
+       argument-table cache skip the setAddress (and its encode-stage packet) for consecutive draws of the shader. */
+    if (sh->ab_cpu && sh->ab_arena == g_arena_epoch && !ab_noreuse && ab_same_on() && !memcmp(sh->ab_cpu, slots, arg_len)) {
+        bind_args(en, nvn_stage, metal_vertex, sh->ab_buf, sh->ab_gpu, sh->ab_off, sh->rf.abi);
+        sh->ab_pass = g_pass.serial; sh->ab_epoch = epoch; g_args_dirty[nvn_stage] = 0;
+        g_stat_args_enc++; g_ab_same++;
+        return 1;
+    }
     __unsafe_unretained id<MTLBuffer> ab; uint8_t *acpu; uint64_t agpu; size_t off = arena_alloc_u(arg_len, &ab, &acpu, &agpu);
     memcpy(acpu, slots, arg_len);
     bind_args(en, nvn_stage, metal_vertex, ab, agpu, off, sh->rf.abi);
     sh->ab_buf = ab; sh->ab_gpu = agpu; sh->ab_off = off; sh->ab_pass = g_pass.serial; sh->ab_epoch = epoch; g_args_dirty[nvn_stage] = 0;
+    sh->ab_cpu = acpu; sh->ab_arena = g_arena_epoch;
     g_stat_args_enc++;
     return 1;
 }
