@@ -205,6 +205,10 @@ static uint64_t g_done;                         // 已完成的最大栅栏值�
 /* TOTK_PIPELINE (totk_pipeline.h): the game's frame wait one frame deeper. The replay notes the guest memory the GPU
    reads / writes in place and reads snapshots of recently CPU-written ranges (pl_read / pl_bind / pl_write). */
 static int g_pl = -1;
+/* the translate thread per submission (mtl_sub_begin .. mtl_sub_commit): wall and thread CPU time, and the waits that
+   sleep (TOTK_PIPELINE stats, or TOTK_XLATE_STATS=1 without it): wall - CPU = sleeping waits + preemption */
+static uint64_t g_plx_t0, g_plx_c0, g_plx_rs0, g_plx_rsf0, g_plx_wait[4];   // waits: 0 allocator, 1 visibility ring, 2 pipeline slot, 3 render-stream (snapshot at begin)
+static void pl_sub_end_stats(void);
 enum { PLK_VB, PLK_IB, PLK_SB, PLK_UB, PLK_CP, PLK_TX, PLK_N };   // kinds of GPU reads (statistics)
 enum { PLW_OTHER, PLW_UPDATE, PLW_UPDFLUSH, PLW_COPY, PLW_T2B, PLW_STORAGE, PLW_STORAGE64, PLW_KERNEL, PLW_IMAGE, PLW_N };   // kinds of GPU writes (the invalidate log)
 static int g_pl_wk;   // the kind of the GPU write being noted, set by the call site
@@ -1124,6 +1128,7 @@ static int g_sub_chunks; static uint64_t g_chunk_mark, g_stat_draw; static void 
 static int g_nupd, g_nshadow; static inline int upd_guard(uint64_t lo, uint64_t hi);   // renamed uniform updates, defined with mtl_sub_update
 void mtl_sub_begin(void) {
     g_fc_begin0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    g_plx_t0 = g_fc_begin0; g_plx_c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
     /* The submission's autorelease pool, drained in mtl_sub_commit, opens before anything else: the guest's submit
        thread has no pool of its own that drains (frontend.m's lasts the whole game), so what defer_drain, defer_reset,
        warm_claim and pt_apply_request autoreleased before it piled up every submission (nxnative found the same leak:
@@ -1150,7 +1155,7 @@ void mtl_sub_begin(void) {
     if (alloc_i < 0 && g_alloc_n < ALLOC_MAX) { NSError *ae = nil; MTL4CommandAllocatorDescriptor *ad = [MTL4CommandAllocatorDescriptor new];
         g_alloc4[g_alloc_n] = [g_dev newCommandAllocatorWithDescriptor:ad error:&ae]; if (!g_alloc4[g_alloc_n]) MDIE("新建 MTL4CommandAllocator 失败：%s", ae.localizedDescription.UTF8String);
         alloc_i = g_alloc_n++; g_alloc_grown++; }
-    if (alloc_i < 0) { alloc_i = 0; for (int i = 1; i < g_alloc_n; i++) if (g_alloc_fence[i] < g_alloc_fence[alloc_i]) alloc_i = i; g_alloc_waits++; mtl_wait(g_alloc_fence[alloc_i], UINT64_MAX); }
+    if (alloc_i < 0) { alloc_i = 0; for (int i = 1; i < g_alloc_n; i++) if (g_alloc_fence[i] < g_alloc_fence[alloc_i]) alloc_i = i; g_alloc_waits++; uint64_t w0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); mtl_wait(g_alloc_fence[alloc_i], UINT64_MAX); g_plx_wait[0] += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - w0; }
     g_alloc_cur = alloc_i;
     [g_alloc4[alloc_i] reset];
     [g_cb beginCommandBufferWithAllocator:g_alloc4[alloc_i]];
@@ -1163,7 +1168,7 @@ void mtl_sub_begin(void) {
     int pick = -1;
     for (int i = 0; i < g_vis_ring_n; i++) if (g_vis_ring[i].fence <= g_done) { pick = i; break; }
     if (pick < 0 && g_vis_ring_n < 4) pick = g_vis_ring_n++;
-    if (pick < 0) { uint64_t oldest = UINT64_MAX; for (int i = 0; i < 4; i++) if (g_vis_ring[i].fence < oldest) { oldest = g_vis_ring[i].fence; pick = i; } if (oldest > g_done) mtl_wait(oldest, UINT64_MAX); }
+    if (pick < 0) { uint64_t oldest = UINT64_MAX; for (int i = 0; i < 4; i++) if (g_vis_ring[i].fence < oldest) { oldest = g_vis_ring[i].fence; pick = i; } if (oldest > g_done) { uint64_t w0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); mtl_wait(oldest, UINT64_MAX); g_plx_wait[1] += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - w0; } }
     g_vis_ring_i = pick; g_vis_ring[pick].fence = UINT64_MAX;
     if (!g_vis_ring[pick].buf) { g_vis_ring[pick].buf = [g_dev newBufferWithLength:VIS_SLOTS * 8 options:MTLResourceStorageModeShared]; res_add(g_vis_ring[pick].buf); }
     g_vis = g_vis_ring[pick].buf;
@@ -2320,6 +2325,7 @@ uint64_t mtl_sub_commit(void) {
     g_cb = nil;
     g_commit_blocks = nil;
     objc_autoreleasePoolPop(g_sub_pool); g_sub_pool = NULL;
+    pl_sub_end_stats();
     return fence;
 }
 

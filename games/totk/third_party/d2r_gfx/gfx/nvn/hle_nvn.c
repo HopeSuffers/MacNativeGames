@@ -2197,7 +2197,7 @@ _Atomic int dm_submit_busy;   // TOTK diagnostic: submissions being replayed (ru
 // 94-frame picture comparison with citron showed no difference from the synchronous replay. On the Mac only: the iPhone
 // and iPad keep the synchronous replay unless TOTK_ASYNC_REPLAY=1 (not measured there).
 enum { XJ_SUBMIT = 1, XJ_PRESENT, XJ_TEXREL };
-typedef struct { int kind, n; uint64_t *h; void *ucap; win_t *win; int idx; double period; int crop[4]; uint64_t frame, sub; tex_t tex; } xjob;   // tex: copy of a finalized texture (XJ_TEXREL); ucap: uniforms captured at the submit call
+typedef struct { int kind, n; uint64_t *h; void *ucap; win_t *win; int idx; double period; int crop[4]; uint64_t frame, sub; tex_t tex; uint64_t t_push; } xjob;   // t_push: queued at (TOTK_PIPELINE / TOTK_XLATE_STATS)   // tex: copy of a finalized texture (XJ_TEXREL); ucap: uniforms captured at the submit call
 #define XQ 64
 #define XF 4096
 static xjob g_xq[XQ];
@@ -2221,6 +2221,9 @@ static void *x_thread(void *unused) {
         while (g_xq_done == g_xq_in) pthread_cond_wait(&g_xq_cv, &g_xq_mu);
         xjob j = g_xq[g_xq_done % XQ];
         pthread_mutex_unlock(&g_xq_mu);
+        static int xs = -1; if (xs < 0) { const char *e = getenv("TOTK_XLATE_STATS"), *p = getenv("TOTK_PIPELINE"); xs = (e && atoi(e) > 0) || (p && atoi(p) > 0); }
+        static uint64_t q_sub, q_sub_ns, pres_n, pres_ns; uint64_t tj = xs ? now_ns() : 0;
+        if (xs && j.kind == XJ_SUBMIT && j.t_push) { q_sub++; q_sub_ns += tj - j.t_push; }
         if (j.kind == XJ_SUBMIT) { submit_exec(j.n, j.h, j.ucap); free(j.h); }
         else if (j.kind == XJ_TEXREL) { void live_del_x(const tex_t *o); live_del_x(&j.tex); mtl_tex_release(&j.tex); }
         else {
@@ -2229,6 +2232,9 @@ static void *x_thread(void *unused) {
             static uint64_t rt; uint64_t per = (uint64_t)(j.period * 1e9);
             if (per && rt != per) { rt = per; void set_time_constraint_comp_x(uint64_t, uint64_t); set_time_constraint_comp_x(per, per / 2); }
             present_exec(j.win, j.idx, j.period, j.crop, j.frame);
+            if (xs) { pres_n++; pres_ns += now_ns() - tj;
+                if (pres_n == 600) { LOG("[translate] the translation thread's queue: a submission waited %.3f ms before its replay began; a present took %.3f ms there (600 presents)",
+                                         q_sub ? q_sub_ns / 1e6 / (double)q_sub : 0.0, pres_ns / 1e6 / 600.0); q_sub = q_sub_ns = pres_n = pres_ns = 0; } }
         }
         pthread_mutex_lock(&g_xq_mu);
         if (j.kind == XJ_SUBMIT) { g_xsub_fence[j.sub % XF] = mtl_last_fence(); g_xsub_done = j.sub; }
@@ -2245,6 +2251,7 @@ static uint64_t x_push(xjob *j) {   // returns the job number (1-based)
     pthread_mutex_lock(&g_xq_mu);
     while (g_xq_in - g_xq_done >= XQ) pthread_cond_wait(&g_xq_cv, &g_xq_mu);
     if (j->kind == XJ_SUBMIT) j->sub = ++g_xsub_in;
+    j->t_push = now_ns();
     g_xq[g_xq_in % XQ] = *j;
     uint64_t no = ++g_xq_in;
     pthread_cond_broadcast(&g_xq_cv);

@@ -46,7 +46,8 @@
 #define PL_SLOTS 16
 #define PL_MEMO 16384
 #define PL_SCACHE 65536
-#define PLDS_SNAPS 32
+#define PLDS_SNAPS 64
+#define PLDS_NEAR 1024   // learned ranges this close to a snapshot join it (the slots of one index-times-size buffer)
 #define PLDS_MAX (256u << 10)
 #define PLDS_RING 4
 static const char *const g_plk_name[PLK_N] = {"vertex", "index", "storage", "uniform", "copy source", "texture source"};
@@ -86,7 +87,7 @@ static struct {
 } g_pls_st;
 static _Atomic uint64_t g_pl_rel_t[3];   // release on the game thread: early results / protection / snapshots published
 static _Atomic uint64_t g_pl_waits, g_pl_early, g_pl_lead_ns, g_pl_lead_n, g_pl_lead_max, g_pl_gate_n, g_pl_gate_ns, g_pl_inval_n, g_pl_inval_gates, g_pl_rel_ns, g_pl_rel_n;
-static _Atomic uint64_t g_plds_pub, g_plds_merge, g_plds_conflict, g_plds_skip, g_plds_act, g_plds_learned, g_plds_grown;
+static _Atomic uint64_t g_plds_pub, g_plds_merge, g_plds_conflict, g_plds_skip, g_plds_act, g_plds_learned, g_plds_grown, g_plds_noslot;
 
 /* ---------- per submission (replay thread) ---------- */
 typedef struct { uint64_t lo, hi, gpu, off; void *buf; uint32_t gen; int8_t snap, kind; } pl_memo;
@@ -248,14 +249,19 @@ static void plds_begin(void) {   // mtl_sub_begin (command buffer open, nothing 
             /* overlapping snapshots (e.g. the 64 KiB a storage pointer of unknown extent is taken to write, over a smaller
                snapshot): one snapshot over the union, the old ones retire first (activation waits until they are gone) */
             uint64_t ulo = lo[c] & ~15ull, uhi = (hi[c] + 15) & ~15ull; int same = 0;
-            for (int i = 0; i < PLDS_SNAPS; i++) { plds_t *o = &g_plds[i]; if (o->state >= 1 && o->state <= 3 && o->lo < uhi && o->hi > ulo) { if (o->lo < ulo) ulo = o->lo; if (o->hi > uhi) uhi = o->hi; } }
+            for (int pass = 0; pass < 2; pass++)   // twice: a union can reach a further neighbour
+                for (int i = 0; i < PLDS_SNAPS; i++) { plds_t *o = &g_plds[i]; if (o->state >= 1 && o->state <= 3 && o->lo < uhi + PLDS_NEAR && o->hi + PLDS_NEAR > ulo) {
+                    uint64_t nlo = o->lo < ulo ? o->lo : ulo, nhi = o->hi > uhi ? o->hi : uhi;
+                    if (nhi - nlo <= PLDS_MAX) { ulo = nlo; uhi = nhi; } } }
             if (uhi - ulo > PLDS_MAX) continue;
             for (int i = 0; i < PLDS_SNAPS; i++) { plds_t *o = &g_plds[i]; if (o->state >= 1 && o->state <= 3 && o->lo < uhi && o->hi > ulo) {
                 if (o->state == 1) { if (o->lo == ulo && o->hi == uhi) same = 1; else *o = (plds_t){0}; }
                 else if (o->lo != ulo || o->hi != uhi) { os_unfair_lock_lock(&g_plds_lk); if (o->state == 2) o->state = 3; os_unfair_lock_unlock(&g_plds_lk); }
                 else same = 1; } }
             if (same) continue;
-            for (int i = 0; i < PLDS_SNAPS; i++) if (g_plds[i].state == 0) { g_plds[i] = (plds_t){0}; g_plds[i].state = 1; g_plds[i].lo = ulo; g_plds[i].hi = uhi; g_plds[i].hits = 2; g_plds[i].last_sub = g_plds_sub; atomic_fetch_add(&g_plds_learned, 1); break; }
+            int put = 0;
+            for (int i = 0; i < PLDS_SNAPS; i++) if (g_plds[i].state == 0) { g_plds[i] = (plds_t){0}; g_plds[i].state = 1; g_plds[i].lo = ulo; g_plds[i].hi = uhi; g_plds[i].hits = 2; g_plds[i].last_sub = g_plds_sub; atomic_fetch_add(&g_plds_learned, 1); put = 1; break; }
+            if (!put && atomic_fetch_add(&g_plds_noslot, 1) < 8) MLOG("【红】[pipeline] readback snapshot %#llx+%llu: no free slot (%d in use)", (unsigned long long)ulo, (unsigned long long)(uhi - ulo), PLDS_SNAPS);
         }
     }
     for (int i = 0; i < PLDS_SNAPS; i++) {
@@ -492,7 +498,23 @@ typedef struct {
 } pl_slot;
 static pl_slot g_plslot[PL_SLOTS];   // under g_mu. state: 1 pending, 2 being released, 3 released (early results applied), 4 taken by the completion
 static void pl_slot_free_locked(pl_slot *s) { free(s->early); free(s->qaddr); free(s->nlo); free(s->nhi); free(s->wlo); free(s->whi); free(s->wmx); free(s->wk); *s = (pl_slot){0}; }
+static struct { uint64_t n, wall, cpu, rs_sync, rs_full, w[3]; } g_plx;
+static int plx_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_XLATE_STATS"); v = e && atoi(e) > 0; } return v || g_pl > 0; }
+/* end of mtl_sub_commit: the translate thread's time for this submission; a line every 600 */
+static void pl_sub_end_stats(void) {
+    if (!plx_on()) return;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), cpu = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
+    g_plx.n++; g_plx.wall += now - g_plx_t0; g_plx.cpu += cpu - g_plx_c0;
+    g_plx.rs_sync += g_rs_sync_ns - g_plx_rs0; g_plx.rs_full += g_rs_full_ns - g_plx_rsf0;
+    for (int i = 0; i < 3; i++) { g_plx.w[i] += g_plx_wait[i]; g_plx_wait[i] = 0; }
+    if (g_plx.n < 600) return;
+    double k = (double)g_plx.n * 1e6;
+    MLOG("[translate] per submission (%llu): wall %.3f ms, on CPU %.3f ms, off CPU %.3f ms (sleeping waits or preempted); waits: encode stage %.3f (join) + %.3f (queue full) ms (spinning: on CPU), command allocator %.3f, visibility ring %.3f, pipeline slot %.3f ms (sleeping)",
+         (unsigned long long)g_plx.n, g_plx.wall / k, g_plx.cpu / k, (g_plx.wall > g_plx.cpu ? g_plx.wall - g_plx.cpu : 0) / k, g_plx.rs_sync / k, g_plx.rs_full / k, g_plx.w[0] / k, g_plx.w[1] / k, g_plx.w[2] / k);
+    memset(&g_plx, 0, sizeof g_plx);
+}
 static void pl_sub_begin(void) {   // end of mtl_sub_begin
+    g_plx_rs0 = g_rs_sync_ns; g_plx_rsf0 = g_rs_full_ns;
     pl_cfg();
     if (g_pl <= 0) return;
     nvn_pl_set_done(pl_done_fn);
@@ -540,7 +562,7 @@ static int pl_commit(uint64_t fence, post_op *ops, int n) {
     if (nq) { q = malloc(sizeof *q * (size_t)nq); memcpy(q, g_plq, sizeof *q * (size_t)nq); }
     pthread_mutex_lock(&g_mu);
     pl_slot *s = &g_plslot[fence % PL_SLOTS];
-    while (s->fence && s->state == 2) pthread_cond_wait(&g_cv, &g_mu);   // its release is still applying (16 submissions back: never in practice)
+    if (s->fence && s->state == 2) { uint64_t w0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); while (s->fence && s->state == 2) pthread_cond_wait(&g_cv, &g_mu); g_plx_wait[2] += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - w0; }   // its release is still applying (16 submissions back: never in practice)
     pl_slot_free_locked(s);
     *s = (pl_slot){.fence = fence, .state = 1, .early = early, .nearly = ne, .qaddr = q, .nq = nq, .nlo = nlo, .nhi = nhi, .nn = 0, .wlo = wlo, .whi = whi, .wmx = wmx, .wk = wk, .nw = nw};
     pthread_mutex_unlock(&g_mu);
