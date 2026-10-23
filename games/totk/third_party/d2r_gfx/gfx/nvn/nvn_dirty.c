@@ -14,6 +14,9 @@
 #include <unistd.h>
 #include <mach/mach_time.h>
 #include <sched.h>
+#include <time.h>
+#include <string.h>
+#include <stdlib.h>
 
 // 页状态与 mprotect 的次序（改保护的一方先把状态改成 BUSY，mprotect 落地后才改成终态；别的线程见 BUSY 就等）：
 //   设只读：NONE → BUSY → mprotect(只读) → PROT；解保护：PROT → BUSY → mprotect(可写) → NONE。
@@ -34,7 +37,8 @@ enum { BUSY_WAIT_MS = 2000 };
 // 跟踪区间 = 各内存池（MemoryPoolInitialize 登记）。池销毁后复用 live=0 的槽，信号处理里无锁扫描。
 // Tracked ranges = the memory pools (registered by MemoryPoolInitialize). After a pool is destroyed its live=0 slot is reused; the signal handler scans without locks.
 #define MAX_RANGE 16384 // 原为 256：内存池多于它时超出的池不跟踪，里面的贴图每次取用都当成脏的重传（暗黑实测峰值见内存读数行的「内存池」；塞尔达约 300 个，踩过）。扫描只到已用的槽数，容量大不增加开销 | was 256: with more memory pools than that the excess pools are untracked and their textures are treated as dirty and re-uploaded on every use (for Diablo's measured peak see "memory pools" in the memory readout line; Zelda has about 300 and hit this). The scan only covers slots in use, so a larger capacity costs nothing. TOTK (2026-10-17): 4096 was full in the user's own games and most long test games (about 3,900 live pools in the world, more when moving between regions); now 16384
-typedef struct { uintptr_t base, end; _Atomic uint8_t *state; _Atomic uint64_t *gen; size_t cap; _Atomic int live; _Atomic uint64_t latest; _Atomic uint64_t *blk; } range_t;   // latest (TOTK): highest page generation in the range; blk: the same per block of BLK_PAGES pages
+typedef struct { uintptr_t base, end; _Atomic uint8_t *state; _Atomic uint64_t *gen; size_t cap; _Atomic int live; _Atomic uint64_t latest; _Atomic uint64_t *blk;
+                 _Atomic uint64_t *pl_rf, *pl_rf2, *pl_wf; _Atomic uint32_t *pl_wfr, *pl_pfr; size_t pl_cap; } range_t;   // pl_*: TOTK_PIPELINE per-page state (see "one frame deeper" below)   // latest (TOTK): highest page generation in the range; blk: the same per block of BLK_PAGES pages
 /* TOTK_DIRTY_FAST (default on; =0 off), 2026-10-23. Two lookups the replay makes for every CPU-mirrored texture at its
    check in each submission (tex_mtl: about 2.5% of the translate thread in the Korok Forest profile):
    - nvn_dirty_since walked every page of the texture whenever anything else in its pool had been written since the stamp
@@ -145,6 +149,205 @@ int nvn_dirty_recent(uintptr_t lo, uintptr_t hi, nvn_dirty_rec *out, int max) {
     for (uint64_t j = n > 4096 ? n - 4096 : 0; j < n && k < max; j++) { nvn_dirty_rec r = g_drec[j % 4096]; if (r.page >= lo && r.page < hi) out[k++] = r; }
     return k;
 }
+/* ---------- TOTK_PIPELINE: one frame deeper (nvn_mtl.m, totk_pipeline.h) ----------
+   With TOTK_PIPELINE=1 the game's frame wait for submission k returns once k-1 has completed, so the GPU still runs k
+   while the game records k+1 and writes the memory k+1 will use. Per page of every tracked pool:
+   - pl_rf:  newest fence of a submission whose GPU work accesses the page in place (a read that was not snapshotted, or a
+             write), pl_rf2 the one before it (beyond the completed fence at most two submissions are in flight: the one
+             released early and the one translated after it); a CPU write to such a page is a hazard while a released
+             submission among them still runs;
+   - pl_wf:  newest fence of a submission whose GPU work writes the page (such pages are never snapshotted);
+   - pl_wfr: frame (nvn_pl_set_frame) of the last CPU write seen: a write fault, or a host write, on a protected page;
+   - pl_pfr: frame the page was last put on probation: write-protected again to see whether the CPU still writes it.
+   A CPU write to a protected page whose pl_rf is above the completed fence while an early release covers it waits in the
+   fault handler until the GPU has passed min(pl_rf, released) (a "hold"; guest threads only; signal-safe: atomics,
+   mach_absolute_time, nanosleep; at most PL_HOLD_MS, then it goes ahead and is counted as a timeout). Host threads (the
+   Metal completion handlers writing query results) are never held. TOTK_PIPELINE=2 (dry run) holds nothing: the frame
+   wait is exact, the fence of the previous frame wait plays "completed" and the writes that would have been held are
+   counted. The writer's pc of the latest holds is kept in a ring (nvn_pl_holds). */
+static int g_pl_mode = -1;                    // 0 off, 1 on, 2 dry run (pl_init, before the first range)
+static uint64_t (*volatile g_pl_done)(void);  // completed fence (nvn_mtl.m), read signal-safely
+static _Atomic uint64_t g_pl_released, g_pl_vdone;
+static _Atomic uint32_t g_pl_frame = 1;
+static _Atomic uint64_t g_pl_st[NVN_PLS_N];
+enum { PL_HOLD_MS = 500 };
+static nvn_pl_hold_rec g_pl_hrec[64]; static _Atomic uint64_t g_pl_hrec_n;
+static void pl_init(void) {
+    if (g_pl_mode >= 0) return;
+    const char *e = getenv("TOTK_PIPELINE"); int m = e ? atoi(e) : 0;
+    g_pl_mode = m == 1 || m == 2 ? m : 0;
+}
+int nvn_pl_mode(void) { pl_init(); return g_pl_mode; }
+void nvn_pl_set_done(uint64_t (*done)(void)) { g_pl_done = done; }
+void nvn_pl_set_frame(uint32_t f) { atomic_store(&g_pl_frame, f ? f : 1); }
+void nvn_pl_set_released(uint64_t released, uint64_t vdone) {
+    if (g_pl_mode == 2) atomic_store(&g_pl_vdone, vdone);
+    uint64_t r = atomic_load(&g_pl_released); while (r < released && !atomic_compare_exchange_weak(&g_pl_released, &r, released)) {}
+}
+static void pl_arrays(range_t *r, size_t np) {   // under g_slot_mu, before the range goes live
+    pl_init(); if (!g_pl_mode) return;
+    if (r->pl_cap < np) {   // the old arrays are not freed (a signal handler may still read them, as for state / gen)
+        _Atomic uint64_t *rf = calloc(np, 8), *rf2 = calloc(np, 8), *wf = calloc(np, 8); _Atomic uint32_t *wfr = calloc(np, 4), *pfr = calloc(np, 4);
+        if (!rf || !rf2 || !wf || !wfr || !pfr) die("pipeline page tables (%zu pages)", np);
+        r->pl_rf2 = rf2; r->pl_wf = wf; r->pl_wfr = wfr; r->pl_pfr = pfr; r->pl_cap = np; atomic_thread_fence(memory_order_release); r->pl_rf = rf;
+    } else { memset((void *)r->pl_rf, 0, np * 8); memset((void *)r->pl_rf2, 0, np * 8); memset((void *)r->pl_wf, 0, np * 8); memset((void *)r->pl_wfr, 0, np * 4); memset((void *)r->pl_pfr, 0, np * 4); }
+}
+static uint64_t pl_done_now(void) {
+    if (g_pl_mode == 2) return atomic_load(&g_pl_vdone);
+    uint64_t (*f)(void) = g_pl_done; return f ? f() : UINT64_MAX;
+}
+/* runtime/threads.c: the guest thread's handle (0 = a host thread). This weak default (no guest threads: graphics tests)
+   gives way to the runtime's definition. */
+#ifndef NVN_DIRTY_NO_HANDLE_DEFAULT   /* tests/pipeline_hold/probe.c brings its own */
+__attribute__((weak)) uint32_t runtime_thread_current_handle(void) { return 0; }
+#else
+uint32_t runtime_thread_current_handle(void);
+#endif
+static int pl_guest_thread(void) { return runtime_thread_current_handle() != 0; }
+static void pl_nap(void) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); }
+/* A CPU write is about to make page p of r writable (fault handler, or a host write announced through prep_write). */
+static void pl_before_write(range_t *r, uintptr_t p, uint64_t pc, int host) {
+    if (g_pl_mode <= 0 || !r->pl_rf || p >= r->pl_cap) return;
+    uint64_t rf = atomic_load_explicit(&r->pl_rf[p], memory_order_acquire); if (!rf) return;
+    uint64_t rf2 = atomic_load_explicit(&r->pl_rf2[p], memory_order_acquire), rel = atomic_load(&g_pl_released), done = pl_done_now(), until;
+    if (rel <= done) return;
+    if (rf > done && rf <= rel) until = rf;            // a released submission still runs and accesses the page in place
+    else if (rf2 > done && rf2 <= rel) until = rf2;
+    else return;
+    uint64_t i = atomic_fetch_add(&g_pl_hrec_n, 1);
+    g_pl_hrec[i % 64] = (nvn_pl_hold_rec){pc, r->base + (p << g_shift), atomic_load(&g_pl_frame), (uint32_t)host, until, rel};
+    if (g_pl_mode == 2) { atomic_fetch_add(&g_pl_st[NVN_PLS_WOULD], 1); return; }
+    if (!pl_guest_thread()) { atomic_fetch_add(&g_pl_st[NVN_PLS_HOSTSKIP], 1); return; }
+    uint64_t t0 = mach_absolute_time(), (*f)(void) = g_pl_done;
+    atomic_fetch_add(&g_pl_st[host ? NVN_PLS_HOLD_HOST : NVN_PLS_HOLD], 1);
+    while (f && f() < until) {
+        if ((mach_absolute_time() - t0) * g_tb.numer / g_tb.denom > (uint64_t)PL_HOLD_MS * 1000000ull) { atomic_fetch_add(&g_pl_st[NVN_PLS_TIMEOUT], 1); break; }
+        pl_nap();
+    }
+    atomic_fetch_add(&g_pl_st[NVN_PLS_HOLD_NS], (mach_absolute_time() - t0) * g_tb.numer / g_tb.denom);
+}
+static inline void pl_wrote(range_t *r, uintptr_t p) {   // the page became writable for a CPU write (unprotect_page)
+    if (r->pl_wfr && p < r->pl_cap) atomic_store_explicit(&r->pl_wfr[p], atomic_load_explicit(&g_pl_frame, memory_order_relaxed), memory_order_relaxed);
+}
+/* The GPU will read [a, a+len). -1: not all of it tracked, or a page is written by GPU work not yet complete (pl_wf above
+   done): it must be read in place. 1: a page was written by the CPU within keep frames, or is on probation: a snapshot
+   should be read. 0: static. A page whose volatility expired (or, with first, a page never looked at) is put on probation
+   here: write-protected and counted as volatile for probe frames; a CPU write meanwhile makes it volatile again. */
+int nvn_pl_classify(const void *addr, size_t len, uint64_t done, uint32_t keep, uint32_t probe, int first) {
+    if (g_pl_mode <= 0 || !len) return -1;
+    uintptr_t a = (uintptr_t)addr, e = a + len; int vol = 0; uint32_t fr = atomic_load(&g_pl_frame);
+    while (a < e) {
+        range_t *r = find(a); if (!r || !r->pl_rf) { atomic_fetch_add(&g_pl_st[NVN_PLS_UNTRACKED], 1); return -1; }
+        uintptr_t stop = e < r->end ? e : r->end, p0 = (a - r->base) >> g_shift, p1 = (stop - 1 - r->base) >> g_shift, run = 0; int open = 0;
+        for (uintptr_t p = p0; p <= p1 + 1; p++) {
+            int start = 0;
+            if (p <= p1) {
+                if (atomic_load_explicit(&r->pl_wf[p], memory_order_relaxed) > done) {
+                    if (open) nvn_dirty_protect((const void *)(r->base + (run << g_shift)), (p - run) << g_shift);
+                    return -1;
+                }
+                uint32_t w = atomic_load_explicit(&r->pl_wfr[p], memory_order_relaxed), pf = atomic_load_explicit(&r->pl_pfr[p], memory_order_relaxed);
+                if (w && fr - w < keep) vol = 1;
+                else if (pf && (!w || pf >= w) && fr - pf < probe) vol = 1;
+                else if ((w && (!pf || pf < w)) || (!w && !pf && first)) { atomic_store(&r->pl_pfr[p], fr); start = 1; vol = 1; atomic_fetch_add(&g_pl_st[NVN_PLS_PROBATION], 1); }
+            }
+            if (start && !open) { run = p; open = 1; }
+            if (!start && open) { nvn_dirty_protect((const void *)(r->base + (run << g_shift)), (p - run) << g_shift); open = 0; }
+        }
+        a = stop;
+    }
+    return vol;
+}
+/* The GPU of submission fence accesses [a, a+len) in place (write: it writes it). Pages whose pl_rf rises are passed to
+   add (the release protects them again); returns the number of pages not tracked. */
+int nvn_pl_live(const void *addr, size_t len, uint64_t fence, int write, void (*add)(uintptr_t page, void *ctx), void *ctx) {
+    if (g_pl_mode <= 0 || !len) return 0;
+    uintptr_t a = (uintptr_t)addr, e = a + len; int untracked = 0;
+    while (a < e) {
+        range_t *r = find(a);
+        if (!r || !r->pl_rf) { untracked++; a = (a + g_pg) & ~(g_pg - 1); continue; }
+        uintptr_t stop = e < r->end ? e : r->end;
+        for (uintptr_t p = (a - r->base) >> g_shift, q = (stop - 1 - r->base) >> g_shift; p <= q; p++) {
+            uint64_t old = atomic_load_explicit(&r->pl_rf[p], memory_order_relaxed);
+            if (old < fence) { atomic_store_explicit(&r->pl_rf2[p], old, memory_order_relaxed); atomic_store_explicit(&r->pl_rf[p], fence, memory_order_release); if (add) add(r->base + (p << g_shift), ctx); }
+            if (write && atomic_load_explicit(&r->pl_wf[p], memory_order_relaxed) < fence) atomic_store_explicit(&r->pl_wf[p], fence, memory_order_relaxed);
+        }
+        a = stop;
+    }
+    if (untracked) atomic_fetch_add(&g_pl_st[NVN_PLS_UNTRACKED], (uint64_t)untracked);
+    return untracked;
+}
+/* Release of an early frame wait: the pages of pages[] (page addresses) still accessed in place by GPU work above done
+   are write-protected again (a CPU write before the release may have unprotected them). Returns pages protected. */
+int nvn_pl_protect(const uintptr_t *pages, int n, uint64_t done) {
+    if (g_pl_mode <= 0) return 0;
+    int k = 0; uintptr_t run = 0, len = 0;
+    for (int i = 0; i <= n; i++) {
+        uintptr_t pg = 0; int want = 0;
+        if (i < n) {
+            pg = pages[i]; range_t *r = find(pg);
+            if (r && r->pl_rf) { uintptr_t p = (pg - r->base) >> g_shift; want = (atomic_load(&r->pl_rf[p]) > done || atomic_load(&r->pl_rf2[p]) > done) && atomic_load(&r->state[p]) == PG_NONE; }
+        }
+        if (want && len && pg == run + len) { len += g_pg; continue; }
+        if (len) { nvn_dirty_protect((const void *)run, len); k += (int)(len >> g_shift); len = 0; }
+        if (want) { run = pg; len = g_pg; }
+    }
+    if (k) atomic_fetch_add(&g_pl_st[NVN_PLS_REPROT], (uint64_t)k);
+    return k;
+}
+/* Some page of [a, a+len) is written by GPU work above done (the CPU reads results there). */
+int nvn_pl_gpu_writes(const void *addr, size_t len, uint64_t done) {
+    if (g_pl_mode <= 0 || !len) return 0;
+    uintptr_t a = (uintptr_t)addr, e = a + len;
+    while (a < e) {
+        range_t *r = find(a); if (!r || !r->pl_wf) { a = (a + g_pg) & ~(g_pg - 1); continue; }
+        uintptr_t stop = e < r->end ? e : r->end;
+        for (uintptr_t p = (a - r->base) >> g_shift, q = (stop - 1 - r->base) >> g_shift; p <= q; p++) if (atomic_load(&r->pl_wf[p]) > done) return 1;
+        a = stop;
+    }
+    return 0;
+}
+/* ---------- TOTK_PIPELINE_RWATCH (dry run diagnostic) ---------- */
+enum { PLW_MAX = 8192 };
+static uintptr_t g_plw[PLW_MAX]; static _Atomic uint8_t g_plw_on[PLW_MAX]; static _Atomic int g_plw_n;
+static int pl_track_prot(uintptr_t pg) { range_t *r = find(pg); return r && atomic_load(&r->state[(pg - r->base) >> g_shift]) == PG_PROT ? PROT_READ : PROT_READ | PROT_WRITE; }
+static int pl_watch_find(uintptr_t pg) {
+    int lo = 0, hi = atomic_load_explicit(&g_plw_n, memory_order_acquire);
+    while (lo < hi) { int m = (lo + hi) / 2; if (g_plw[m] < pg) lo = m + 1; else hi = m; }
+    return lo < atomic_load(&g_plw_n) && g_plw[lo] == pg ? lo : -1;
+}
+static int pl_watch_fault(uintptr_t a, int is_write, uint64_t pc) {   // signal handler: 1 = a watched page (restored, run again)
+    if (!atomic_load_explicit(&g_plw_n, memory_order_relaxed)) return 0;
+    uintptr_t pg = a & ~(g_pg - 1); int i = pl_watch_find(pg); if (i < 0) return 0;
+    if (atomic_exchange(&g_plw_on[i], 0)) {
+        mp(pg, g_pg, pl_track_prot(pg));
+        atomic_fetch_add(&g_pl_st[is_write ? NVN_PLS_WATCH_WRITE : NVN_PLS_WATCH_READ], 1);
+        uint64_t k = atomic_fetch_add(&g_pl_hrec_n, 1);
+        g_pl_hrec[k % 64] = (nvn_pl_hold_rec){pc, pg, atomic_load(&g_pl_frame), is_write ? 3u : 2u, 0, atomic_load(&g_pl_released)};
+    }
+    return 1;
+}
+static int pl_upcmp(const void *x, const void *y) { uintptr_t a = *(const uintptr_t *)x, b = *(const uintptr_t *)y; return a < b ? -1 : a > b; }
+int nvn_pl_watch(const uintptr_t *pages, int n) {   // the frame-wait thread only
+    int old = atomic_load(&g_plw_n);
+    for (int i = 0; i < old; i++) if (atomic_exchange(&g_plw_on[i], 0)) mp(g_plw[i], g_pg, pl_track_prot(g_plw[i]));
+    atomic_store_explicit(&g_plw_n, 0, memory_order_release);
+    if (g_pl_mode != 2 || !n) return 0;
+    int k = 0;
+    for (int i = 0; i < n && k < PLW_MAX; i++) g_plw[k++] = pages[i] & ~(g_pg - 1);
+    qsort(g_plw, (size_t)k, sizeof *g_plw, pl_upcmp);
+    int m = 0; for (int i = 0; i < k; i++) if (!m || g_plw[m - 1] != g_plw[i]) g_plw[m++] = g_plw[i];
+    for (int i = 0; i < m; i++) atomic_store(&g_plw_on[i], 1);
+    atomic_store_explicit(&g_plw_n, m, memory_order_release);   // published before any page becomes inaccessible
+    for (int i = 0; i < m; i++) mp(g_plw[i], g_pg, PROT_NONE);
+    return m;
+}
+void nvn_pl_stats(uint64_t v[NVN_PLS_N]) { for (int i = 0; i < NVN_PLS_N; i++) v[i] = atomic_load(&g_pl_st[i]); }
+int nvn_pl_holds(nvn_pl_hold_rec *out, int max) {   // the latest held (or, dry run, would-be held) writes, newest first
+    uint64_t n = atomic_load(&g_pl_hrec_n); int k = 0;
+    for (uint64_t j = n; j > 0 && j + 64 > n && k < max; j--) out[k++] = g_pl_hrec[(j - 1) % 64];
+    return k;
+}
 static void unprotect_page(range_t *r, uintptr_t p) {   // 调用方已把状态从 PROT 改成 BUSY | The caller has already changed the state from PROT to BUSY
     mp(r->base + (p << g_shift), g_pg, PROT_READ | PROT_WRITE);
     uint64_t g = atomic_fetch_add(&g_now, 1) + 1, l = atomic_load(&r->latest);
@@ -156,13 +359,22 @@ static void unprotect_page(range_t *r, uintptr_t p) {   // 调用方已把状态
        first step and the stores found the page clean and kept that "now" as its last look (tex_mtl's now == seen); the page
        is writable from here on, so without a newer "now" every later write went unseen until something else faulted. */
     atomic_fetch_add(&g_now, 1);
+    pl_wrote(r, p);   // TOTK_PIPELINE: a CPU write
     atomic_store(&r->state[p], PG_NONE);
 }
 static int on_fault(void *addr, int is_write, void *uc) {
+    if (g_pl_mode == 2 && atomic_load_explicit(&g_plw_n, memory_order_relaxed)) {   // TOTK_PIPELINE_RWATCH
+        uint64_t pc = 0; if (uc) { _STRUCT_MCONTEXT64 *mc = ((ucontext_t *)uc)->uc_mcontext; pc = mc->__ss.__pc; }
+        if (pl_watch_fault((uintptr_t)addr, is_write, pc)) return 1;
+    }
     (void)uc;
     range_t *r = is_write ? find((uintptr_t)addr) : NULL;
     if (!r) return 0;
     uintptr_t p = ((uintptr_t)addr - r->base) >> g_shift;
+    if (g_pl_mode > 0 && atomic_load(&r->state[p]) == PG_PROT) {   // TOTK_PIPELINE: the GPU may still read this page in place
+        uint64_t pc = 0; if (uc) { _STRUCT_MCONTEXT64 *mc = ((ucontext_t *)uc)->uc_mcontext; pc = mc->__ss.__pc; }
+        pl_before_write(r, p, pc, 0);
+    }
     uint8_t st = PG_PROT;
     if (atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY)) { unprotect_page(r, p); atomic_fetch_add(&g_faults, 1);
         if (g_drec_on && uc) { _STRUCT_MCONTEXT64 *mc = ((ucontext_t *)uc)->uc_mcontext; drec_add(r->base + (p << g_shift), mc->__ss.__pc, mc->__ss.__lr, 0); }
@@ -172,11 +384,14 @@ static int on_fault(void *addr, int is_write, void *uc) {
 }
 static void prep_write(void *addr, size_t len) {
     uintptr_t a = (uintptr_t)addr, e = a + len;
+    if (g_pl_mode == 2 && len && atomic_load_explicit(&g_plw_n, memory_order_relaxed))   // TOTK_PIPELINE_RWATCH: a system call must not meet an inaccessible page
+        for (uintptr_t pg = a & ~(g_pg - 1); pg < e; pg += g_pg) pl_watch_fault(pg, 1, dm_host_write_pc);
     while (len && a < e) {
         range_t *r = find(a);
         if (!r) { a = (a + g_pg) & ~(g_pg - 1); continue; }
         uintptr_t stop = e < r->end ? e : r->end;
         for (uintptr_t p = (a - r->base) >> g_shift, q = (stop - 1 - r->base) >> g_shift; p <= q; p++) {
+            if (g_pl_mode > 0 && atomic_load(&r->state[p]) == PG_PROT) pl_before_write(r, p, dm_host_write_pc, 1);   // TOTK_PIPELINE
             for (;;) { uint8_t st = PG_PROT;   // 见 BUSY 等完要重看：对方可能是在设只读，等完这页是 PROT，照样得解 | After waiting out BUSY, look again: the other side may have been setting read-only, in which case the page is PROT after the wait and still has to be unprotected
                 if (atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY)) { unprotect_page(r, p); atomic_fetch_add(&g_preps, 1); drec_add(r->base + (p << g_shift), dm_host_write_pc, 0, 1); break; }
                 if (st != PG_BUSY || !busy_wait(r, p)) break; }
@@ -258,6 +473,7 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
         memset((void *)state, 0, np); memset((void *)gen, 0, np * sizeof *gen); memset((void *)blk, 0, blk_count(np) * sizeof *blk);
     }
     r->base = base; r->end = end; r->state = state; r->gen = gen; r->blk = blk; atomic_store(&r->latest, 0);
+    pl_arrays(r, np);
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
     pthread_mutex_unlock(&g_slot_mu);
@@ -324,6 +540,7 @@ static void range_put(int slot, int n, uintptr_t base, uintptr_t end, const void
         memset((void *)state, 0, np); memset((void *)gen, 0, np * sizeof *gen); memset((void *)blk, 0, blk_count(np) * sizeof *blk);
     }
     r->base = base; r->end = end; r->state = state; r->gen = gen; r->blk = blk; atomic_store(&r->latest, 0);
+    pl_arrays(r, np);
     g_rmem[slot] = (uintptr_t)mem; atomic_store(&g_rdying[slot], 0);
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
