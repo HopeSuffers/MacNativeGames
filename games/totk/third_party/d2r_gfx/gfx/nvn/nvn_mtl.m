@@ -9724,6 +9724,7 @@ static uint64_t h_ser(uint64_t h) { int tid = (int)(h & 0xfffff); return tid ? a
    ordered against each other on the Switch either, and a split per decal would store and reload the G-buffer 56 times. */
 #define ATT_READS_MAX 8
 static int has_ser(const uint64_t *s, int n, uint64_t v) { for (int i = 0; i < n; i++) if (s[i] == v) return 1; return 0; }
+#define ATT_SER_BIT(ser) (UINT64_C(1) << (((uint64_t)(ser) * UINT64_C(0x9E3779B97F4A7C15)) >> 58))
 /* The serials of the textures the draw samples that are attachments: of the current targets or of the open encoder (which
    can hold more, e.g. a merged pass). By serial, not slot: the encoder's attachment order need not be the targets' order. */
 /* The sampled texture / image slots of the program's stages, taken from the reflection once per sh[] (ar_*): the draw path
@@ -9745,13 +9746,17 @@ static int draw_att_reads(NvProg *pr, uint64_t out[ATT_READS_MAX]) {
                     if (R.rt.depth) cand[nc++] = R.rt.depth->serial; }
     if (g_enc) for (int i = 0; i < g_nsd; i++) cand[nc++] = g_sd[i].ser;
     if (!pr || !nc) return 0;
+    /* TOTK: a one-word filter of the candidate serials in front of the list search (has_ser over up to 18 candidates for
+       every sampled slot was ~2.5% of the replay; nearly every sampled texture is no attachment). A clear bit means the
+       serial is not a candidate; a set bit runs the search. */
+    uint64_t cbits = 0; for (int i = 0; i < nc; i++) cbits |= ATT_SER_BIT(cand[i]);
     int same = 1; for (int st = 0; st < 6; st++) if (pr->ar_sh[st] != (__bridge void *)pr->sh[st]) { same = 0; break; }
     if (!same) ar_learn(pr);
     if (pr->ar_n != 255) {
         for (unsigned i = 0; i < pr->ar_n; i++) {
             uint64_t h = pr->ar_img[i] ? S.img[pr->ar_st[i]][pr->ar_reg[i]] : S.tex[pr->ar_st[i]][pr->ar_reg[i]];
             uint64_t ser = h ? h_ser(h) : 0;
-            if (ser && has_ser(cand, nc, ser) && !has_ser(out, n, ser) && n < ATT_READS_MAX) out[n++] = ser; }
+            if (ser && (cbits & ATT_SER_BIT(ser)) && has_ser(cand, nc, ser) && !has_ser(out, n, ser) && n < ATT_READS_MAX) out[n++] = ser; }
         return n;
     }
     for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh || sh->stage >= 6) continue;
