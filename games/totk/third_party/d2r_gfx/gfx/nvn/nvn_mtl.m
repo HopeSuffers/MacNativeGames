@@ -5771,7 +5771,12 @@ static void *prog_get_p(const prog_t *cp);
 #define prog_get(cp) ((__bridge NvProg *)prog_get_p(cp))
 static void *prog_get_p(const prog_t *cp) {   // 只在提交线程调用 | Called only on the submit thread
     prog_t *p = (prog_t *)cp;
-    static const prog_t *lp; static uint64_t lser, lgen; static NvProg *lpr;   // 上次结果：同一对象、同一序号且序号表未变即直接用 | Last result: same object, same serial and unchanged serial table means it is used directly
+    /* lpr is not retained (2026-10-23): a strong static cost a retain + release (objc_storeStrong) whenever the program
+       changed, ~20 samples of the translate thread in the Kakariko profile. It is only set from the serial table, and only
+       returned while no serial-table step since lgen was for lser: removing the program from the table steps for its serial,
+       and the table's reference goes through the deferred-release queue (alive until the submission being replayed
+       completes). A program without a serial is never remembered. */
+    static const prog_t *lp; static uint64_t lser, lgen; static __unsafe_unretained NvProg *lpr;   // 上次结果：同一对象、同一序号且序号表未变即直接用 | Last result: same object, same serial and unchanged serial table means it is used directly
     uint64_t gen = g_ser_gen;
     if (p == lp && p->serial == lser && lpr && (gen == lgen || ser_unaffected(lgen, gen, lser))) { lgen = gen; return (__bridge void *)lpr; }
     __unsafe_unretained NvProg *have = p->serial ? (__bridge NvProg *)serial_ptr(p->serial) : nil;
@@ -11422,7 +11427,8 @@ static int mfxup_dock(__unsafe_unretained NvShader *fs) {
    MetalFX first and let encode_args bind the result. Runs before the draw opens its render encoder. Docked: mfxup_dock.
    Returns 1 when the draw was replaced (not to be encoded). */
 static int mfxup_draw(NvProg *pr) {
-    g_mfxup_src = nil; g_mfxup_out = nil; g_mfxup_sh = nil;
+    if (g_mfxup_src || g_mfxup_out) { g_mfxup_src = nil; g_mfxup_out = nil; }   // strong globals: stored only when set (an objc_storeStrong call each per draw otherwise)
+    g_mfxup_sh = nil;
     if (!pr) return 0;
     __unsafe_unretained NvShader *fs = pr->sh[1];
     if (!fs) return 0;
@@ -11650,7 +11656,11 @@ frz_plain:;
     if (!g_mfx.scene_done && g_mfx.canvas && R.rt.n > 0 && R.rt.color[0] && R.rt.color[0]->serial == g_mfx.canvas && pr && pr->sh[0] && MFX_UI_DRAW(pr) && mfx_enabled())
         mfx_snapshot_scene();   // TOTK_MFX: first UI draw into the canvas: copy the finished scene first
     if (!g_uw_ui && uw_on_canvas() && pr && pr->sh[0] && UW_UI_BEGINS(pr)) g_uw_ui = 1; BOTW_MFX_NO_UI_SCENE()   // key 4: the UI begins | BOTW key 2 (every draw, not part of the if): a frame without UI takes the canvas as its scene
-    id<MTLRenderCommandEncoder> en = g_enc ? g_enc : rp_begin_ex(mode);   // TOTK: rp_begin_ex returns g_enc first thing; read here it is a retain, not a retain + autorelease
+    /* TOTK: rp_begin_ex returns g_enc first thing. The draw holds a real encoder strongly as before; the encode stage's
+       sentinel (static, never released) is used without a reference: a strong local was a retain + release of that one
+       object on every draw (~20 samples of the translate thread). */
+    __unsafe_unretained id<MTL4RenderCommandEncoder> en = g_enc ? g_enc : rp_begin_ex(mode);
+    __attribute__((objc_precise_lifetime)) id en_hold = en && en != g_rs_sentinel ? en : nil; (void)en_hold;
     g_fd_dw = NULL; g_fd_di = NULL;
     if (!en) { g_draw_skip[8]++; return; }
     if (g_hz_cur && pr) hz_draw(pr);
@@ -11801,8 +11811,8 @@ frz_plain:;
     enc_r_blend_color(en, S.blend_color[0], S.blend_color[1], S.blend_color[2], S.blend_color[3]);
     bind_vertex_streams((id<MTL4RenderCommandEncoder>)en,pr->sh[0]);
     if (g_lay.active) enc_r_vbuf(en, LAY_BUF_INDEX, lay_gpu(g_lay_probe_neg == 1 ? 0 : g_lay.cur - g_lay.base));   // TOTK: this draw's layer within the layered pass
-    if (pr->sh[0]) encode_args(en, pr->sh[0], 0, 1);
-    if (pr->sh[1]) encode_args(en, pr->sh[1], 1, 0);
+    if (pr->sh[0]) encode_args((id<MTLCommandEncoder>)en, pr->sh[0], 0, 1);
+    if (pr->sh[1]) encode_args((id<MTLCommandEncoder>)en, pr->sh[1], 1, 0);
     // 参数绑定在登记表锁内捕获实际资源；资格判断到绑定期间有版本变化，则在任何GPU draw前切开重试。
     // Parameter binding captures the actual resources under the registry lock; if the version changed between the eligibility check and the binding, split and retry before any GPU draw.
     if (g_rt_range_active && (g_pass.reg_gen != g_reg_gen || g_pass.ser_gen != g_ser_gen || g_pass.range_dirty != nvn_dirty_now())) { rp_end(); draw(dw, di); return; }
