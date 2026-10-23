@@ -2089,7 +2089,13 @@ static void *x_thread(void *unused) {
             // Real-time like the game's render thread that used to replay (set at acquire): otherwise the game's ~50
             // worker threads preempt the replay (measured: replay 6.6 -> 13 ms, 10 fps). Half the period is declared.
             static uint64_t rt; uint64_t per = (uint64_t)(j.period * 1e9);
-            if (per && rt != per) { rt = per; void set_time_constraint_comp_x(uint64_t, uint64_t); set_time_constraint_comp_x(per, per / 2); }
+            /* TOTK_XCOMP=<percent> (default 50): the share of the present period declared as this thread's computation.
+               Uncapped the period is 8.33 ms, so half is 4.17 ms while a replay takes 4.6-6 ms: an under-declared
+               real-time thread is moved off the performance cores (perf/pipeline measured 3.9 -> 1.5 GHz; the base
+               run also drifted to 1.6-2.5 GHz later in the bench). */
+            if (per && rt != per) { rt = per; void set_time_constraint_comp_x(uint64_t, uint64_t);
+                static int xc = -1; if (xc < 0) { const char *e = getenv("TOTK_XCOMP"); xc = e && atoi(e) > 0 && atoi(e) <= 95 ? atoi(e) : 50; }
+                set_time_constraint_comp_x(per, per * (uint64_t)xc / 100); }
             present_exec(j.win, j.idx, j.period, j.crop, j.frame);
         }
         pthread_mutex_lock(&g_xq_mu);
