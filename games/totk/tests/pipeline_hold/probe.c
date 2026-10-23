@@ -84,20 +84,20 @@ int main(int argc, char **argv) {
         EXPECT("negative: it waited about PL_HOLD_MS (>= 400 ms)", dry ? 0 : 1, dt >= 400);
         printf("%d checks, %d failed\n", g_checks, g_fail); return g_fail != 0;
     }
-    EXPECT("first sight: snapshot (probation)", 1, nvn_pl_classify((const void *)g_mem, 64, KEEP, PROBE, 1));
+    EXPECT("first sight: snapshot (probation)", 1, nvn_pl_classify((const void *)g_mem, 64, KEEP, PROBE, 1, NULL));
     EXPECT("first sight: page write-protected", 1, page_writable(0));
     nvn_pl_set_frame(fr + PROBE - 1);
-    EXPECT("still on probation", 1, nvn_pl_classify((const void *)g_mem, 64, KEEP, PROBE, 1));
+    EXPECT("still on probation", 1, nvn_pl_classify((const void *)g_mem, 64, KEEP, PROBE, 1, NULL));
     nvn_pl_set_frame(fr + PROBE);
-    EXPECT("probation over without writes: static", 0, nvn_pl_classify((const void *)g_mem, 64, KEEP, PROBE, 1));
-    EXPECT("first=0: an unseen page is static", 0, nvn_pl_classify((const void *)(g_mem + 5 * P), 64, KEEP, PROBE, 0));
+    EXPECT("probation over without writes: static", 0, nvn_pl_classify((const void *)g_mem, 64, KEEP, PROBE, 1, NULL));
+    EXPECT("first=0: an unseen page is static", 0, nvn_pl_classify((const void *)(g_mem + 5 * P), 64, KEEP, PROBE, 0, NULL));
     fr += PROBE; nvn_pl_set_frame(fr);
     EXPECT("write with nothing in flight finishes at once", 1, run_thread(writer, 8, 7, 200, 0));
-    EXPECT("written page: snapshot (volatile)", 1, nvn_pl_classify((const void *)g_mem, 64, KEEP, PROBE, 1));
+    EXPECT("written page: snapshot (volatile)", 1, nvn_pl_classify((const void *)g_mem, 64, KEEP, PROBE, 1, NULL));
     nvn_pl_set_frame(fr + KEEP - 1);
-    EXPECT("volatile until KEEP frames", 1, nvn_pl_classify((const void *)g_mem, 64, KEEP, PROBE, 1));
+    EXPECT("volatile until KEEP frames", 1, nvn_pl_classify((const void *)g_mem, 64, KEEP, PROBE, 1, NULL));
     nvn_pl_set_frame(fr + KEEP);
-    EXPECT("KEEP expired: probation again (snapshot)", 1, nvn_pl_classify((const void *)g_mem, 64, KEEP, PROBE, 1));
+    EXPECT("KEEP expired: probation again (snapshot)", 1, nvn_pl_classify((const void *)g_mem, 64, KEEP, PROBE, 1, NULL));
     EXPECT("probation again: page protected", 1, page_writable(0));
     fr += KEEP; nvn_pl_set_frame(fr);
     nvn_pl_gpu_write((const void *)(g_mem + 2 * P), 32, 11);
@@ -114,7 +114,7 @@ int main(int argc, char **argv) {
     EXPECT(dry ? "dry: write into the range not held" : "write into the range held until fence 11", dry ? 1 : 0, run_thread(writer, 3 * P + 300, 7, 150, 11));
     { uint64_t v[NVN_PLS_N]; nvn_pl_stats(v); EXPECT(dry ? "dry: counted as would-hold" : "counted as a hold", 1, dry ? v[NVN_PLS_WOULD] : v[NVN_PLS_HOLD]); }
     EXPECT("written through: byte stored", 99, g_mem[3 * P + 300]);
-    EXPECT("held page is volatile now", 1, nvn_pl_classify((const void *)(g_mem + 3 * P), 64, KEEP, PROBE, 1));
+    EXPECT("held page is volatile now", 1, nvn_pl_classify((const void *)(g_mem + 3 * P), 64, KEEP, PROBE, 1, NULL));
     // fence 12 released (done 11), fence 13 published but not released: a write into 13's range only is not held
     publish1(12, M + 4 * P, M + 4 * P + 64); publish1(13, M + 6 * P, M + 6 * P + 64);
     nvn_dirty_protect((const void *)(M + 4 * P), P); nvn_dirty_protect((const void *)(M + 6 * P), P);
