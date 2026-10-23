@@ -230,6 +230,7 @@ static void pl_init(void) {
     g_pl_mode = m == 1 || m == 2 ? m : 0;
 }
 int nvn_pl_mode(void) { pl_init(); return g_pl_mode; }
+int nvn_pl_wwhold(void) { pl_init(); return g_pl_wwhold; }   // CPU writes that meet only GPU writes are held (else they pass: their pages need no protection)
 void nvn_pl_set_done(uint64_t (*done)(void)) { g_pl_done = done; }
 void nvn_pl_set_frame(uint32_t f) { atomic_store(&g_pl_frame, f ? f : 1); }
 void nvn_pl_set_released(uint64_t released, uint64_t vdone) {
@@ -423,7 +424,7 @@ int nvn_pl_reprotect(uint64_t done, uint64_t released, const uintptr_t *nlo, con
     int k = 0;
     uint64_t end = atomic_load(&g_pl_uring_n), from = g_pl_uring_cur;
     if (end - from > PL_URING) {   // the ring overflowed: every range of those submissions
-        for (int i = 0; i < 2 * PL_RSETS; i++) {
+        for (int i = 0; i < (g_pl_wwhold ? 2 : 1) * PL_RSETS; i++) {   // the write ranges only when W-W writes are held
             pl_rset *s = i < PL_RSETS ? &g_pl_rs[i] : &g_pl_ws[i - PL_RSETS]; uint64_t f = atomic_load(&s->fence);
             if (f <= done || f > released) continue;
             int n = atomic_load(&s->n); uintptr_t *lo = atomic_load(&s->lo), *hi = atomic_load(&s->hi);
@@ -433,7 +434,8 @@ int nvn_pl_reprotect(uint64_t done, uint64_t released, const uintptr_t *nlo, con
     } else
         for (uint64_t j = from; j < end; j++) {
             uintptr_t pg = atomic_load_explicit(&g_pl_uring[j % PL_URING], memory_order_acquire);
-            if (pg && pl_inflight_hit(pg, pg + g_pg, done, released)) pl_protect_run(pg, pg + g_pg, &k);
+            int kinds = 0;   // a page only GPU writes of those submissions reach: a CPU write there passes anyway (unless TOTK_PIPELINE_WWHOLD)
+            if (pg && pl_inflight_hit2(pg, pg + g_pg, done, released, &kinds) && ((kinds & 1) || g_pl_wwhold)) pl_protect_run(pg, pg + g_pg, &k);
         }
     g_pl_uring_cur = end;
     for (int i = 0; i < nn; i++) pl_protect_run(nlo[i], nhi[i], &k);
