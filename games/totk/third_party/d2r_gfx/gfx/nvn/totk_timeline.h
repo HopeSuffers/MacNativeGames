@@ -19,6 +19,8 @@ enum {
     TL_FENCE,                       /* fence value of commit a: b */
     TL_RS_JOIN,                     /* the replay thread waited a ns for the encode stage (b = join count) */
     TL_PASS_BEGIN, TL_PASS_END,     /* a render pass opened / ended on the replay thread: a = pass serial, b = draws in it (end) */
+    TL_EARLY,                       /* TOTK_PIPELINE: the frame wait for fence a returned early (fence b, the previous frame's, completed) */
+    TL_GATE_IN, TL_GATE_OUT,        /* TOTK_PIPELINE: waiting until early-released submissions really completed (a = fence) */
 };
 
 int totk_tl_on(void);                                   /* the window is open (cheap after the first call) */

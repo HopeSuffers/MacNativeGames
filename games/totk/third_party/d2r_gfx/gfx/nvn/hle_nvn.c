@@ -131,6 +131,7 @@ void mtl_args_stats(uint64_t *enc, uint64_t *reuse);
 static uint64_t fence_now(int *token);
 static int fence_wait(uint64_t k, uint64_t timeout_ns);
 static int fence_wait_to(uint64_t k, uint64_t kg, uint64_t timeout_ns);
+static int pl_hle_mode(void);   // TOTK_PIPELINE ("one frame deeper" below)
 static void x_drain(void);
 static int async_replay(void);
 static int call_stats_on(void);
@@ -264,6 +265,7 @@ NVN(nvnMemoryPoolMap, void *, const NVNmemoryPool *p){const pool_t *v=(const voi
 #endif
  if(v->magic!=MAGIC('P','O','O','L'))return NULL;return (v->flags&NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)?NULL:v->mem;}
 NVN(nvnMemoryPoolMapVirtual, NVNboolean, NVNmemoryPool *p, int n, const NVNmappingRequest *r) {
+    if (pl_hle_mode() == 1) { NVN_BLOCKING(); mtl_pl_gate(); }   // TOTK_PIPELINE: an early-released frame may still read through the old mapping
     return (NVNboolean)totk_vpool_map((pool_t *)p, n, (const totk_mapping_request *)(const void *)r);
 }
 NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) { return (NVNbufferAddress)((const pool_t *)p)->mem; }
@@ -622,7 +624,81 @@ static int sync_chain_left(int k) {
     if (lim == -2) { const char *e = getenv("TOTK_SYNC_CHAIN"); lim = e ? atoi(e) : 0; from = e && strchr(e, ':') ? strtoull(strchr(e, ':') + 1, NULL, 10) : 0; }
     return lim > 0 && g_frame >= from && atomic_fetch_add(&used[k], 1) < lim;
 }
+/* ---------- TOTK_PIPELINE: the game's frame wait one frame deeper (nvn_mtl.m totk_pipeline.h) ----------
+   The frame loop (1.2.1; sys = the graphics system object, vtable main+0x45b66c8, found with the pfnc_nvnSyncWait slot
+   main+0x4671780 and its users):
+     main thread, frame function main+0x8f24bc (vtable slot 0xe0), once per frame:
+       slot 0xe8 main+0xb592a8  records the frame: BeginRecording on sys+0x170 (command memory sys+0x160, control memory
+                                sys+0x168, the same every frame: single-buffered), TIMESTAMP_TOP report, the frame
+                                (sys+0x1b8 -> vtbl+0x30), TIMESTAMP report, EndRecording -> handle sys+0x1e8; clears sys+0x221
+       slot 0xf0 main+0x9d1d30, slot 0x70 (the next frame's game logic), sys+0x118 = work time (present interval)
+       slot 0x118 main+0x2a27f54 right after the wait: reads the frame's TIMESTAMP_TOP / TIMESTAMP reports (buffer at
+                                sys+0x180) and raises sys+0x118 to GPU end - frame start (nvnDeviceGetTimestampInNanoseconds)
+       slot 0x110 main+0xb23d58 frame end: spins until sys+0x221 (submitted), then nvnSyncWait(*(sys+0x1d8), -1) at
+                                main+0xb23df8 (or main+0xb23f3c with sys+0xa6), then the window crop, unlock
+     render thread, slot 0xf8 main+0x8c1474: under the mutex at *(main+0x4716e48)+0xf8 sets sys+0x221,
+       nvnQueueSubmitCommands(sys+0x1b0, 1, sys+0x1e8) at main+0x8c14e4, nvnQueueFenceSync(sys+0x1b0, sys+0x1d8) at
+       main+0x8c1504, nvnQueueFlush; then slot 0x100 (acquire / present).
+   So the main thread waits for frame N right before it records N+1 (nothing of N+1 exists before), and the GPU idles
+   from the end of N until N+1 arrives. The sync fenced from main+0x8c1504 is the frame fence (bit 3 of fenced); only
+   main+0xb23d58 waits for it. TOTK_PIPELINE=1: that wait returns once N has been translated and N-1 has completed
+   (mtl_pl_release does the rest); =2: exact wait plus the dry-run bookkeeping. Another game version: the return
+   addresses differ (TOTK_PIPELINE_FENCE_LR / TOTK_PIPELINE_WAIT_LR=<hex>,<hex> override them); unrecognised, every
+   wait stays exact and it says so once. */
+static uint64_t guest_main_caller(void);
+static int x_sub_translated(uint64_t k, uint64_t timeout_ns, uint64_t *fence);
+static uint64_t g_pl_fence_lr = 0x8c1508, g_pl_wait_lr[2] = {0xb23dfc, 0xb23f40};
+static int pl_hle_mode(void) {
+    static int m = -1;
+    if (m < 0) {
+        int v = nvn_pl_mode();
+        const char *e = getenv("TOTK_PIPELINE_FENCE_LR"); if (e) g_pl_fence_lr = strtoull(e, NULL, 16);
+        e = getenv("TOTK_PIPELINE_WAIT_LR"); if (e) { char *q; g_pl_wait_lr[0] = strtoull(e, &q, 16); g_pl_wait_lr[1] = *q == ',' ? strtoull(q + 1, NULL, 16) : g_pl_wait_lr[0]; }
+        if (v && !async_replay()) { LOG("【红】[pipeline] TOTK_PIPELINE needs the translation thread (TOTK_ASYNC_REPLAY): off"); v = 0; }
+        m = v;
+    }
+    return m;
+}
+static void pl_note_fence(NVNsync *s) {   // nvnQueueFenceSync with a submit token: the frame fence?
+    uint64_t lr = guest_main_caller();
+    static uint64_t seen[6]; static int ns;
+    int known = 0; for (int i = 0; i < ns; i++) known |= seen[i] == lr;
+    if (!known && ns < 6) { seen[ns++] = lr; LOG("[pipeline] nvnQueueFenceSync called from main+%#llx%s", (unsigned long long)lr, lr == g_pl_fence_lr ? " (the frame submit: its sync is the frame fence)" : ""); }
+    if (lr == g_pl_fence_lr) ((sync_t *)s)->fenced |= 8;
+}
+/* The game's frame wait (sync fenced from the frame submit, a submit token). */
+static NVNsyncWaitResult pl_frame_wait(const NVNsync *s, const sync_t *o, uint64_t timeout) {
+    int mode = pl_hle_mode();
+    uint64_t lr = guest_main_caller();
+    if (lr != g_pl_wait_lr[0] && lr != g_pl_wait_lr[1]) {   // an unexpected waiter: exact
+        static int said; if (said++ < 4) LOG("【红】[pipeline] the frame fence is waited for from main+%#llx (expected main+%#llx / main+%#llx): this wait stays exact", (unsigned long long)lr, (unsigned long long)g_pl_wait_lr[0], (unsigned long long)g_pl_wait_lr[1]);
+        return fence_wait(o->fence, timeout) ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
+    }
+    { static int said; if (!said++) LOG("[pipeline] frame wait from main+%#llx recognised: %s", (unsigned long long)lr, mode == 1 ? "it returns once the previous frame has completed" : "dry run (exact)"); }
+    mtl_pl_frame_wait_note();
+    uint64_t k = o->fence, t0 = now_ns(), Fk;
+    totk_tl(TL_WAIT_IN, k, 0);
+    if (!x_sub_translated(k, timeout, &Fk)) { totk_tl(TL_WAIT_OUT, k, 0); return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED; }
+    static uint64_t last_k, last_F;   // the frame wait runs on the main thread only
+    int repeat = k == last_k; uint64_t prev = repeat ? 0 : last_F;
+    if (!repeat) { last_k = k; last_F = Fk; }
+    uint64_t used = now_ns() - t0, left = timeout > used ? timeout - used : 0;
+    int ok;
+    int rel = 0;
+    if (mode == 1 && prev && prev < Fk) {
+        ok = mtl_wait(prev, left);
+        if (ok && mtl_done_fence() < Fk) { mtl_pl_release(Fk, prev, 0); rel = 1; }   // frame N still runs: released early
+    } else {
+        ok = mtl_wait(Fk, left);
+        if (ok && mode == 2 && !repeat && prev) { mtl_pl_release(Fk, prev, 1); rel = 1; }
+    }
+    if (ok && !rel) mtl_pl_publish();   // depth statistics of the newest completed frame (the release publishes them itself)
+    totk_tl(TL_WAIT_OUT, k, ok);
+    if (ok) survey_after_wait(s);
+    return ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
+}
 NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { (void)q; (void)c; (void)f; int tok; uint64_t v = fence_now(&tok); ((sync_t *)s)->fenced = tok ? 5 : 1; ((sync_t *)s)->fence = v;
+    if (tok && pl_hle_mode() > 0) pl_note_fence(s);   // TOTK_PIPELINE
     if (sync_chain_left(0)) { char w[96]; snprintf(w, sizeof w, "FenceSync sync=%p fence=%llu cond=%d flags=%d", (void *)s, (unsigned long long)v, (int)c, f); guest_chain(w); } }
 // 没围栏过的同步对象按真机行为等到超时；已围栏的只在 GPU 真正完成到该栅栏值后放行
 // A sync object that was never fenced waits until timeout, as on a real device; a fenced one is released only after the GPU has actually completed up to that fence value
@@ -646,6 +722,7 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     int k = (o->fenced & 2) != 0, lg = synclog_env();
     if (lg) { atomic_fetch_add(&g_sw_calls[k], 1); if (o->fence == mtl_last_fence()) atomic_fetch_add(&g_sw_newest[k], 1); }
     int tok = (o->fenced & 4) != 0;
+    if (tok && (o->fenced & 8) && pl_hle_mode() > 0) return pl_frame_wait(s, o, timeout);   // TOTK_PIPELINE: the game's frame wait
     uint64_t want = o->fence;   // the fence whose GPU completion is waited for (TOTK_SYNC_LAG: one submission earlier)
     if (want > 1 && sync_lag_on()) { int t; if (tok ? fence_now(&t) == want : want == mtl_last_fence()) want--; }
     if (tok ? fence_wait_to(o->fence, want, 0) : mtl_wait(want, 0)) { survey_after_wait(s); mtl_wb_fence_done(); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
@@ -2187,6 +2264,7 @@ static void x_wait_job(uint64_t job) {
 }
 static void x_drain(void) {   // everything queued so far has run (no-op when synchronous or idle)
     if (!async_replay() || t_on_x_thread) return;   // on the translation thread everything queued before this job has run
+    if (pl_hle_mode() == 1) { NVN_BLOCKING(); mtl_pl_gate(); }   // TOTK_PIPELINE: what is destroyed / read back next may still be used by an early-released frame
     NVN_BLOCKING();   // a guest thread gives its virtual core back while it waits (TOTK has three)
     pthread_mutex_lock(&g_xq_mu); uint64_t want = g_xq_in, have = g_xq_done; pthread_mutex_unlock(&g_xq_mu);
     if (have >= want) return;
@@ -2219,6 +2297,20 @@ static int fence_wait_to(uint64_t k, uint64_t kg, uint64_t timeout_ns) {
     return mtl_wait(f, timeout_ns > used ? timeout_ns - used : 0);
 }
 
+/* TOTK_PIPELINE: submit token k has been translated (its Metal fence in *fence). 1 = translated. */
+static int x_sub_translated(uint64_t k, uint64_t timeout_ns, uint64_t *fence) {
+    pthread_mutex_lock(&g_xq_mu);
+    if (g_xsub_done < k) {
+        struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
+        uint64_t ns = (uint64_t)dl.tv_nsec + (timeout_ns > 3600000000000ull ? 3600000000000ull : timeout_ns);
+        dl.tv_sec += ns / 1000000000ull; dl.tv_nsec = ns % 1000000000ull;
+        while (g_xsub_done < k) if (pthread_cond_timedwait(&g_xq_cv, &g_xq_mu, &dl)) break;
+    }
+    int ok = g_xsub_done >= k;
+    *fence = !k ? 0 : g_xsub_done - k < XF ? g_xsub_fence[k % XF] : mtl_last_fence();
+    pthread_mutex_unlock(&g_xq_mu);
+    return ok;
+}
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
     NVN_BLOCKING();
 #ifdef GAME_BOTW
