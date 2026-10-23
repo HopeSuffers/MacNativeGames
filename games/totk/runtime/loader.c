@@ -196,7 +196,7 @@ static void map_module(Module *m,const char *dir) {
  uint64_t *key=(void *)(m->base+m->key_off);
  for(unsigned i=0;i<8;i++)key[i]=runtime_keys[i]*8;
  make_hash(m);
- fprintf(stderr,"[totk] mapped %s size=%zu symbols=%u\n",m->name,m->size,m->nsym);
+ fprintf(stderr,"[totk] mapped %s at %p size=%zu symbols=%u\n",m->name,(void *)m->base,m->size,m->nsym);   /* base: maps sampled guest PCs to module offsets */
 }
 /* TOTK_EXPORT_IOS=<dir>: after the game patches, write each module's text [0, page_up(TEXT_END)) for ios/tools/gen_embed.py.
    Relocations never reach the text (they start at DATA_OFF), so the exported bytes differ from the verified image only at
