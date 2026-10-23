@@ -53,7 +53,7 @@
 static const char *const g_plk_name[PLK_N] = {"vertex", "index", "storage", "uniform", "copy source", "texture source"};
 static uint32_t g_pl_keep = 600, g_pl_probe = 4; static int g_pl_first = 1, g_pl_query_vis, g_pl_log, g_pl_dsnap = 1, g_pl_texhold = 1;
 static uint64_t g_pl_rwatch;   // dry run: watch from this submission (0 off)
-static uint64_t g_pl_snap_max = 2u << 20, g_pl_budget = 96u << 20, g_pl_sub_bytes;
+static uint64_t g_pl_snap_max = 2u << 20, g_pl_budget = 96u << 20, g_pl_sub_bytes, g_pl_first_max = 64u << 10;
 static uint64_t g_pl_rel;   // under g_mu: newest fence whose frame wait was released early (mode 1)
 static void pl_cfg_once(void) {
     const char *e;
@@ -64,6 +64,7 @@ static void pl_cfg_once(void) {
     if ((e = getenv("TOTK_PIPELINE_KEEP")) && atoi(e) > 0) g_pl_keep = (uint32_t)atoi(e);
     if ((e = getenv("TOTK_PIPELINE_PROBE")) && atoi(e) > 0) g_pl_probe = (uint32_t)atoi(e);
     if ((e = getenv("TOTK_PIPELINE_FIRST"))) g_pl_first = atoi(e) != 0;
+    if ((e = getenv("TOTK_PIPELINE_FIRST_MAX"))) g_pl_first_max = strtoull(e, NULL, 0);
     if ((e = getenv("TOTK_PIPELINE_QUERY"))) g_pl_query_vis = !strcmp(e, "visible");
     if ((e = getenv("TOTK_PIPELINE_DSTATS"))) g_pl_dsnap = atoi(e) != 0;
     if ((e = getenv("TOTK_PIPELINE_TEXHOLD"))) g_pl_texhold = atoi(e) != 0;
@@ -85,9 +86,9 @@ static struct {
     uint64_t subs, over_budget, snaps[PLK_N], snap_bytes, snap_ns, memo_hits, cache_hits, live[PLK_N], live_static, live_gpuw, live_big, live_noshot, live_untracked;
     uint64_t ranges, nonstatic, writes, snap_drops, dsnap_redirects, ns, t_decide, t_commit, decides, dc[7];
 } g_pls_st;
-static _Atomic uint64_t g_pl_rel_t[3];   // release on the game thread: early results / protection / snapshots published
+static _Atomic uint64_t g_pl_rel_t[3], g_pl_pool_skips;   // release on the game thread: early results / protection / snapshots published
 static _Atomic uint64_t g_pl_waits, g_pl_early, g_pl_lead_ns, g_pl_lead_n, g_pl_lead_max, g_pl_gate_n, g_pl_gate_ns, g_pl_inval_n, g_pl_inval_gates, g_pl_rel_ns, g_pl_rel_n;
-static _Atomic uint64_t g_plds_pub, g_plds_merge, g_plds_conflict, g_plds_skip, g_plds_act, g_plds_learned, g_plds_grown, g_plds_noslot;
+static _Atomic uint64_t g_plds_pub, g_plds_merge, g_plds_conflict, g_plds_skip, g_plds_act, g_plds_learned, g_plds_grown, g_plds_noslot, g_plds_gaveup;
 
 /* ---------- per submission (replay thread) ---------- */
 typedef struct { uint64_t lo, hi, gpu, off; void *buf; uint32_t gen; int8_t snap, kind; } pl_memo;
@@ -101,20 +102,70 @@ typedef struct { uintptr_t lo, hi; int kind; } pl_wrng;
 static struct { pl_wrng *r; int n, cap; } g_plr_w;   // its GPU writes, with what wrote them (g_pl_wk)
 static const char *const g_plw_name[PLW_N] = {"other", "inline uniform update", "renamed uniform updates (flush)", "buffer copy", "texture-to-buffer copy", "storage buffer", "storage pointer (64 KiB taken)", "built-in kernel", "image store"};
 static uint64_t *g_plq; static int g_plq_n, g_plq_cap;   // occlusion report addresses (TOTK_PIPELINE_QUERY=visible)
+/* Write protection of spans the replay decided on (static spans, probation runs, non-static in-place ranges) runs on a
+   helper thread, not on the translate thread (the mprotect calls of new data were the slow translations of streaming
+   frames). A release first makes sure every span queued up to its submission is done (pl_protq_sync). */
+static pthread_mutex_t g_plpq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_plpq_cv = PTHREAD_COND_INITIALIZER;
+static pl_rng *g_plpq; static int g_plpq_n, g_plpq_cap; static uint64_t g_plpq_seq, g_plpq_done, g_plpq_busy_to; static int g_plpq_busy;
+static _Atomic uint64_t g_plpq_inline, g_plpq_spans;
+static void pl_protq_run(pl_rng *v, int n) { for (int i = 0; i < n; i++) nvn_pl_protect_span((const void *)v[i].lo, (size_t)(v[i].hi - v[i].lo)); atomic_fetch_add(&g_plpq_spans, (uint64_t)n); }
+static void *pl_protq_main(void *arg) {
+    (void)arg; pthread_setname_np("totk-pl-protect"); pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+    pl_rng *own = NULL; int cap = 0;
+    for (;;) {
+        pthread_mutex_lock(&g_plpq_mu);
+        while (!g_plpq_n) pthread_cond_wait(&g_plpq_cv, &g_plpq_mu);
+        pl_rng *v = g_plpq; int n = g_plpq_n; g_plpq = own; g_plpq_cap = cap; g_plpq_n = 0; own = v; cap = n > cap ? n : cap;   // swap: the producer fills the other one
+        uint64_t to = g_plpq_seq; g_plpq_busy = 1; g_plpq_busy_to = to;
+        pthread_mutex_unlock(&g_plpq_mu);
+        pl_protq_run(v, n);
+        pthread_mutex_lock(&g_plpq_mu); g_plpq_busy = 0; if (to > g_plpq_done) g_plpq_done = to; pthread_cond_broadcast(&g_plpq_cv); pthread_mutex_unlock(&g_plpq_mu);
+    }
+    return NULL;
+}
+static void pl_protq_push(uintptr_t lo, uintptr_t hi) {   // translate thread
+    static int started; if (!started) { started = 1; pthread_t t; if (pthread_create(&t, NULL, pl_protq_main, NULL)) MDIE("pipeline protection thread"); pthread_detach(t); }
+    pthread_mutex_lock(&g_plpq_mu);
+    if (g_plpq_n == g_plpq_cap) { g_plpq_cap = g_plpq_cap ? g_plpq_cap * 2 : 1024; g_plpq = realloc(g_plpq, sizeof *g_plpq * (size_t)g_plpq_cap); if (!g_plpq) MDIE("pipeline protection queue"); }
+    g_plpq[g_plpq_n++] = (pl_rng){lo, hi}; g_plpq_seq++;
+    if (g_plpq_n == 1) pthread_cond_broadcast(&g_plpq_cv);
+    pthread_mutex_unlock(&g_plpq_mu);
+}
+static void pl_protq_cb(uintptr_t lo, uintptr_t hi) { pl_protq_push(lo, hi); }
+static uint64_t pl_protq_seq(void) { pthread_mutex_lock(&g_plpq_mu); uint64_t q = g_plpq_seq; pthread_mutex_unlock(&g_plpq_mu); return q; }
+/* the spans queued up to seq are protected (the release of a submission: seq at its commit); what is still queued is
+   done here, a batch the helper is working on is waited for */
+static void pl_protq_sync(uint64_t seq) {
+    pthread_mutex_lock(&g_plpq_mu);
+    while (g_plpq_done < seq) {
+        if (g_plpq_n) {   // still queued: take it (the helper swaps in the empty buffer next time)
+            pl_rng *v = malloc(sizeof *v * (size_t)g_plpq_n); int n = g_plpq_n; uint64_t to = g_plpq_seq;
+            if (!v) MDIE("pipeline protection queue");
+            memcpy(v, g_plpq, sizeof *v * (size_t)n); g_plpq_n = 0;
+            pthread_mutex_unlock(&g_plpq_mu);
+            pl_protq_run(v, n); free(v); atomic_fetch_add(&g_plpq_inline, (uint64_t)n);
+            pthread_mutex_lock(&g_plpq_mu);
+            while (g_plpq_busy && g_plpq_busy_to < to) pthread_cond_wait(&g_plpq_cv, &g_plpq_mu);   // an older batch still in the helper
+            if (to > g_plpq_done) g_plpq_done = to;
+        } else pthread_cond_wait(&g_plpq_cv, &g_plpq_mu);   // the helper is protecting the last batch
+    }
+    pthread_mutex_unlock(&g_plpq_mu);
+}
 static void pl_rvec_add(pl_rvec *v, uintptr_t lo, uintptr_t hi) {
     if (v->n == v->cap) { v->cap = v->cap ? v->cap * 2 : 4096; v->r = realloc(v->r, (size_t)v->cap * sizeof *v->r); if (!v->r) MDIE("pipeline ranges"); }
     v->r[v->n++] = (pl_rng){lo, hi};
 }
 static void pl_rng_add(uintptr_t lo, uintptr_t hi, int nonstatic, int write) {
     pl_rvec_add(&g_plr_all, lo, hi);
-    if (nonstatic) { pl_rvec_add(&g_plr_ns, lo, hi); nvn_pl_protect_span((const void *)lo, (size_t)(hi - lo)); }   // CPU writes until the release then go through the ring
+    if (nonstatic) { pl_rvec_add(&g_plr_ns, lo, hi); pl_protq_push(lo, hi); }   // protected before the release (helper); CPU writes until the release then go through the ring
     if (write) {
         if (g_plr_w.n == g_plr_w.cap) { g_plr_w.cap = g_plr_w.cap ? g_plr_w.cap * 2 : 1024; g_plr_w.r = realloc(g_plr_w.r, (size_t)g_plr_w.cap * sizeof *g_plr_w.r); if (!g_plr_w.r) MDIE("pipeline ranges"); }
         g_plr_w.r[g_plr_w.n++] = (pl_wrng){lo, hi, g_pl_wk};
     }
 }
 /* decisions per submission: -1 GPU-written / untracked, 0 static, 1 volatile */
-typedef struct { uint64_t lo, hi; uint32_t gen, wep; int8_t c, pub; } pl_dm;   // pub: the static span is published; wep: g_pl_wep when decided
+typedef struct { uint64_t lo, hi; uint32_t gen, wep; int8_t c, pub; uint64_t ulo, uhi; } pl_dm;   // pub: read in place this submission (static), [ulo, uhi): the bytes read (published at the commit); wep: g_pl_wep when decided
+static uint32_t *g_pldl; static int g_pldl_n, g_pldl_cap;   // decision entries read in place (static) this submission
 static uint32_t g_pl_wep;   // GPU writes noted in this submission (a volatile decision is checked again after one)
 static pl_dm g_pldm[PL_MEMO];
 static inline unsigned pl_memo_slot(uint64_t lo, uint64_t hi) { uint64_t h = (lo >> 4) ^ (lo >> 19) ^ (hi * UINT64_C(0x9e3779b97f4a7c15)); return (unsigned)(h ^ (h >> 31)) & (PL_MEMO - 1); }
@@ -140,7 +191,7 @@ static inline pl_sc *pl_sc_slot(uint64_t lo, uint64_t hi) { uint64_t h = (lo >> 
 /* ---------- depth statistics: snapshot ring of small compute-written storage buffers (from TOTK_OVERLAP) ---------- */
 typedef struct {
     int state;   // 0 free, 1 candidate, 2 active, 3 retiring (whole bindings still use H; at the next submission H goes back to memory), 4 dead (buffers kept until dead_fence)
-    int hits, used_rw, base_valid, gone, inval, nmask;   // inval: the CPU invalidates it (published there, not at frame waits); nmask: CPU words to merge
+    int hits, used_rw, base_valid, gone, inval, nmask; uint64_t wait_since;   // wait_since: a candidate waiting for overlapping snapshots to go   // inval: the CPU invalidates it (published there, not at frame waits); nmask: CPU words to merge
     uint64_t lo, hi, last_sub, base_fence, pub_fence, dead_fence;
     __strong id<MTLBuffer> H, S[PLDS_RING]; uint64_t s_fence[PLDS_RING];
     uint64_t *base, *mval; uint8_t *mmask;   // guest words at the last sync; CPU words still to merge into H
@@ -261,7 +312,9 @@ static void plds_begin(void) {   // mtl_sub_begin (command buffer open, nothing 
             if (same) continue;
             int put = 0;
             for (int i = 0; i < PLDS_SNAPS; i++) if (g_plds[i].state == 0) { g_plds[i] = (plds_t){0}; g_plds[i].state = 1; g_plds[i].lo = ulo; g_plds[i].hi = uhi; g_plds[i].hits = 2; g_plds[i].last_sub = g_plds_sub; atomic_fetch_add(&g_plds_learned, 1); put = 1; break; }
-            if (!put && atomic_fetch_add(&g_plds_noslot, 1) < 8) MLOG("【红】[pipeline] readback snapshot %#llx+%llu: no free slot (%d in use)", (unsigned long long)ulo, (unsigned long long)(uhi - ulo), PLDS_SNAPS);
+            if (!put && atomic_fetch_add(&g_plds_noslot, 1) < 8) {
+                int st[5] = {0}; for (int i = 0; i < PLDS_SNAPS; i++) { int k = g_plds[i].state; if (k >= 0 && k <= 4) st[k]++; }
+                MLOG("【红】[pipeline] readback snapshot %#llx+%llu: no free slot (candidates %d, active %d, retiring %d, dead %d)", (unsigned long long)ulo, (unsigned long long)(uhi - ulo), st[1], st[2], st[3], st[4]); }
         }
     }
     for (int i = 0; i < PLDS_SNAPS; i++) {
@@ -281,7 +334,11 @@ static void plds_begin(void) {   // mtl_sub_begin (command buffer open, nothing 
             for (int j = 0; j < PLDS_SNAPS; j++) { plds_t *o = &g_plds[j]; if (o != s && o->state == 1 && o->lo < hi && o->hi > lo) { if (o->lo < lo) lo = o->lo & ~15ull; if (o->hi > hi) hi = (o->hi + 15) & ~15ull; } }
             int clash = 0; for (int j = 0; j < PLDS_SNAPS; j++) { plds_t *o = &g_plds[j]; if (o->state >= 2 && o->state <= 4 && o->lo < hi && o->hi > lo) clash = 1; }
             void *mb; uint64_t mo;
-            if (clash && s->hits >= 2 && hi - lo <= PLDS_MAX) { s->last_sub = g_plds_sub; continue; }   // waits until the overlapping snapshots are gone
+            if (clash && s->hits >= 2 && hi - lo <= PLDS_MAX) {   // make way: active snapshots inside the union retire; give up after 64 submissions
+                if (!s->wait_since) s->wait_since = g_plds_sub;
+                if (g_plds_sub - s->wait_since > 64) { s->state = 0; atomic_fetch_add(&g_plds_gaveup, 1); continue; }
+                for (int j = 0; j < PLDS_SNAPS; j++) { plds_t *o = &g_plds[j]; if (o->state == 2 && o->lo < hi && o->hi > lo) { os_unfair_lock_lock(&g_plds_lk); o->state = 3; os_unfair_lock_unlock(&g_plds_lk); } }
+                s->last_sub = g_plds_sub; continue; }
             if (clash || hi - lo > PLDS_MAX || !mtl_addr(lo, hi - lo, &mb, &mo)) { s->state = 0; continue; }
             for (int j = 0; j < PLDS_SNAPS; j++) { plds_t *o = &g_plds[j]; if (o != s && o->state == 1 && o->lo < hi && o->hi > lo) *o = (plds_t){0}; }
             size_t len = (size_t)(hi - lo), nw = len / 8;
@@ -403,13 +460,13 @@ static int pl_decide(uint64_t a0, uint64_t n0, pl_dm **out) {
         if (nvn_pl_gpu_written((const void *)(uintptr_t)a, (size_t)n, pl_done_fn())) c = -1;   // a GPU write in flight: read in place (not cached)
         else {
             uint64_t stamp = nvn_dirty_now();
-            c = nvn_pl_classify((const void *)(uintptr_t)a, (size_t)n, g_pl_keep, g_pl_probe, g_pl_first);
-            if (c == 0) nvn_dirty_protect((const void *)(uintptr_t)a, (size_t)n);   // static: every page protected, so a CPU write is seen
+            c = nvn_pl_classify((const void *)(uintptr_t)a, (size_t)n, g_pl_keep, g_pl_probe, g_pl_first && n <= g_pl_first_max, pl_protq_cb);   // first-seen spans over FIRST_MAX are static (no probation copy)
+            if (c == 0) pl_protq_push(a, a + n);   // static: every page protected (helper), so a CPU write is seen
             if (c >= 0) *sc = (pl_sc){a, a + n, stamp, (uint32_t)g_sub_serial, (int8_t)c};
             else *sc = (pl_sc){a, a + n, rgen, (uint32_t)g_sub_serial, -2};   // untracked
         }
     }
-    if (d) *d = (pl_dm){a, a + n, g_plm_gen, g_pl_wep, (int8_t)c, 0};
+    if (d) *d = (pl_dm){a, a + n, g_plm_gen, g_pl_wep, (int8_t)c, 0, 0, 0};
     *out = d;
     if (samp) g_pls_st.t_decide += (pl_now() - t0) * 32;
     return c;
@@ -425,8 +482,13 @@ static int pl_read(uint64_t a, uint64_t n, int kind, void **buf, uint64_t *off, 
     pl_dm *d = NULL; int c = pl_decide(a, n, &d);
     if (c == 0) {
         g_pls_st.live_static++; g_pls_st.live[kind]++;
-        if (d && !d->pub && (kind != PLK_TX || g_pl_texhold)) { d->pub = 1; pl_rng_add(d->lo, d->hi, 0, 0); }
-        else if (!d && (kind != PLK_TX || g_pl_texhold)) pl_rng_add(a, a + n, 0, 0);
+        if (kind == PLK_TX && !g_pl_texhold) return 0;
+        if (d && !d->pub) {   // the bytes read of a static span: their union is published at the commit (exact enough for the holds:
+            d->pub = 1; d->ulo = a; d->uhi = a + n;   // the game streams new data next to data in use in the same 16 KiB page)
+            if (g_pldl_n == g_pldl_cap) { g_pldl_cap = g_pldl_cap ? g_pldl_cap * 2 : 2048; g_pldl = realloc(g_pldl, sizeof *g_pldl * (size_t)g_pldl_cap); if (!g_pldl) MDIE("pipeline ranges"); }
+            g_pldl[g_pldl_n++] = (uint32_t)(d - g_pldm);
+        } else if (d) { if (a < d->ulo) d->ulo = a; if (a + n > d->uhi) d->uhi = a + n; }
+        else pl_rng_add(a, a + n, 0, 0);
         return 0;
     }
     int fresh = 0; pl_memo *m = pl_memo_find(a, a + n, &fresh);
@@ -494,6 +556,7 @@ static int pl_bind(uint64_t a, uint64_t n, int rw, int kind, int compute, void *
 typedef struct {
     uint64_t fence; int state; post_op *early; int nearly; uint64_t *qaddr; int nq; uint64_t t_rel;
     uintptr_t *nlo, *nhi; int nn;          // in-place ranges that are not static (all their pages protected at the release)
+    uint64_t protq;                        // protection queue sequence at the commit (pl_protq_sync before the release)
     uintptr_t *wlo, *whi, *wmx; uint8_t *wk; int nw;    // GPU write ranges, sorted, running maximum of the ends, kind (invalidates, RWATCH)
 } pl_slot;
 static pl_slot g_plslot[PL_SLOTS];   // under g_mu. state: 1 pending, 2 being released, 3 released (early results applied), 4 taken by the completion
@@ -520,7 +583,7 @@ static void pl_sub_begin(void) {   // end of mtl_sub_begin
     nvn_pl_set_done(pl_done_fn);
     nvn_pl_set_frame((uint32_t)g_sub_serial);
     if (++g_plm_gen == 0) g_plm_gen = 1;
-    g_pl_sub_bytes = 0; g_plsr_n = 0; g_plsr_lo = UINT64_MAX; g_plsr_hi = 0; g_plr_all.n = g_plr_ns.n = g_plr_w.n = 0; g_plq_n = 0; g_plds_ncand = 0;
+    g_pl_sub_bytes = 0; g_plsr_n = 0; g_plsr_lo = UINT64_MAX; g_plsr_hi = 0; g_plr_all.n = g_plr_ns.n = g_plr_w.n = 0; g_pldl_n = 0; g_plq_n = 0; g_plds_ncand = 0;
     if (g_pl_dsnap) plds_begin();
 }
 static void pl_sub_split(void) { if (g_pl > 0) g_plds_ncand = 0; }   // the candidates of the depth statistics are those of the last command buffer
@@ -544,6 +607,7 @@ static int pl_commit(uint64_t fence, post_op *ops, int n) {
     } else nl = n;
     /* ranges: all of them sorted (radix) and merged for the fault handler; the GPU writes sorted with a running maximum
        of their ends (invalidates); the non-static ones as they are (protected page by page at the release) */
+    for (int i = 0; i < g_pldl_n; i++) { const pl_dm *d = &g_pldm[g_pldl[i]]; if (d->gen == g_plm_gen && d->pub) pl_rvec_add(&g_plr_all, d->ulo, d->uhi); }   // static reads
     int na = g_plr_all.n, nn = g_plr_ns.n, nw = g_plr_w.n;
     rng_sort((usnap_rng *)g_plr_all.r, na);
     uintptr_t *alo = malloc(sizeof *alo * (size_t)(na ? na : 1)), *ahi = malloc(sizeof *ahi * (size_t)(na ? na : 1));
@@ -564,7 +628,7 @@ static int pl_commit(uint64_t fence, post_op *ops, int n) {
     pl_slot *s = &g_plslot[fence % PL_SLOTS];
     if (s->fence && s->state == 2) { uint64_t w0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); while (s->fence && s->state == 2) pthread_cond_wait(&g_cv, &g_mu); g_plx_wait[2] += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - w0; }   // its release is still applying (16 submissions back: never in practice)
     pl_slot_free_locked(s);
-    *s = (pl_slot){.fence = fence, .state = 1, .early = early, .nearly = ne, .qaddr = q, .nq = nq, .nlo = nlo, .nhi = nhi, .nn = 0, .wlo = wlo, .whi = whi, .wmx = wmx, .wk = wk, .nw = nw};
+    *s = (pl_slot){.fence = fence, .state = 1, .early = early, .nearly = ne, .qaddr = q, .nq = nq, .nlo = nlo, .nhi = nhi, .nn = 0, .protq = pl_protq_seq(), .wlo = wlo, .whi = whi, .wmx = wmx, .wk = wk, .nw = nw};
     pthread_mutex_unlock(&g_mu);
     g_pls_st.subs++; g_pls_st.ranges += (uint64_t)na; g_pls_st.nonstatic += (uint64_t)nn;
     g_pls_st.ns += pl_now() - t0; g_pls_st.t_commit += pl_now() - t0;
@@ -637,6 +701,7 @@ void mtl_pl_release(uint64_t fence, uint64_t prev, int dry) {
         free(take[i].nlo); free(take[i].nhi); free(take[i].qaddr);
     }
     uint64_t tb = pl_now();
+    { uint64_t q = 0; for (int i = 0; i < nt; i++) if (take[i].protq > q) q = take[i].protq; if (q) pl_protq_sync(q); }   // its spans are protected (normally long done by the helper)
     nvn_pl_reprotect(done, fence, NULL, NULL, 0);   // the non-static ranges were protected when published; CPU writes since: the ring
     free(nlo); free(nhi);
     uint64_t tc = pl_now();
@@ -666,15 +731,29 @@ void mtl_pl_release(uint64_t fence, uint64_t prev, int dry) {
 void mtl_pl_frame_wait_note(void) { atomic_fetch_add(&g_pl_waits, 1); }
 void mtl_pl_publish(void) { if (g_pl > 0) plds_publish(); }   // a frame wait returned without a release: the depth statistics of the newest completed frame
 /* Before state is destroyed or read back: every early-released submission has really completed. */
-void mtl_pl_gate(void) {
+static _Atomic uint64_t g_pl_gate_r[PLG_N], g_pl_gate_rns[PLG_N];
+static const char *const g_plg_name[PLG_N] = {"other", "invalidate", "pool finalize", "program finalize", "texel read / write", "virtual remap", "queue finish / suspend"};
+void mtl_pl_gate_r(int reason) {
     if (g_pl != 1) return;
     pthread_mutex_lock(&g_mu);
     if (g_done < g_pl_rel) {
-        uint64_t t0 = pl_now(); totk_tl(TL_GATE_IN, g_pl_rel, 0);
+        uint64_t t0 = pl_now(); totk_tl(TL_GATE_IN, g_pl_rel, (uint64_t)reason);
         while (g_done < g_pl_rel) pthread_cond_wait(&g_cv, &g_mu);
-        atomic_fetch_add(&g_pl_gate_n, 1); atomic_fetch_add(&g_pl_gate_ns, pl_now() - t0); totk_tl(TL_GATE_OUT, g_done, 0);
+        uint64_t dt = pl_now() - t0;
+        atomic_fetch_add(&g_pl_gate_n, 1); atomic_fetch_add(&g_pl_gate_ns, dt); totk_tl(TL_GATE_OUT, g_done, 0);
+        if (reason >= 0 && reason < PLG_N) { atomic_fetch_add(&g_pl_gate_r[reason], 1); atomic_fetch_add(&g_pl_gate_rns[reason], dt); }
     }
     pthread_mutex_unlock(&g_mu);
+}
+void mtl_pl_gate(void) { mtl_pl_gate_r(PLG_OTHER); }
+/* Pool finalize: wait only when GPU work of a released, unfinished submission accesses the pool's memory in place (its
+   published ranges); its other bindings read snapshots, its textures are Metal copies. 1 = waited. */
+int mtl_pl_gate_pool(const void *mem, uint64_t size) {
+    if (g_pl != 1 || !mem || !size) return 0;
+    pthread_mutex_lock(&g_mu); uint64_t rel = g_pl_rel, done = g_done; pthread_mutex_unlock(&g_mu);
+    if (rel <= done) return 0;
+    if (!nvn_pl_inflight(mem, (size_t)size, done, rel)) { atomic_fetch_add(&g_pl_pool_skips, 1); return 0; }
+    mtl_pl_gate_r(PLG_POOL); return 1;
 }
 /* nvnMemoryPoolInvalidateMappedRange: the CPU reads GPU results there next. The game's readback buffers (the depth
    statistics, the double-buffered objects of main+0x8d3xxx-0x8d4xxx, ...) are served from the snapshot ring: GPU work
@@ -705,7 +784,7 @@ static void pl_invalidate(const void *ap, uint64_t n, uint64_t caller) {
     if (hit) {
         atomic_fetch_add(&g_pl_inval_gates, 1);
         why = whi <= wlo ? "no write range found" : plds_learn(wlo, whi);   // from the next submission on: served from the snapshot ring
-        mtl_pl_gate();
+        mtl_pl_gate_r(PLG_INVAL);
     }
     uint64_t dt = hit ? pl_now() - t0 : 0;
     os_unfair_lock_lock(&g_plivs_lk);
@@ -737,6 +816,11 @@ static void pl_stats_line(void) {
          (unsigned long long)(gn - last_gate_n), gn > last_gate_n ? pl_ns(gns - last_gate_ns) / (double)(gn - last_gate_n) / 1e6 : 0.0,
          (unsigned long long)(in - last_inval_n), (unsigned long long)(ig - last_inval_gates));
     last_gate_n = gn; last_gate_ns = gns; last_inval_gates = ig; last_inval_n = in; last_rel_n = rn; last_rel_ns = rns;
+    { char line[600]; size_t o = 0; static uint64_t last_r[PLG_N], last_rns[PLG_N];
+      for (int r = 0; r < PLG_N; r++) { uint64_t n = atomic_load(&g_pl_gate_r[r]) - last_r[r], ns = atomic_load(&g_pl_gate_rns[r]) - last_rns[r]; last_r[r] += n; last_rns[r] += ns;
+          if (n) o += (size_t)snprintf(line + o, sizeof line - o, " %s %llu (%.1f ms)", g_plg_name[r], (unsigned long long)n, pl_ns(ns) / 1e6); }
+      MLOG("[pipeline] last 600: gate waits by reason:%s; pool finalizes that needed no wait %llu (since the start), readback snapshots given up waiting %llu; spans protected by the helper %llu (by a release itself %llu, since the start)", o ? line : " none",
+           (unsigned long long)atomic_load(&g_pl_pool_skips), (unsigned long long)atomic_load(&g_plds_gaveup), (unsigned long long)atomic_load(&g_plpq_spans), (unsigned long long)atomic_load(&g_plpq_inline)); }
     { char line[1600]; size_t o = 0; os_unfair_lock_lock(&g_plivs_lk);   // per caller since the start: invalidates / waited / ms waited
       for (int k = 0; k < 32 && g_plivs[k].caller && o < sizeof line - 80; k++)
           o += (size_t)snprintf(line + o, sizeof line - o, " main+%#llx %llu/%llu/%.0f", (unsigned long long)g_plivs[k].caller, (unsigned long long)g_plivs[k].n, (unsigned long long)g_plivs[k].waited, pl_ns(g_plivs[k].ns) / 1e6);
