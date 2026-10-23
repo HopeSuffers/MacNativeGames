@@ -31,6 +31,8 @@
 #include <mach/mach.h>
 #include <pthread/qos.h>
 #include <dlfcn.h>
+#include <unistd.h>
+#include <stdatomic.h>
 
 #define R_TIMEOUT     0xEA01u   // 内核模块 1，描述 117 | Kernel module 1, description 117
 #define R_CANCELLED   0xEC01u   // 118
@@ -77,6 +79,9 @@ typedef struct thr {
     uint32_t wh[4]; int nwh;   // handles of the current WaitSynchronization (state dump)
     int last_hle;              // 1 + wrapper index of the last host call made while "hletrace" was on (state dump)
     uint64_t yrun_ns, yrun_svc;   // the current run of yields: when it started, and nsvc at its last yield (yield_backoff_ns)
+    int eco_epoch;                // g_eco_epoch this thread last applied (eco_apply)
+    int is_main;                  // the game's main thread (svc_thread_main_init)
+    uint64_t cpu_prev_us;         // TOTK_THREAD_CPU: CPU time at the previous report
 #ifdef GAME_BOTW
     uint64_t cwait_ns;            // when it last queued for a virtual core (starvation rule, core_beats)
     uint64_t protect_until;       // given a core by the starvation rule: no priority preemption before this
@@ -520,6 +525,7 @@ void dm_thread_returned(void) { die("客体线程入口函数返回（Horizon �
 
 // 主线程登记，返回其句柄（交给 nnosInitialize 作主线程句柄）
 // Register the main thread and return its handle (passed to nnosInitialize as the main thread handle)
+void thread_cpu_start(void);
 uint32_t svc_thread_main_init(void) {
     pthread_key_create(&g_keythr, NULL);
     thr_t *t = calloc(1, sizeof *t);
@@ -529,7 +535,7 @@ uint32_t svc_thread_main_init(void) {
 #else
     t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt);
 #endif
-    t->cur_core = -1;
+    t->cur_core = -1; t->is_main = 1;
     pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; core_take(t); pthread_mutex_unlock(&G);
 #ifdef GAME_BOTW
     g_main_handle = t->handle;
@@ -537,6 +543,7 @@ uint32_t svc_thread_main_init(void) {
     pthread_setspecific(g_keythr, t);
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
     pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
+    thread_cpu_start();
     return t->handle;
 }
 
@@ -649,7 +656,61 @@ static uint64_t yield_backoff_ns(uint64_t run_ns) {
     return s < (uint64_t)cap ? s : (uint64_t)cap;
 }
 
+/* TOTK_ECO_PRIO=<p> / runtime "flag eco_prio <p>" (2026-10-24, experiment): guest threads whose Horizon priority is
+   numerically >= p (lower priority) run at QOS_CLASS_UTILITY, which Darwin schedules on the efficiency cores; the others
+   stay USER_INTERACTIVE. 64 = off (default). On the fanless Air the sustained package budget is ~12 W and the P-cores are
+   held at DVFS state ~5/20 (pwr, RESULTS.md 2026-10-24), so work an E-core can do in time frees P-core power. Each thread
+   applies a change itself at its next thread SVC (QoS can only be set on the calling thread). */
+static _Atomic int g_eco_prio = -1, g_eco_epoch, g_eco_main;   /* g_eco_main: the game's main thread too (flag eco_main); eco_prio leaves it out */
+static int eco_prio(void) {
+    int v = atomic_load_explicit(&g_eco_prio, memory_order_relaxed);
+    if (v < 0) { const char *e = getenv("TOTK_ECO_PRIO"); v = e ? atoi(e) : 64; if (v < 0) v = 64; atomic_store(&g_eco_prio, v); }
+    return v;
+}
+void runtime_eco_main_set(int v) { atomic_store(&g_eco_main, v != 0); atomic_fetch_add(&g_eco_epoch, 1); LOG("[eco] main thread at %s QoS", v ? "utility" : "user-interactive"); }
+void runtime_eco_prio_set(int p) { atomic_store(&g_eco_prio, p < 0 ? 64 : p); atomic_fetch_add(&g_eco_epoch, 1); LOG("[eco] guest threads with priority >= %d run at utility QoS (efficiency cores)", p); }
+static void eco_apply(thr_t *t) {
+    int ep = atomic_load_explicit(&g_eco_epoch, memory_order_relaxed) + 1;   // +1: the first check always applies (eco_epoch starts at 0)
+    if (t->eco_epoch == ep) return;
+    t->eco_epoch = ep;
+    qos_class_t want = (t->is_main ? atomic_load(&g_eco_main) : t->prio >= eco_prio()) ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INTERACTIVE;
+    if ((uint32_t)want != t->qos) { pthread_set_qos_class_self_np(want, 0); t->qos = (uint32_t)want; }
+}
+/* TOTK_THREAD_CPU=<seconds>: every so many seconds, each live guest thread's CPU share over the interval with its
+   priority, core and entry (to pick eco_prio candidates). */
+static void *thread_cpu_main(void *arg) {
+    int sec = (int)(intptr_t)arg; uint64_t last = now_ns();
+    pthread_setname_np("totk-thread-cpu");
+    for (;;) {
+        sleep((unsigned)sec);
+        uint64_t now = now_ns(); double span = (double)(now - last) / 1e3; last = now;
+        struct { uint32_t h; int prio, core; uint64_t entry; double pct; uint32_t qos; } r[256]; int n = 0;
+        pthread_mutex_lock(&G);
+        for (thr_t *t = g_all; t && n < 256; t = t->all) {
+            if (t->exited || !t->mport) continue;
+            thread_basic_info_data_t bi; mach_msg_type_number_t c = THREAD_BASIC_INFO_COUNT;
+            if (thread_info(t->mport, THREAD_BASIC_INFO, (thread_info_t)&bi, &c) != KERN_SUCCESS) continue;
+            uint64_t us = (uint64_t)bi.user_time.seconds * 1000000 + (uint64_t)bi.user_time.microseconds + (uint64_t)bi.system_time.seconds * 1000000 + (uint64_t)bi.system_time.microseconds;
+            double pct = t->cpu_prev_us && us >= t->cpu_prev_us ? 100.0 * (double)(us - t->cpu_prev_us) / span : 0; t->cpu_prev_us = us;
+            r[n].h = t->handle; r[n].prio = t->prio; r[n].core = t->core; r[n].entry = t->entry; r[n].pct = pct; r[n].qos = t->qos; n++;
+        }
+        pthread_mutex_unlock(&G);
+        for (int i = 1; i < n; i++) for (int j = i; j > 0 && r[j].pct > r[j - 1].pct; j--) { __typeof__(r[0]) x = r[j]; r[j] = r[j - 1]; r[j - 1] = x; }
+        char line[2048]; int o = 0;
+        for (int i = 0; i < n && i < 24 && r[i].pct >= 0.5; i++)
+            o += snprintf(line + o, sizeof line - (size_t)o, " %#x/p%d/c%d/%llx/%s:%.0f%%", r[i].h, r[i].prio, r[i].core, (unsigned long long)r[i].entry, r[i].qos == QOS_CLASS_UTILITY ? "u" : "i", r[i].pct);
+        LOG("[thread-cpu] handle/prio/core/entry/qos:cpu%s", line);
+    }
+    return NULL;
+}
+void thread_cpu_start(void) {
+    static int started; if (started) return; started = 1;
+    const char *e = getenv("TOTK_THREAD_CPU"); int sec = e ? atoi(e) : 0; if (sec <= 0) return;
+    pthread_t th; if (!pthread_create(&th, NULL, thread_cpu_main, (void *)(intptr_t)sec)) pthread_detach(th);
+}
+
 int svc_thread(int num, uint64_t *regs) {
+    { thr_t *me = (g_keythr ? pthread_getspecific(g_keythr) : NULL); if (me) eco_apply(me); }
     { thr_t *me = (g_keythr ? pthread_getspecific(g_keythr) : NULL); if (me) { me->last_svc = num; me->last_lr = regs[30]; me->last_fp = regs[29]; me->nsvc++; } }
 
     switch (num) {

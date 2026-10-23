@@ -1355,6 +1355,13 @@ static inline void es_begin(id e);   // render state cache, defined with the sta
 /* TOTK: the shared copy / dispatch encoder (g_blit) may still be open after a dispatch: any other encoder on g_cb closes it
    first (a Metal command buffer encodes one encoder at a time). */
 static inline void blit_close(void) { if (g_blit) { m4_end(g_blit); g_blit = nil; } }
+/* flag eco_host <bits> (2026-10-24, experiment): host threads that switch themselves to utility QoS (efficiency cores):
+   1 the uniform snapshot helpers, 2 the encode stage. *cur: the class this thread runs at now (0 user-interactive). */
+static _Atomic int g_eco_host;
+static inline void eco_host_apply(int bit, int *cur) {
+    int want = (atomic_load_explicit(&g_eco_host, memory_order_relaxed) & bit) != 0;
+    if (want != *cur) { pthread_set_qos_class_self_np(want ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INTERACTIVE, 0); *cur = want; }
+}
 #include "nvn_render_stream.h"
 /* TOTK_SIDE_CB (opt-in: =1 on), 2026-10-23. A Metal command buffer records one encoder at a time, so an encoder the replay
    thread opens itself (compute / copy) right after a render pass the encode stage owns waited in rs_sync until the encode
@@ -1683,9 +1690,10 @@ static void usnap_take(const uint64_t *h, int n, const usnap_cap *cap);
 static dispatch_semaphore_t g_ush_sem; static _Atomic int g_ush_next, g_ush_busy, g_ush_n; static int g_ush_count = -1;
 static const usnap_cap *g_usnap_cap;   // the translation-thread mode's capture, the source of the copies until the helpers are done
 static void *ush_main(void *arg) {
-    (void)arg; pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    (void)arg; pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0); int qos_now = 0;
     for (;;) {
         dispatch_semaphore_wait(g_ush_sem, DISPATCH_TIME_FOREVER);
+        eco_host_apply(1, &qos_now);
         int n = atomic_load_explicit(&g_ush_n, memory_order_acquire);
         uint64_t did = usnap_copy_run(&g_ush_next, n);
         atomic_fetch_add(&g_usnap_helped, did);
@@ -2740,6 +2748,10 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "tex_slots_check")) { (void)tex_slots_on(); atomic_store(&g_tex_slots_check, v != 0); MLOG("[flag] tex_slots_check = %d verified=%llu hits=%llu", v != 0, (unsigned long long)atomic_load(&g_tex_slots_verified), (unsigned long long)atomic_load(&g_tex_slots_hits)); return; }
     if (!strcmp(name, "gpucap")) { gpucap_request(v); return; }   // Metal GPU capture of the next v submissions (MTL_CAPTURE_ENABLED=1)
     if (!strcmp(name, "hz")) { hz_set(v); return; }   // TOTK_HZ from the next render pass
+    if (!strcmp(name, "eco_main")) { extern void runtime_eco_main_set(int) __attribute__((weak)); if (runtime_eco_main_set) runtime_eco_main_set(v); return; }
+    if (!strcmp(name, "eco_host")) { atomic_store(&g_eco_host, v); MLOG("[flag] eco_host = %d (1 uniform helpers, 2 encode stage: utility QoS)", v); return; }
+    if (!strcmp(name, "eco_prio")) { extern void runtime_eco_prio_set(int) __attribute__((weak)); if (runtime_eco_prio_set) runtime_eco_prio_set(v); return; }
+    if (!strcmp(name, "rs_spin_us")) { if (v < 0 || v > 5000) { MLOG("[flag] rs_spin_us requires 0..5000"); return; } atomic_store(&g_rs_spin_ns, (int64_t)v * 1000); MLOG("[flag] rs_spin_us = %d", v); return; }
     if (!strcmp(name, "render_stream")) { atomic_store(&g_rs_on, v != 0); MLOG("[flag] render_stream = %d (next render pass)", v != 0); return; }
     if (!strcmp(name, "cube_merge")) { atomic_store(&g_cg_on, v != 0); MLOG("[flag] cube_merge = %d", v != 0); return; }
     if (!strcmp(name, "skip_invisible")) { skv_set(v); return; }

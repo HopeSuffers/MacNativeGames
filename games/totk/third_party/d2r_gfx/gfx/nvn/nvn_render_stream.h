@@ -31,6 +31,15 @@ enum { RS_SPIN_NS = 200000 };   /* B waits (wfe) this long on an empty queue bef
                                    for that long, so B sleeps in the frame gap and wakes (~30 us) at the next submission. The waits are wfe / sev,
                                    not a hot spin: with a hot spin (2 ms yield loop) the visible-mode GPU time rose 8.9 -> 9.3 ms (analysis/rs3v-*,
                                    rs4v-* with 200 us): CPU power taken from the GPU's budget. */
+/* TOTK_RS_SPIN_US=<µs> (default RS_SPIN_NS / 1000): how long B waits (wfe) on an empty queue before sleeping. 2026-10-24:
+   the wait shows as ~1000 busy samples of rs_worker per 10 s at Kakariko, and the CPU takes about as much power as the
+   GPU on the fanless Air (pwr: ~10 W of ~19.5 W package); measured per value with park-pwr.sh. */
+static _Atomic int64_t g_rs_spin_ns = -1;   /* runtime: flag rs_spin_us <µs> */
+static uint64_t rs_spin_ns(void) {
+    int64_t v = atomic_load_explicit(&g_rs_spin_ns, memory_order_relaxed);
+    if (v < 0) { const char *e = getenv("TOTK_RS_SPIN_US"); v = e ? (int64_t)atoll(e) * 1000 : RS_SPIN_NS; atomic_store_explicit(&g_rs_spin_ns, v, memory_order_relaxed); }
+    return (uint64_t)v;
+}
 static nvn_encode_fifo g_rs_fifo;
 static _Atomic int g_rs_on = -1;
 static _Atomic int g_rs_sleeping;          /* B announced it is about to sleep (seq_cst handshake with the publisher) */
@@ -109,19 +118,19 @@ static void *rs_worker(void *unused) {
     pthread_setname_np("TOTK encode stage");
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     id<MTL4RenderCommandEncoder> enc = nil; id<MTL4ArgumentTable> vt = nil, ft = nil;
-    uint64_t idle_since = 0, busy_since = 0;
+    uint64_t idle_since = 0, busy_since = 0; int qos_now = 0;
     for (;;) {
         const nvn_encode_packet *p = nvn_encode_fifo_peek(&g_rs_fifo);
         if (!p) {
             uint64_t now = rs_now();
             if (busy_since) { atomic_fetch_add_explicit(&g_rs_b_busy_ns, now - busy_since, memory_order_relaxed); busy_since = 0; }
             if (!idle_since) idle_since = now;
-            if (now - idle_since < RS_SPIN_NS) { __builtin_arm_wfe(); continue; }   /* low-power wait; A does sev after every publish */
+            if (now - idle_since < rs_spin_ns()) { __builtin_arm_wfe(); continue; }   /* low-power wait; A does sev after every publish */
             atomic_store_explicit(&g_rs_sleeping, 1, memory_order_seq_cst);
             atomic_thread_fence(memory_order_seq_cst);
             if (!nvn_encode_fifo_peek(&g_rs_fifo)) { dispatch_semaphore_wait(g_rs_sem, DISPATCH_TIME_FOREVER); atomic_fetch_add_explicit(&g_rs_b_sleeps, 1, memory_order_relaxed); }
             atomic_store_explicit(&g_rs_sleeping, 0, memory_order_seq_cst);
-            idle_since = 0; continue;
+            idle_since = 0; eco_host_apply(2, &qos_now); continue;
         }
         if (!busy_since) busy_since = rs_now();
         idle_since = 0;
