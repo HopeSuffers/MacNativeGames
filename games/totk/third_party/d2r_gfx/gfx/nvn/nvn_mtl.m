@@ -4693,12 +4693,13 @@ static void uw_ui_squeeze(const char *vs, const p_draw *dw, const p_draw_idx *di
 }
 /* TOTK_MFX: the scene is complete: end the pass (the draw that follows opens it again, loading the canvas, with the UI
    attachment) and copy the canvas into this frame's scene texture. */
+static void mfx_residency_once(void) { static int added; if (!added) { [g_q4 addResidencySet:mfx_residency()]; added = 1; } }   // the interpolator's textures, added to the queue once
 static void mfx_snapshot_scene(void) {
     if (g_enc) rp_end();
     id<MTLTexture> c = tex_mtl(R.rt.color[0]);
     if (!c || c.textureType != MTLTextureType2D || c.mipmapLevelCount < 1) { g_mfx.scene_done = 1; return; }
     id<MTLTexture> sc = mfx_scene_target(g_dev, c.width, c.height, c.pixelFormat);
-    static int rs_added; if (!rs_added) { [g_q4 addResidencySet:mfx_residency()]; rs_added = 1; }
+    mfx_residency_once();
     id<MTL4ComputeCommandEncoder> b = blit();
     enc_b_copy_texture(b, c, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(c.width, c.height, 1), sc, 0, 0, MTLOriginMake(0, 0, 0));
     enc_b_end(g_blit); g_blit = nil;
@@ -14330,8 +14331,35 @@ void mtl_present_discard(int on) { atomic_store(&g_present_discard, on != 0); if
    per-frame state. Returns the output slot or -1. */
 static id<MTL4CommandAllocator> g_mfx_alloc[3]; static id<MTL4CommandBuffer> g_mfx_cb[3]; static _Atomic int g_mfx_busy[3];
 static id<MTLTexture> g_mfx_swap_prev;   // TOTK_MFX_DUMP: copy of the previous presented image
+/* TOTK_MFX: a frame with no UI draw (the benchmark camera hides the HUD; cutscenes, photo mode) never reaches the scene
+   copy taken before the first UI draw (mfx_snapshot_scene), so it was never interpolated: 92% of the benchmark's frames
+   ("missing input: picture"). The presented image is then the whole scene: it is copied as the scene in a small
+   submission of its own and the UI layer is cleared, as Breath of the Wild does at its canvas copy (botw_mfx_no_ui_scene). */
+static uint64_t g_mfx_noui_n;
+static void mfx_no_ui_scene(const tex_t *t) {
+    id<MTLTexture> c = tex_mtl(t);
+    if (!c || c.textureType != MTLTextureType2D || c.mipmapLevelCount < 1) return;
+    mtl_sub_begin();
+    id<MTLTexture> sc = mfx_scene_target(g_dev, c.width, c.height, c.pixelFormat);
+    mfx_residency_once();
+    id<MTL4ComputeCommandEncoder> b = blit();
+    enc_b_copy_texture(b, c, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(c.width, c.height, 1), sc, 0, 0, MTLOriginMake(0, 0, 0));
+    enc_b_end(g_blit); g_blit = nil;
+    id<MTLTexture> ui = mfx_ui_target(g_dev, c.width, c.height);
+    if (ui) {   // an empty pass clears the UI layer to transparent
+        MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new]; rp.colorAttachments[0].texture = ui;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0); rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        blit_close(); rs_sync(); id<MTL4RenderCommandEncoder> en = [g_cb renderCommandEncoderWithDescriptor:rp]; es_reset();
+        if (en) { [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; m4_end(en); }
+        args_dirty_all(); g_pso_dirty = g_dss_dirty = 1;
+    }
+    mtl_sub_commit();
+    g_mfx.scene_done = 1; g_mfx.ui_cleared = 1; mfx_note_scene();
+    if (++g_mfx_noui_n <= 2 || g_mfx_noui_n % 600 == 0) MLOG("[mfx] %llu frames without UI so far (game frame %llu): the presented image is the scene, the UI layer is empty", (unsigned long long)g_mfx_noui_n, (unsigned long long)atomic_load(&g_cur_frame));
+}
 static int mfx_present_frame_body(const tex_t *t, double period, int discard) {
     if (t) uw_note_present(t);
+    if (t && !discard && !nogpu() && !g_mfx.scene_done && g_mfx.canvas) mfx_no_ui_scene(t);
     int slot = mfx_frame_prepare(period);
     if (slot >= 0) {
         int a = -1; for (int i = 0; i < 3 && a < 0; i++) if (!atomic_load(&g_mfx_busy[i])) a = i;
