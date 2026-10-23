@@ -2248,14 +2248,21 @@ static void chunk_cfg(void) {
 }
 uint64_t mtl_chunk_commits(void) { return g_chunk_commits; }
 void mtl_blit_stats(uint64_t v[6]) { v[0] = g_blit_opens; v[1] = g_blit_splits; v[2] = g_upd_n; v[3] = g_upd_split; v[4] = g_copy_n; v[5] = g_copy_split; }
+/* TOTK_SPLIT_EARLY (default on; =0 off), 2026-10-23: the split waited for the encode stage (rs_sync: 125 samples in the
+   Korok Forest profile) before doing the work that does not touch the chunk's command buffer: flushing the upload batch
+   (its own command buffer, committed before this chunk as before), the residency commit, the commit options and the next
+   chunk's command buffer object. That work now runs first and overlaps the encode stage's tail; the chunk is ended and
+   committed after the wait as before, so the GPU sees the same commits in the same order. Nothing is replayed in
+   between, so no upload can be recorded after the flush for this chunk. */
+static int split_early_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_SPLIT_EARLY"); v = !(e && !atoi(e)); if (!v) MLOG("TOTK_SPLIT_EARLY=0: a chunk split waits for the encode stage first"); } return v; }
 static void mtl_sub_split(void) {
-    uint64_t fc0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); int fc_first = g_sub_chunks == 0;
-    rs_sync();   // TOTK: the encode stage must have finished every pass of this command buffer
-    uint64_t fc1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    uint64_t fc0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); int fc_first = g_sub_chunks == 0, early = split_early_on();
+    uint64_t fc1 = fc0, fc2, fc3, w0 = 0;
+    if (!early) { rs_sync(); fc1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }   // TOTK: the encode stage must have finished every pass of this command buffer
     up_flush();
-    uint64_t fc2 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    fc2 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     res_commit();
-    uint64_t fc3 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    fc3 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     uint64_t gpu_f = atomic_load(&g_cur_frame), fence_next = g_fence + 1; gpu_tag_begin(gpu_f);
     TotkCommitOptions *o = [TotkCommitOptions new];
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
@@ -2264,13 +2271,16 @@ static void mtl_sub_split(void) {
     }];
     if (totk_tl_on()) { uint64_t tlid = totk_tl_commit_id(); totk_tl(TL_COMMIT, tlid, 0);
         [o addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { totk_tl_at(TL_GPU, (uint64_t)(fb.GPUStartTime * 1e9), tlid, (uint64_t)(fb.GPUEndTime * 1e9)); }]; }
+    id<MTL4CommandBuffer> next = [g_dev newCommandBuffer];
+    if (early) { w0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); rs_sync(); fc1 = fc0 + (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - w0); }   // fc1 - fc0: the wait, as before
     __strong id<MTL4CommandBuffer> list[SIDE_LIST + 1]; int nl = side_collect(list);   // TOTK_SIDE_CB: the chunk's earlier command buffers first
     [g_cb endCommandBuffer]; list[nl++] = g_cb;
     q4_commit_n(list, nl, o);
-    g_cb = [g_dev newCommandBuffer];
+    g_cb = next;
     [g_cb beginCommandBufferWithAllocator:g_alloc4[g_alloc_cur]]; g_cb_alloc = 0; g_side_busy = 1;
     g_sub_chunks++; g_chunk_commits++; g_chunk_mark = g_stat_draw;
-    if (fc_first) { uint64_t fc4 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); g_fc_t[1] += fc0 - g_fc_snap_end; g_fc_t[2] += fc1 - fc0; g_fc_t[3] += fc2 - fc1; g_fc_t[4] += fc3 - fc2; g_fc_t[5] += fc4 - fc3; g_fc_n++; }
+    if (fc_first) { uint64_t fc4 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), wait = fc1 - fc0;   // [2] the wait, [3] up_flush, [4] res_commit, [5] the rest
+        g_fc_t[1] += fc0 - g_fc_snap_end; g_fc_t[2] += wait; g_fc_t[3] += fc2 - (early ? fc0 : fc1); g_fc_t[4] += fc3 - fc2; g_fc_t[5] += fc4 - fc3 - (early ? wait : 0); g_fc_n++; }
 }
 // Called where a new encoder is about to be opened and none is open.
 static void chunk_maybe_split(void) {
