@@ -78,6 +78,8 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns);   // GPU 完成到 fence 返�
    dry run). mtl_pl_gate: every early-released submission has really completed (before state is destroyed / read back). */
 void mtl_pl_release(uint64_t fence, uint64_t prev, int dry);
 void mtl_pl_gate(void);
+void mtl_pl_gate_r(int reason);   // reason: PLG_* in nvn_mtl.m (1 invalidate, 2 pool finalize, 3 program finalize, 4 texels, 5 virtual remap, 6 finish / suspend)
+int mtl_pl_gate_pool(const void *mem, uint64_t size);   // pool finalize: waits only if a released frame accesses the pool in place; 1 = waited
 void mtl_pl_frame_wait_note(void);
 void mtl_pl_publish(void);
 uint64_t mtl_done_fence(void);

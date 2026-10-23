@@ -31,9 +31,10 @@ int nvn_pl_mode(void);
 void nvn_pl_set_done(uint64_t (*done)(void));                   // completed fence, signal-safe
 void nvn_pl_set_frame(uint32_t frame);                          // the frame CPU writes are stamped with (pl_wfr)
 void nvn_pl_set_released(uint64_t released, uint64_t vdone);    // newest fence released early; dry run: the fence treated as complete
-int nvn_pl_classify(const void *addr, size_t len, uint32_t keep, uint32_t probe, int first);   // -1 untracked, 1 snapshot, 0 static
+int nvn_pl_classify(const void *addr, size_t len, uint32_t keep, uint32_t probe, int first, void (*prot)(uintptr_t lo, uintptr_t hi));   // -1 untracked, 1 snapshot, 0 static; prot: protects the probation runs (NULL: inline)
 void nvn_pl_gpu_write(const void *addr, size_t len, uint64_t fence);
 int nvn_pl_gpu_written(const void *addr, size_t len, uint64_t done);
+int nvn_pl_inflight(const void *addr, size_t len, uint64_t done, uint64_t released);   // overlaps an in-place range of a submission in (done, released]
 void nvn_pl_publish(uint64_t fence, const uintptr_t *lo, const uintptr_t *hi, int n);       // in-place ranges, sorted by start
 int nvn_pl_reprotect(uint64_t done, uint64_t released, const uintptr_t *nlo, const uintptr_t *nhi, int nn);
 void nvn_pl_protect_span(const void *addr, size_t len);   // translate thread: a non-static in-place range, protected at its publication

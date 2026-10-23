@@ -305,7 +305,7 @@ static inline void pl_wrote(range_t *r, uintptr_t p) {   // the page became writ
    on probation: a snapshot should be read. 0: static. A page whose volatility expired (or, with first, a page never
    looked at) is put on probation here: write-protected and counted as volatile for probe frames; a CPU write meanwhile
    makes it volatile again. (GPU writes in flight are checked first by the caller: nvn_pl_gpu_written.) */
-int nvn_pl_classify(const void *addr, size_t len, uint32_t keep, uint32_t probe, int first) {
+int nvn_pl_classify(const void *addr, size_t len, uint32_t keep, uint32_t probe, int first, void (*prot)(uintptr_t lo, uintptr_t hi)) {   // prot: protects the probation runs (NULL: here)
     if (g_pl_mode <= 0 || !len) return -1;
     uintptr_t a = (uintptr_t)addr, e = a + len; int vol = 0; uint32_t fr = atomic_load(&g_pl_frame);
     while (a < e) {
@@ -320,11 +320,16 @@ int nvn_pl_classify(const void *addr, size_t len, uint32_t keep, uint32_t probe,
                 else if ((w && (!pf || pf < w)) || (!w && !pf && first)) { atomic_store(&r->pl_pfr[p], fr); start = 1; vol = 1; atomic_fetch_add(&g_pl_st[NVN_PLS_PROBATION], 1); }
             }
             if (start && !open) { run = p; open = 1; }
-            if (!start && open) { nvn_dirty_protect((const void *)(r->base + (run << g_shift)), (p - run) << g_shift); open = 0; }
+            if (!start && open) { if (prot) prot(r->base + (run << g_shift), r->base + (p << g_shift)); else nvn_dirty_protect((const void *)(r->base + (run << g_shift)), (p - run) << g_shift); open = 0; }
         }
         a = stop;
     }
     return vol;
+}
+/* [a, a+len) overlaps an in-place range of a submission in (done, released] (not signal context). */
+int nvn_pl_inflight(const void *addr, size_t len, uint64_t done, uint64_t released) {
+    if (g_pl_mode <= 0 || !len) return 0;
+    return pl_inflight_hit((uintptr_t)addr, (uintptr_t)addr + len, done, released) != 0;
 }
 /* GPU work of submission fence writes [a, a+len). */
 void nvn_pl_gpu_write(const void *addr, size_t len, uint64_t fence) {

@@ -132,6 +132,7 @@ static uint64_t fence_now(int *token);
 static int fence_wait(uint64_t k, uint64_t timeout_ns);
 static int fence_wait_to(uint64_t k, uint64_t kg, uint64_t timeout_ns);
 static int pl_hle_mode(void);   // TOTK_PIPELINE ("one frame deeper" below)
+static _Thread_local int t_drain_reason = 6;   // TOTK_PIPELINE gate reason of this thread's next x_drain (PLG_* in nvn_mtl.m: 6 finish / suspend; -1 no gate)
 static void x_drain(void);
 static int async_replay(void);
 static int call_stats_on(void);
@@ -248,7 +249,12 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
 }
 NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) {
     pool_t *o = (pool_t *)p;
-    if (o->mem && !(o->flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS)) { x_drain(); nvn_dirty_remove_range(o->mem); mtl_pool_del(o->mem); }
+    if (o->mem && !(o->flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS)) {
+        /* TOTK_PIPELINE: the translation queue drains as before; the real completion is waited for only when a released
+           frame still accesses this pool's memory in place */
+        t_drain_reason = pl_hle_mode() == 1 ? -1 : 6; x_drain();
+        if (pl_hle_mode() == 1) { NVN_BLOCKING(); mtl_pl_gate_pool(o->mem, o->size); }
+        nvn_dirty_remove_range(o->mem); mtl_pool_del(o->mem); }
     totk_vpool_fini(o); o->magic = 0;
 }
 /* A mirrored render target has private Metal storage. Reconcile GPU writes at mapped-range cache maintenance too:
@@ -265,7 +271,7 @@ NVN(nvnMemoryPoolMap, void *, const NVNmemoryPool *p){const pool_t *v=(const voi
 #endif
  if(v->magic!=MAGIC('P','O','O','L'))return NULL;return (v->flags&NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)?NULL:v->mem;}
 NVN(nvnMemoryPoolMapVirtual, NVNboolean, NVNmemoryPool *p, int n, const NVNmappingRequest *r) {
-    if (pl_hle_mode() == 1) { NVN_BLOCKING(); mtl_pl_gate(); }   // TOTK_PIPELINE: an early-released frame may still read through the old mapping
+    if (pl_hle_mode() == 1) { NVN_BLOCKING(); mtl_pl_gate_r(5); }   // TOTK_PIPELINE: an early-released frame may still read through the old mapping
     return (NVNboolean)totk_vpool_map((pool_t *)p, n, (const totk_mapping_request *)(const void *)r);
 }
 NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) { return (NVNbufferAddress)((const pool_t *)p)->mem; }
@@ -482,7 +488,7 @@ static void read_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r,
     if (!row) row = wb;
     if (!img) img = row * hb;
     unsigned level = v && v->set_levels ? (unsigned)v->base_level : 0, layer0 = v && v->set_layers ? (unsigned)v->min_layer : 0;
-    x_drain(); mtl_read_texels(o, level, layer0, r, dst, (size_t)row, (size_t)img);
+    t_drain_reason = 4; x_drain(); mtl_read_texels(o, level, layer0, r, dst, (size_t)row, (size_t)img);
 }
 NVN(nvnTextureReadTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, void *dst) {
     read_texels(CTX(t), (const view_t *)v, r, dst, 0, 0);
@@ -498,7 +504,7 @@ static void write_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r
     if (row < (ptrdiff_t)wb || img < row * (ptrdiff_t)hb) die("WriteTexels: stride smaller than region");
     unsigned level = v && v->set_levels ? (unsigned)v->base_level : 0, layer0 = v && v->set_layers ? (unsigned)v->min_layer : 0;
     if (v && v->set_format && v->format != o->d.format) die("WriteTexels: format-reinterpreting view not supported");
-    x_drain(); mtl_write_texels(o, level, layer0, r, src, (size_t)row, (size_t)img);
+    t_drain_reason = 4; x_drain(); mtl_write_texels(o, level, layer0, r, src, (size_t)row, (size_t)img);
 }
 NVN(nvnTextureWriteTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, const void *src) {
     write_texels(CTX(t), (const view_t *)v, r, src, 0, 0);
@@ -553,7 +559,8 @@ NVN(nvnSamplerFinalize, void, NVNsampler *s) { ((samp_t *)s)->magic = 0; }
 NVN(nvnProgramInitialize, NVNboolean, NVNprogram *p, NVNdevice *d) {
     (void)d; memset(p, 0, sizeof(prog_t)); ((prog_t *)p)->magic = MAGIC('P', 'R', 'O', 'G'); return 1;
 }
-NVN(nvnProgramFinalize, void, NVNprogram *p) { x_drain(); mtl_prog_release((prog_t *)p); ((prog_t *)p)->magic = 0; }
+NVN(nvnProgramFinalize, void, NVNprogram *p) { t_drain_reason = -1; x_drain();   /* TOTK_PIPELINE: no wait for the GPU: mtl_prog_release only forgets the serial (pipelines stay cached, shader code is host-side) */
+    mtl_prog_release((prog_t *)p); ((prog_t *)p)->magic = 0; }
 NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData *sd) {
     NVN_BLOCKING();
     prog_t *o = (prog_t *)p;
@@ -2270,15 +2277,16 @@ static void x_wait_job(uint64_t job) {
     pthread_mutex_lock(&g_xq_mu); while (g_xq_done < job) pthread_cond_wait(&g_xq_cv, &g_xq_mu); pthread_mutex_unlock(&g_xq_mu);
 }
 static void x_drain(void) {   // everything queued so far has run (no-op when synchronous or idle)
+    int reason = t_drain_reason; t_drain_reason = 6;
     if (!async_replay() || t_on_x_thread) return;   // on the translation thread everything queued before this job has run
-    if (pl_hle_mode() == 1) { NVN_BLOCKING(); mtl_pl_gate(); }   // TOTK_PIPELINE: what is destroyed / read back next may still be used by an early-released frame
+    if (pl_hle_mode() == 1 && reason >= 0) { NVN_BLOCKING(); mtl_pl_gate_r(reason); }   // TOTK_PIPELINE: what is destroyed / read back next may still be used by an early-released frame
     NVN_BLOCKING();   // a guest thread gives its virtual core back while it waits (TOTK has three)
     pthread_mutex_lock(&g_xq_mu); uint64_t want = g_xq_in, have = g_xq_done; pthread_mutex_unlock(&g_xq_mu);
     if (have >= want) return;
     uint64_t t0 = now_ns(); x_wait_job(want);
     atomic_fetch_add(&g_x_drains, 1); atomic_fetch_add(&g_x_drain_ns, now_ns() - t0);
 }
-void nvn_x_drain(void) { x_drain(); }   // for the graphics layer (pool invalidate write-back)
+void nvn_x_drain(void) { t_drain_reason = 1; x_drain(); }   // for the graphics layer (pool invalidate write-back)
 // Fence token for FenceSync: submits enqueued so far (async) or the Metal fence (synchronous).
 static uint64_t fence_now(int *token) {
     if (!async_replay()) { *token = 0; return mtl_last_fence(); }

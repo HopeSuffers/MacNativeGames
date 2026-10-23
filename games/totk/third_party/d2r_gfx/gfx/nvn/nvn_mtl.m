@@ -210,6 +210,7 @@ static int g_pl = -1;
 static uint64_t g_plx_t0, g_plx_c0, g_plx_rs0, g_plx_rsf0, g_plx_wait[4];   // waits: 0 allocator, 1 visibility ring, 2 pipeline slot, 3 render-stream (snapshot at begin)
 static void pl_sub_end_stats(void);
 enum { PLK_VB, PLK_IB, PLK_SB, PLK_UB, PLK_CP, PLK_TX, PLK_N };   // kinds of GPU reads (statistics)
+enum { PLG_OTHER, PLG_INVAL, PLG_POOL, PLG_PROG, PLG_TEXELS, PLG_VREMAP, PLG_FINISH, PLG_N };   // why the game waited for the real completion
 enum { PLW_OTHER, PLW_UPDATE, PLW_UPDFLUSH, PLW_COPY, PLW_T2B, PLW_STORAGE, PLW_STORAGE64, PLW_KERNEL, PLW_IMAGE, PLW_N };   // kinds of GPU writes (the invalidate log)
 static int g_pl_wk;   // the kind of the GPU write being noted, set by the call site
 static void pl_write(uint64_t a, uint64_t n);
