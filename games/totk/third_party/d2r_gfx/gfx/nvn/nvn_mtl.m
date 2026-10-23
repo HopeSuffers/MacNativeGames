@@ -212,7 +212,7 @@ static int pl_bind(uint64_t a, uint64_t n, int rw, int kind, int compute, void *
 static void plds_touch(uint64_t a, uint64_t n, const char *what);
 static void plds_pool_gone(uintptr_t lo, uintptr_t hi);
 static void pl_sub_begin(void);
-static void pl_invalidate(const void *a, uint64_t n);
+static void pl_invalidate(const void *a, uint64_t n, uint64_t caller);
 static _Atomic int g_last_commit_error;
 static _Atomic int g_up_pending;
 
@@ -2822,8 +2822,10 @@ void mtl_wb_eager(void) {
     pthread_mutex_unlock(&g_smu);
     wb_write_list(list, nl, 1);
 }
-void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
-    if (g_pl > 0 && p && p->mem) pl_invalidate(p->mem + off, n);   // TOTK_PIPELINE: GPU results of a released submission are read next
+void mtl_pool_invalidate_from(const pool_t *p, uint64_t off, uint64_t n, uint64_t caller);
+void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) { mtl_pool_invalidate_from(p, off, n, 0); }
+void mtl_pool_invalidate_from(const pool_t *p, uint64_t off, uint64_t n, uint64_t caller) {
+    if (g_pl > 0 && p && p->mem) pl_invalidate(p->mem + off, n, caller);   // TOTK_PIPELINE: GPU results of a released submission are read next
     if (!p || !p->mem || !atomic_load(&g_wb_on)) return;
     pthread_mutex_lock(&g_smu);
     if (!g_wb.n) { pthread_mutex_unlock(&g_smu); return; }
@@ -11860,13 +11862,22 @@ static uint16_t vertex_stream_mask(NvShader *vs) {
    bound: the largest index, scanned); per-instance streams: the last instance. Every attribute is taken as 16 bytes.
    TOTK_PIPELINE_VB_EXTENT=0: the bound size. */
 static const p_draw *g_pl_dw; static const p_draw_idx *g_pl_di;
+/* The largest index of a draw, kept per (index buffer, count, type) while no page of the indices is written (their pages
+   are write-protected for that); a GPU write in flight over them: unknown. */
+typedef struct { uint64_t ibuf, stamp; int32_t count, itype; uint32_t mx; } pl_mi;
+static pl_mi g_pl_mi[4096];
 static int pl_max_index(const p_draw_idx *di, uint32_t *mx) {
     if (!di->ibuf || di->count <= 0 || di->count > (1 << 20) || di->itype < 0 || di->itype > 2) return 0;
-    void *mb; uint64_t mo; size_t isz = di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4;
-    if (!mtl_addr(di->ibuf, (uint64_t)di->count * isz, &mb, &mo)) return 0;
+    void *mb; uint64_t mo; size_t isz = di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4, len = (size_t)di->count * isz;
+    if (!mtl_addr(di->ibuf, len, &mb, &mo)) return 0;
+    if (nvn_pl_gpu_written((const void *)(uintptr_t)di->ibuf, len, pl_done_fn())) return 0;
+    pl_mi *c = &g_pl_mi[((di->ibuf >> 4) ^ (di->ibuf >> 17) ^ (uint64_t)di->count * 31) & 4095];
+    if (c->ibuf == di->ibuf && c->count == di->count && c->itype == di->itype && !nvn_dirty_since((const void *)(uintptr_t)di->ibuf, len, c->stamp)) { *mx = c->mx; return 1; }
+    uint64_t stamp = nvn_dirty_now(); nvn_dirty_protect((const void *)(uintptr_t)di->ibuf, len);
     uint32_t m = 0, restart = di->itype == 0 ? 0xff : di->itype == 1 ? 0xffff : 0xffffffffu;
     const uint8_t *p = (const uint8_t *)(uintptr_t)di->ibuf;
     for (int i = 0; i < di->count; i++) { uint32_t v = isz == 1 ? p[i] : isz == 2 ? ((const uint16_t *)p)[i] : ((const uint32_t *)p)[i]; if (v != restart && v > m) m = v; }
+    *c = (pl_mi){di->ibuf, stamp, di->count, di->itype, m};
     *mx = m; return 1;
 }
 static uint64_t pl_vb_extent(unsigned stream, uint64_t size) {
@@ -11893,8 +11904,8 @@ static void bind_vertex_streams(id<MTL4RenderCommandEncoder> en, NvShader *vs) {
         if(!(mask&(1u<<stream))){omitted++;continue;}
         void *mb;uint64_t mo,gpu;
         if(g_pl>0) {   // TOTK_PIPELINE: depth statistics host buffer, or a snapshot of recently CPU-written vertex data
-            void *pb;uint64_t po,pg;uint64_t n=pl_vb_extent(stream,S.vbuf[stream].size?S.vbuf[stream].size:UINT64_MAX/2);
-            if(plds_redirect(S.vbuf[stream].address,n,0,&pb,&pg)||pl_read(S.vbuf[stream].address,n,PLK_VB,&pb,&po,&pg)) {
+            void *pb;uint64_t pg;uint64_t full=S.vbuf[stream].size?S.vbuf[stream].size:UINT64_MAX/2;
+            if(plds_redirect(S.vbuf[stream].address,1,0,&pb,&pg)||pl_read_vb(S.vbuf[stream].address,full,pl_vb_extent,stream,&pb,&pg)) {
                 enc_r_vbuf(en,16+stream,pg);use_rec("buf",S.vbuf[stream].address,S.vbuf[stream].size,0,NULL);bound++;continue;
             }
         }
