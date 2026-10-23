@@ -12229,12 +12229,21 @@ static void dispatch(const p_dispatch *dp) {
     if (!tg[0]) { RED_ONCE(29, "计算着色器缺线程组大小反射"); return; }
     rp_end();
     int reuse = disp_reuse_on() && !pg_on();
+    /* TOTK_DISP_PREARGS (default on): when this dispatch opens the compute encoder after a streamed render pass, disp_enc
+       first waits for the encode stage to finish that pass (rs_sync, ~5% of the replay in the world). The dispatch's
+       arguments only go to g_ct, the compute argument table that only this thread writes and that each dispatch snapshots,
+       and to the arena, so they are resolved before that wait and overlap it. Same table contents, same commands in the
+       same order; should resolving them need a copy (a texture created or recreated on the spot), that copy opens the
+       encoder itself and the dispatch follows it behind the usual barrier, as any later dispatch does. */
+    static int prearg = -1; if (prearg < 0) { const char *e = getenv("TOTK_DISP_PREARGS"); prearg = !(e && !atoi(e)); if (!prearg) MLOG("TOTK_DISP_PREARGS=0: compute arguments are resolved after the encoder opens"); }
+    int pre = reuse && prearg && !g_blit && g_rs_created;
+    g_dispatch_grid[0] = (uint32_t)dp->x; g_dispatch_grid[1] = (uint32_t)dp->y; g_dispatch_grid[2] = (uint32_t)dp->z;
+    if (pre) encode_args(nil, cs, 5, 0);   // binds through g_ct only (enc_c_args ignores the encoder)
     id<MTLComputeCommandEncoder> ce;
     if (reuse) ce = disp_enc();
     else { if (g_blit) { enc_b_end(g_blit); g_blit = nil; } ce = pg_compute(); }
     enc_c_pso(ce, ps);
-    g_dispatch_grid[0] = (uint32_t)dp->x; g_dispatch_grid[1] = (uint32_t)dp->y; g_dispatch_grid[2] = (uint32_t)dp->z;
-    encode_args(ce, cs, 5, 0);
+    if (!pre) encode_args(ce, cs, 5, 0);
     if (atomic_load(&g_draw_log) > 0) MLOG("[uw] F%llu pass %llu dispatch cs %.8s grid %dx%dx%d", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, cs->key, dp->x, dp->y, dp->z);
     enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(tg[0], tg[1], tg[2]));
     if (!reuse) enc_c_end(ce);
