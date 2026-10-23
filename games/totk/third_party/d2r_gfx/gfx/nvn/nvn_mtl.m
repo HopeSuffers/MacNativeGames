@@ -973,6 +973,7 @@ static int usnap_index_on(void) {
     return v;
 }
 static void usnap_copy_one(usnap_t *c);
+static uint64_t usnap_copy_run(_Atomic int *next, int n);
 static const usnap_t *usnap_find_slow(uint64_t a, uint64_t n, int wait) {   // wait: copy a pending entry now / wait for a helper (bindings); 0: not ready = not found (copy routine)
     if (!g_nusnap || !n) return NULL;
     int i = usnap_first(a);
@@ -1711,11 +1712,8 @@ static void *ush_main(void *arg) {
     (void)arg; pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     for (;;) {
         dispatch_semaphore_wait(g_ush_sem, DISPATCH_TIME_FOREVER);
-        int n = atomic_load_explicit(&g_ush_n, memory_order_acquire); uint64_t did = 0;
-        for (;;) {
-            int i = atomic_fetch_add(&g_ush_next, 1); if (i >= n) break;
-            int exp = US_PENDING; if (atomic_compare_exchange_strong(&g_usnap[i].st, &exp, US_COPYING)) { usnap_copy_one(&g_usnap[i]); did++; }
-        }
+        int n = atomic_load_explicit(&g_ush_n, memory_order_acquire);
+        uint64_t did = usnap_copy_run(&g_ush_next, n);
         atomic_fetch_add(&g_usnap_helped, did);
         atomic_fetch_sub_explicit(&g_ush_busy, 1, memory_order_release);
     }
@@ -1813,28 +1811,61 @@ static void usnap_take(const uint64_t *h, int n, const usnap_cap *cap) {
     g_usnap_pend_n = g_npend;   // the copies (helpers or the replay itself) overlay only the pending writes known now
     int helpers = ush_count();
     if (helpers && g_nusnap) { atomic_store(&g_ush_next, 0); atomic_store_explicit(&g_ush_n, g_nusnap, memory_order_release); atomic_store_explicit(&g_ush_busy, helpers, memory_order_release); for (int k = 0; k < helpers; k++) dispatch_semaphore_signal(g_ush_sem); }
-    else for (int i = 0; i < g_nusnap; i++) { int exp = US_PENDING; if (atomic_compare_exchange_strong(&g_usnap[i].st, &exp, US_COPYING)) usnap_copy_one(&g_usnap[i]); }
+    else { _Atomic int next = 0; usnap_copy_run(&next, g_nusnap); }
     g_usnap_t[2] += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tq2;
 }
-static void usnap_copy_one(usnap_t *c) {   // the entry is COPYING and ours; lookups inside never wait (memory, as before)
+/* The copy itself; the caller has the fault guard armed. */
+static void usnap_copy_body(usnap_t *c) {
     size_t sz = (size_t)(c->hi - c->lo);
+    if (g_usnap_cap) ucap_read(g_usnap_cap, c->lo, c->cpu, sz);   // captured bytes plus earlier submissions' writes not yet executed
+    else memcpy(c->cpu, (const void *)(uintptr_t)c->lo, sz);     // memory plus writes of earlier submissions not yet executed
+    pend_overlay_x(c->lo, c->cpu, sz, 0, 0);
+    int exp = US_COPYING; atomic_compare_exchange_strong_explicit(&c->st, &exp, US_READY, memory_order_release, memory_order_relaxed);   // stays DROPPED if a GPU write hit it meanwhile
+}
+static void usnap_copy_fault(usnap_t *c) {   // a guarded copy of c faulted: drop the entry (its readers use memory)
+    atomic_store_explicit(&c->st, US_DROPPED, memory_order_release);
+    uint64_t k = atomic_fetch_add(&g_usnap_faults, 1);
+    if (k < 4) MLOG("【红】uniform 快照拷贝读到不可访问的地址（段 %#llx+%zu，第 %llu 次）：这一段改读内存", (unsigned long long)c->lo, (size_t)(c->hi - c->lo), (unsigned long long)k + 1);
+}
+static void usnap_copy_one(usnap_t *c) {   // the entry is COPYING and ours; lookups inside never wait (memory, as before)
     /* The reads below touch guest memory and the sources of pending GPU copies; a page the game unmapped meanwhile faults.
        Guarded: the fault drops this entry (its readers use memory, as for a GPU-written range) instead of ending the process
        (2026-10-16: a helper thread died with SIGBUS once in ~12 sessions). */
     sigjmp_buf jb;
     if (sigsetjmp(jb, 1) == 0) {
         runtime_fault_guard = &jb;
-        if (g_usnap_cap) ucap_read(g_usnap_cap, c->lo, c->cpu, sz);   // captured bytes plus earlier submissions' writes not yet executed
-        else memcpy(c->cpu, (const void *)(uintptr_t)c->lo, sz);     // memory plus writes of earlier submissions not yet executed
-        pend_overlay_x(c->lo, c->cpu, sz, 0, 0);
+        usnap_copy_body(c);
         runtime_fault_guard = NULL;
-        int exp = US_COPYING; atomic_compare_exchange_strong_explicit(&c->st, &exp, US_READY, memory_order_release, memory_order_relaxed);   // stays DROPPED if a GPU write hit it meanwhile
     } else {
         runtime_fault_guard = NULL;
-        atomic_store_explicit(&c->st, US_DROPPED, memory_order_release);
-        uint64_t k = atomic_fetch_add(&g_usnap_faults, 1);
-        if (k < 4) MLOG("【红】uniform 快照拷贝读到不可访问的地址（段 %#llx+%zu，第 %llu 次）：这一段改读内存", (unsigned long long)c->lo, sz, (unsigned long long)k + 1);
+        usnap_copy_fault(c);
     }
+}
+/* TOTK_USNAP_BATCH (default on; =0 the guard per entry), 2026-10-24: the helpers (and the replay without helpers) claim
+   entries through *next up to n and copy them under one fault guard. sigsetjmp with the mask saved makes two system calls
+   on Darwin (sigprocmask, sigaltstack): per entry that was ~60% of a helper's busy time at Kakariko (prof-kak-best). The
+   mask must be saved (the handler runs with SIGSEGV / SIGBUS blocked; see copy_token_intact in hle_nvn.c). A fault drops
+   the entry being copied and arms the guard again for the rest. Returns the entries copied. */
+static int usnap_batch_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_USNAP_BATCH"); v = !(e && !atoi(e)); } return v; }
+static uint64_t usnap_copy_run(_Atomic int *next, int n) {
+    volatile uint64_t did = 0;
+    if (!usnap_batch_on()) {
+        for (;;) { int i = atomic_fetch_add(next, 1); if (i >= n) break;
+                   int exp = US_PENDING; if (atomic_compare_exchange_strong(&g_usnap[i].st, &exp, US_COPYING)) { usnap_copy_one(&g_usnap[i]); did++; } }
+        return did;
+    }
+    usnap_t *volatile cur = NULL;
+    sigjmp_buf jb;
+again:
+    if (sigsetjmp(jb, 1)) { runtime_fault_guard = NULL; if (cur) usnap_copy_fault(cur); cur = NULL; goto again; }
+    runtime_fault_guard = &jb;
+    for (;;) {
+        int i = atomic_fetch_add(next, 1); if (i >= n) break;
+        int exp = US_PENDING;
+        if (atomic_compare_exchange_strong(&g_usnap[i].st, &exp, US_COPYING)) { cur = &g_usnap[i]; usnap_copy_body(&g_usnap[i]); cur = NULL; did++; }
+    }
+    runtime_fault_guard = NULL;
+    return did;
 }
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
     g_copy_n++; g_copy_split += g_enc != nil;
@@ -15896,6 +15927,24 @@ int mtl_probe_ubo_snapshot(void) {
         if (runtime_fault_guard) MDIE("ubo snapshot probe: the fault guard was left set");
         munmap(pg, 16384); free(buf); checked++;
         MLOG("ubo snapshot probe: a copy from an unreadable page was dropped by the fault guard (faults %llu)", (unsigned long long)atomic_load(&g_usnap_faults));
+        /* the batched guard (usnap_copy_run): readable, unreadable, readable -> ready, dropped, ready, with the bytes */
+        pg = mmap(NULL, 16384, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0); if (pg == MAP_FAILED) MDIE("ubo snapshot probe: mmap");
+        uint8_t src[2][64], dst[3][64]; for (int i = 0; i < 64; i++) { src[0][i] = (uint8_t)(i * 7 + 1); src[1][i] = (uint8_t)(i * 13 + 5); }
+        usnap_t es[3] = {{.lo = (uint64_t)(uintptr_t)src[0], .hi = (uint64_t)(uintptr_t)src[0] + 64, .cpu = dst[0]},
+                         {.lo = (uint64_t)(uintptr_t)pg, .hi = (uint64_t)(uintptr_t)pg + 64, .cpu = dst[1]},
+                         {.lo = (uint64_t)(uintptr_t)src[1], .hi = (uint64_t)(uintptr_t)src[1] + 64, .cpu = dst[2]}};
+        for (int i = 0; i < 3; i++) atomic_store(&es[i].st, US_PENDING);
+        usnap_t *u0 = g_usnap; int n0 = g_nusnap; cap0 = g_usnap_cap; f0 = atomic_load(&g_usnap_faults);
+        g_usnap = es; g_nusnap = 3; g_usnap_cap = NULL;
+        _Atomic int next = 0; uint64_t did = usnap_copy_run(&next, 3);
+        g_usnap = u0; g_nusnap = n0; g_usnap_cap = cap0;
+        if (atomic_load(&es[0].st) != US_READY || atomic_load(&es[1].st) != US_DROPPED || atomic_load(&es[2].st) != US_READY || (usnap_batch_on() && did != 2)   // the per-entry path counts claimed entries
+            || memcmp(dst[0], src[0], 64) || memcmp(dst[2], src[1], 64) || atomic_load(&g_usnap_faults) != f0 + 1)
+            MDIE("ubo snapshot probe: batched copy states %d %d %d, copied %llu, faults %llu -> %llu", atomic_load(&es[0].st), atomic_load(&es[1].st), atomic_load(&es[2].st),
+                 (unsigned long long)did, (unsigned long long)f0, (unsigned long long)atomic_load(&g_usnap_faults));
+        if (runtime_fault_guard) MDIE("ubo snapshot probe: the batched fault guard was left set");
+        munmap(pg, 16384); checked++;
+        MLOG("ubo snapshot probe: the batched copy dropped only the unreadable entry (batch %s)", usnap_batch_on() ? "on" : "off");
     }
     atomic_store(&g_usnap_on, 1); g_usnap_drop_off = 0; g_usnap_index_negative=0;
     mtl_pool_del(mem); return checked;
