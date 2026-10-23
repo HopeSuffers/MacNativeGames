@@ -141,6 +141,15 @@ int main(int argc, char **argv) {
     EXPECT("unprotected page of the range read-only again", 1, page_writable(11 * P));
     EXPECT("page of the non-static range read-only", 1, page_writable(10 * P));
     { nvn_pl_hold_rec h[8]; int n = nvn_pl_holds(h, 8); EXPECT("hold records kept", 1, n >= 2); }
+    {   // a page whose other part the CPU writes after every release is left writable after 4 passes (TOTK_PIPELINE_PASSKEEP)
+        publish1(15, M + 14 * P, M + 14 * P + 64); nvn_pl_set_released(15, 14); atomic_store(&g_done_fence, 14);
+        int prot = 0;
+        for (int i = 0; i < 4; i++) { nvn_pl_protect_span((const void *)(M + 14 * P), 64); prot += page_writable(14 * P) == 1; t_handle = 7; g_mem[14 * P + 8192] = (uint8_t)i; }
+        EXPECT("protected again after each of the first 4 passes", 4, prot);
+        nvn_pl_protect_span((const void *)(M + 14 * P), 64);
+        EXPECT("then left writable", 2, page_writable(14 * P));
+        uint64_t v[NVN_PLS_N]; nvn_pl_stats(v); EXPECT("counted", 1, v[NVN_PLS_PASSKEEP]);
+    }
     if (dry) {   // TOTK_PIPELINE_RWATCH
         uintptr_t pg = M + 12 * P, pg2 = M + 13 * P; uintptr_t two[2] = {pg2, pg};
         nvn_dirty_protect((const void *)pg2, P);   // the tracker wants page 13 read-only
