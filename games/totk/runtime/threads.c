@@ -81,6 +81,7 @@ typedef struct thr {
     uint64_t yrun_ns, yrun_svc;   // the current run of yields: when it started, and nsvc at its last yield (yield_backoff_ns)
     int eco_epoch;                // g_eco_epoch this thread last applied (eco_apply)
     int is_main;                  // the game's main thread (svc_thread_main_init)
+    int resume_first;             // TOTK async preemption: took the core away in the signal handler; gets it back first (core_grant)
     uint64_t cpu_prev_us;         // TOTK_THREAD_CPU: CPU time at the previous report
 #ifdef GAME_BOTW
     uint64_t cwait_ns;            // when it last queued for a virtual core (starvation rule, core_beats)
@@ -236,6 +237,7 @@ static int eff_prio(const thr_t *o) {
     return p;
 }
 #endif
+static int async_waiter_ok(const thr_t *t);
 static void core_grant(int c) {   // holding G: give free core c to the best waiter
     thr_t *b = NULL, **bp = NULL;
 #ifdef GAME_BOTW
@@ -249,12 +251,20 @@ static void core_grant(int c) {   // holding G: give free core c to the best wai
     if (b) b->cqueued = 0;
 #else
     if (g_tk_async) {   // by effective priority (inheritance), then first come
-        int bpri = 0;
+        int bpri = 0; thr_t *r = NULL, **rp = NULL;
         for (thr_t **p = &g_core_wait; *p; p = &(*p)->cnext) {
             if (!core_allowed(*p, c)) continue;
             int pr = eff_prio(*p);
             if (!b || pr < bpri || (pr == bpri && (*p)->cseq < b->cseq)) { b = *p; bp = p; bpri = pr; }
+            if ((*p)->resume_first && (!r || (*p)->cseq < r->cseq)) { r = *p; rp = p; }
         }
+        /* A thread the signal took the core from gets it back before every waiter that is not itself allowed to signal
+           (async_waiter_ok): the preemption only inserts the better thread's run. Otherwise a waiter of middle priority
+           took the core next and spun on work behind a guest mutex the preempted thread held (save-load livelock with
+           the pipeline, hr-both3-4: 0x1006 priority 48 spinning on core 1, 0x1011 priority 52 owning the mutex 0x1010 /
+           0x1012 waited on, queued for core 1). */
+        if (r && b != r && !async_waiter_ok(b)) { b = r; bp = rp; }
+        if (b) b->resume_first = 0;
     } else
     for (thr_t **p = &g_core_wait; *p; p = &(*p)->cnext)
         if (core_allowed(*p, c) && (!b || (*p)->prio < b->prio || ((*p)->prio == b->prio && (*p)->cseq < b->cseq))) { b = *p; bp = p; }
@@ -332,8 +342,14 @@ static int async_preempt_on(void) {   // holding G
    signals; hr-pr-1). The stall being fixed is the main thread and the job workers (44) and the 30-32 system threads
    waiting behind a priority-58 thread's 30 ms of guest code (RESULTS.md 2026-10-24). */
 static int async_waiter_ok(const thr_t *t) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_ASYNC_PREEMPT_MAXW"); v = e ? atoi(e) : 44; } return eff_prio(t) <= v; }
+/* TOTK_ASYNC_PREEMPT_MINO=<priority> (default 55): and only owners at that priority or worse are signalled. With owners
+   of any worse priority signalled, the job workers (44) took the cores from the priority 48-54 loader threads at every
+   turn and the save load never finished (hr-both4-2, GPU busy, workers spinning on locks / yields). The stall being fixed
+   is a priority-58 thread's 30 ms of guest code without an SVC. */
+static int async_owner_ok(const thr_t *o) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_ASYNC_PREEMPT_MINO"); v = e ? atoi(e) : 55; } return eff_prio(o) >= v; }
 #else
 static int async_waiter_ok(const thr_t *t) { (void)t; return 1; }
+static int async_owner_ok(const thr_t *o) { (void)o; return 1; }
 #endif
 static int core_kick(thr_t *t) {   // holding G, t waiting: mark (and signal) the owners t may preempt; returns how many
     int n = 0; uint64_t now = now_ns();
@@ -341,7 +357,7 @@ static int core_kick(thr_t *t) {   // holding G, t waiting: mark (and signal) th
         thr_t *o = g_core_owner[i];
         if (!o || !core_allowed(t, i) || !core_beats(t, o, now)) continue;
         __atomic_store_n(&o->preempt, 1, __ATOMIC_RELEASE); n++;
-        if (async_preempt_on() && async_waiter_ok(t) && !pthread_kill(o->pt, SIGUSR2)) g_preempt_kicks++;
+        if (async_preempt_on() && async_waiter_ok(t) && async_owner_ok(o) && !pthread_kill(o->pt, SIGUSR2)) g_preempt_kicks++;
     }
     return n;
 }
@@ -460,7 +476,7 @@ static void preempt_signal(int sig, siginfo_t *si, void *context) {
     if (!runtime_hle_tsd_off || !*(volatile uintptr_t *)(tp + runtime_hle_tsd_off) || !runtime_guest_code_pc(pc)) return;
     int saved = errno;
     pthread_mutex_lock(&G);
-    if (t->cur_core >= 0 && core_should_yield(t)) { core_put(t); core_take(t); g_preempt_async++; }
+    if (t->cur_core >= 0 && core_should_yield(t)) { t->resume_first = 1; core_put(t); core_take(t); t->resume_first = 0; g_preempt_async++; }
     else t->preempt = 0;
     pthread_mutex_unlock(&G);
     errno = saved;
