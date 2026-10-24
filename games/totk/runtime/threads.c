@@ -320,7 +320,7 @@ static int async_preempt_on(void) {   // holding G
 #ifdef GAME_BOTW
         g_async_preempt = !(e && !strcmp(e, "0"));
 #else
-        g_async_preempt = e && *e && strcmp(e, "0");   /* Tears of the Kingdom: off unless asked for */
+        g_async_preempt = !(e && !strcmp(e, "0"));   /* Tears of the Kingdom: on since 2026-10-24 (narrowed: MAXW / MINO); TOTK_ASYNC_PREEMPT=0 off */
 #endif
         if (g_async_preempt) {
             struct sigaction a = {0}; a.sa_sigaction = preempt_signal; a.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
@@ -647,7 +647,7 @@ uint32_t svc_thread_main_init(void) {
     g_main_handle = t->handle;
 #else
     { const char *e = getenv("TOTK_ASYNC_PREEMPT");   // before any other guest thread exists: afterwards g_tk_async is only read
-      if (e && *e && strcmp(e, "0")) { pthread_mutex_lock(&G); g_tk_async = async_preempt_on(); pthread_mutex_unlock(&G); } }
+      if (!(e && !strcmp(e, "0"))) { pthread_mutex_lock(&G); g_tk_async = async_preempt_on(); pthread_mutex_unlock(&G); } }
 #endif
     pthread_setspecific(g_keythr, t);
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;

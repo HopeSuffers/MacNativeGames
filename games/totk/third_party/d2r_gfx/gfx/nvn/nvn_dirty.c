@@ -7,6 +7,7 @@
 // (measured: the game writes streamed assets into texture storage that is still being sampled, without re-registering).
 // Signal handler constraint: the page-fault path uses only atomic operations and mprotect, no allocation, no locks.
 #include "nvn_dirty.h"
+#include <TargetConditionals.h>
 #include "../../host/dm.h"
 #include <stdatomic.h>
 #include <pthread.h>
@@ -224,7 +225,9 @@ static int g_pl_wwhold;   // TOTK_PIPELINE_WWHOLD=1: also hold CPU writes that o
 static _Atomic uintptr_t g_pl_uring[PL_URING]; static _Atomic uint64_t g_pl_uring_n; static uint64_t g_pl_uring_cur;
 static void pl_init(void) {
     if (g_pl_mode >= 0) return;
-    const char *e = getenv("TOTK_PIPELINE"); int m = e ? atoi(e) : 0;
+    /* Default on for the Mac since 2026-10-24 (with TOTK_ASYNC_PREEMPT): full bench +7.9% / +12.3% average, 1% low equal,
+       poses within noise (RESULTS.md); TOTK_PIPELINE=0 turns it off. iOS: off unless asked for (not measured there). */
+    const char *e = getenv("TOTK_PIPELINE"); int m = e ? atoi(e) : !TARGET_OS_IPHONE;
     e = getenv("TOTK_PIPELINE_PASSKEEP"); if (e) g_pl_passkeep = atoi(e) != 0;
     e = getenv("TOTK_PIPELINE_WWHOLD"); if (e) g_pl_wwhold = atoi(e) != 0;
     g_pl_mode = m == 1 || m == 2 ? m : 0;
