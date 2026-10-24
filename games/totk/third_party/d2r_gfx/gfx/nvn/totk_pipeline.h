@@ -107,6 +107,10 @@ static inline uint64_t plh_in(int cat) {
     return g_plh_rnd & 15 ? 0 : pl_now();
 }
 static inline void plh_out(int cat, uint64_t t0) { g_plh_depth--; if (t0) g_plh_t[cat] += (pl_now() - t0) * 16; }
+/* 2026-10-24: the snapshot / decision timers of pl_read_i and pl_write_i read the clock on every call (~10% of pl_read,
+   2% of a draw on the translate thread, tl-dghot); sampled 1 in 16 like the hooks, scaled when added. */
+static uint32_t g_pls_rnd = 0x2545f491u;
+static inline uint64_t pls_t0(void) { g_pls_rnd ^= g_pls_rnd << 13; g_pls_rnd ^= g_pls_rnd >> 17; g_pls_rnd ^= g_pls_rnd << 5; return g_pls_rnd & 15 ? 0 : pl_now(); }
 
 /* ---------- per submission (replay thread) ---------- */
 typedef struct { uint64_t lo, hi, gpu, off; void *buf; uint32_t gen; int8_t snap, kind; } pl_memo;
@@ -403,7 +407,7 @@ static size_t arena_alloc_u(size_t n, __unsafe_unretained id<MTLBuffer> *buf, ui
 static void pl_write_i(uint64_t a, uint64_t n) {
     if (g_pl <= 0 || !a || !n) return;
     for (int j = 0; j < g_plds_ln; j++) if (a >= g_plds_llo[j] && a + n <= g_plds_lhi[j]) { const plds_t *d = &g_plds[g_plds_li[j]]; if (d->state == 2 || d->state == 3) return; }   // its bindings write the host buffer
-    uint64_t t0 = pl_now();
+    uint64_t t0 = pls_t0();
     nvn_pl_gpu_write((const void *)(uintptr_t)a, (size_t)n, g_fence + 1);
     pl_rng_add(a, a + n, 1, 1); g_pls_st.writes++; g_pl_wep++;
     if (g_plsr_n && a < g_plsr_hi && a + n > g_plsr_lo)
@@ -413,7 +417,7 @@ static void pl_write_i(uint64_t a, uint64_t n) {
             pl_memo *m = &g_plm[r->slot]; if (m->gen == g_plm_gen && m->lo == r->lo && m->hi == r->hi) { m->snap = 0; m->gpu = 0; }   // from here on: memory
             r->gen = 0; g_pls_st.snap_drops++; g_usnap_drops++;   // g_usnap_drops is in the binding caches' context (cbc_ctx, arg_epoch_key): a cached address of the dropped copy misses
         }
-    g_pls_st.ns += pl_now() - t0;
+    if (t0) g_pls_st.ns += (pl_now() - t0) * 16;
 }
 static void pl_write(uint64_t a, uint64_t n) { if (g_pl <= 0 || !a || !n) return; uint64_t t = plh_in(PLH_WRITE); pl_write_i(a, n); plh_out(PLH_WRITE, t); }
 /* The decision for a GPU read of [a, a+n) (clamped to its pool): memoised per submission, a static one kept across
@@ -476,15 +480,15 @@ static int pl_read_i(uint64_t a, uint64_t n, int kind, void **buf, uint64_t *off
     }
     int fresh = 0; pl_memo *m = pl_memo_find(a, a + n, &fresh);
     if (m && !fresh) { g_pls_st.memo_hits++; if (m->snap > 0) { *buf = m->buf; *off = m->off; *gpu = m->gpu; return 1; } return 0; }
-    uint64_t t0 = pl_now();
+    uint64_t t0 = pls_t0();
     if (c == 1 && (n > (64u << 20) ? (n = pl_clamp(a, n)) : n) <= g_pl_snap_max && g_pl_sub_bytes + n > g_pl_budget) g_pls_st.over_budget++;
     else if (c == 1 && n <= g_pl_snap_max) {
-        uint64_t t1 = pl_now();
+        uint64_t t1 = t0 ? pl_now() : 0;
         __unsafe_unretained id<MTLBuffer> ab; uint8_t *acpu; uint64_t agpu; size_t ao = arena_alloc_u((size_t)n, &ab, &acpu, &agpu);
         sigjmp_buf jb; int ok = 0;
         if (sigsetjmp(jb, 1) == 0) { runtime_fault_guard = &jb; memcpy(acpu, (const void *)(uintptr_t)a, (size_t)n); ok = 1; }
         runtime_fault_guard = NULL;
-        g_pls_st.snap_ns += pl_now() - t1;
+        if (t1) g_pls_st.snap_ns += (pl_now() - t1) * 16;
         if (ok) {
             g_pls_st.snaps[kind]++; g_pls_st.snap_bytes += n; g_pl_sub_bytes += n;
             if (m) {
@@ -495,7 +499,7 @@ static int pl_read_i(uint64_t a, uint64_t n, int kind, void **buf, uint64_t *off
             }
             if (g_pl_log > 0) { g_pl_log--; MLOG("[pipeline] F%llu %s %#llx+%llu snapshot (volatile pages)", (unsigned long long)atomic_load(&g_cur_frame), g_plk_name[kind], (unsigned long long)a, (unsigned long long)n); }
             *buf = (__bridge void *)ab; *off = ao; *gpu = agpu;
-            g_pls_st.ns += pl_now() - t0;
+            if (t0) g_pls_st.ns += (pl_now() - t0) * 16;
             return 1;
         }
     }
@@ -503,7 +507,7 @@ static int pl_read_i(uint64_t a, uint64_t n, int kind, void **buf, uint64_t *off
     g_pls_st.live[kind]++;
     if (kind != PLK_TX || g_pl_texhold) pl_rng_add(a, a + n, 1, 0);
     if (m) { m->snap = 0; m->kind = (int8_t)kind; }
-    g_pls_st.ns += pl_now() - t0;
+    if (t0) g_pls_st.ns += (pl_now() - t0) * 16;
     return 0;
 }
 static int pl_read(uint64_t a, uint64_t n, int kind, void **buf, uint64_t *off, uint64_t *gpu) {
