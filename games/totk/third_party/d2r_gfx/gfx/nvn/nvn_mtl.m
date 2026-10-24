@@ -6410,6 +6410,7 @@ static MTLBlendOperation bop(int e) { switch (e) { case 2: return MTLBlendOperat
 // Pipeline: cached by (program, target formats, blend / write mask, vertex layout, sample count)
 static const uint8_t *g_pso_lmap; static id<MTLFunction> g_pso_fsfn; static pso_fz_desc g_pso_fz, g_fz_desc;
 static id<MTLFunction> g_pso_fbfn;   // TOTK: this draw's fragment function reading its own attachments from the tile (att_fb_take), nil = none
+static char g_pso_fbrec[256];   // TOTK: its recipe "aid:att;..." (att_fb_take), for the T row of the warm-up list (pso_get)
 static os_unfair_lock g_fz_fn_lock = OS_UNFAIR_LOCK_INIT;
 static NSMutableDictionary<NSString *, id<MTLFunction>> *g_bf_fn_cache;
 static NSMutableDictionary<NSString *, id<MTLLibrary>> *g_bf_lib_cache;
@@ -7338,6 +7339,13 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     if (g_vmissing) { if (!fbread) { bfn = nil; k.fsfn = NULL; } k.a2c &= ~PSO_VBORDER; k.vs = (__bridge void *)vs; }
     __unsafe_unretained id<MTLRenderPipelineState> cached = (__bridge id<MTLRenderPipelineState>)hm_get_ptr(&g_pso, &k);
     if (cached) { if (g_vmissing) atomic_fetch_add_explicit(&g_stat_variant_plain, 1, memory_order_relaxed); return cached; }
+    /* A tile-reading pipeline (att_fb_take) was recorded only as its plain R row, so the warm-up never built it and every
+       session compiled it in play: about 4,750 pipelines per UltraCam run, frames of 0.3-1 s (2026-10-24). Its T row names
+       the variant (aid:att pairs) so the warm-up builds it into the archive (warm_tileread). */
+    if (fbread && g_pso_fbrec[0] && !(k.a2c & PSO_VBORDER)) {
+        pso_key rk = k; rk.fsfn = NULL; pso_skey tsk; char thex[sizeof tsk * 2 + 1]; pso_skey_from(&rk, vs, fs, 0, NULL, &tsk); pso_skey_hex(&tsk, thex);
+        pso_user_record("T\t%s\t%s\n", thex, g_pso_fbrec);
+    }
     NSString *brec = !g_vmissing && bordered ? [NSString stringWithFormat:@"%@\t%@", (k.a2c & PSO_VBORDER) && vrec ? vrec : @"-", bfn && frec ? frec : @"-"] : nil;
     if (plain && !g_vmissing && bordered && apso_defer(&k, vs, fs, bfn, brec)) {   // the border pipeline is compiling: the plain one meanwhile
         if (!fbread) { bfn = nil; k.fsfn = NULL; } k.a2c &= ~PSO_VBORDER; k.vs = (__bridge void *)vs; brec = nil;
@@ -7586,7 +7594,7 @@ static void warm_plan(NSArray<NSString *> *paths, NSArray<NSString *> *files, NS
                 if (g_warm_pipelines_only || !warm_available(c[1])) continue;
                 [keys addObject:c[1]];
             }
-            else if (([c[0] isEqualToString:@"R"] && c.count >= 2) || ([c[0] isEqualToString:@"B"] && c.count >= 4)) {
+            else if (([c[0] isEqualToString:@"R"] && c.count >= 2) || ([c[0] isEqualToString:@"B"] && c.count >= 4) || ([c[0] isEqualToString:@"T"] && c.count >= 3)) {
                 pso_skey sk; if (pso_skey_parse(c[1].UTF8String, &sk)) continue;
                 NSString *vs = warm_key(sk.vs, sizeof sk.vs), *fs = warm_key(sk.fs, sizeof sk.fs);
                 // Evaluate both so the missing-shader count remains deduplicated.
@@ -7635,6 +7643,31 @@ static int warm_border(NSArray<NSString *> *c, NSMutableDictionary<NSString *, N
     if (!ps) return 0;
     WarmItem *item = [WarmItem new]; item->kind = 1; item->vs_key = vkey; item->fs_key = fkey; item->vs = vs; item->fs = fs; item->pso = k; item->object = ps;
     item->vfn = vfn; item->bfn = bfn; item->vpatch_key = vk; item->bpatch_key = fk;
+    warm_enqueue(item); g_warm_rps++;
+    return 1;
+}
+/* A T row (pso_get): the pipeline with the fragment variant that reads the draw's own attachments from the tile
+   (att_fb_take / fs_fn_fbread), built from its aid:att pairs; the same variant object a draw gets later (fs->bpatch). */
+static int warm_tileread(NSArray<NSString *> *c, NSMutableDictionary<NSString *, NvShader *> *dict) {
+    pso_skey sk; if (pso_skey_parse(c[1].UTF8String, &sk) || sk.merged || sk.fz) return 0;
+    NSString *vkey = warm_key(sk.vs, sizeof sk.vs), *fkey = warm_key(sk.fs, sizeof sk.fs);
+    NvShader *vs = vkey.length ? warm_shader(dict, vkey, sk.vs_stage) : nil, *fs = fkey.length ? warm_shader(dict, fkey, sk.fs_stage) : nil;
+    if (!vs || !fs) return 0;
+    int aid[8], att[8], n = 0;
+    for (NSString *pair in [c[2] componentsSeparatedByString:@";"]) {
+        NSArray<NSString *> *q = [pair componentsSeparatedByString:@":"];
+        if (q.count != 2) continue;
+        if (n == 8) return 0;
+        aid[n] = q[0].intValue; att[n] = q[1].intValue; n++;
+    }
+    id<MTLFunction> fn = n ? fs_fn_fbread(fs, aid, att, n) : nil;
+    if (!fn) return 0;
+    pso_key k = sk.k; k.vs = (__bridge void *)vs; k.fs = (__bridge void *)fs; k.fsfn = (__bridge void *)fn;
+    NSError *e = nil; uint64_t ps_started = bp_now();
+    id ps = pso_new(pso_desc(&k, vs, fs, fn, 0), pso_archive_key(&k, vs, fs, 0), &e);
+    atomic_fetch_add(&g_warm_pipeline_ns, bp_now() - ps_started); atomic_fetch_add(&g_warm_pipeline_count, 1);
+    if (!ps) return 0;
+    WarmItem *item = [WarmItem new]; item->kind = 1; item->vs_key = vkey; item->fs_key = fkey; item->vs = vs; item->fs = fs; item->fsfn = fn; item->pso = k; item->object = ps;
     warm_enqueue(item); g_warm_rps++;
     return 1;
 }
@@ -7693,6 +7726,8 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
                         warm_enqueue(item); g_warm_rps++;
                     } else if ([c[0] isEqualToString:@"B"] && c.count >= 4) {
                         if (!warm_border(c, dict)) MLOG("【红】预热：边框色管线没建成（%s / %s）", c[2].UTF8String, c[3].UTF8String);
+                    } else if ([c[0] isEqualToString:@"T"] && c.count >= 3) {
+                        if (!warm_tileread(c, dict)) { static int said; if (said++ < 8) MLOG("【红】预热：读 tile 的管线没建成（%s）", c[2].UTF8String); }
                     } else if ([c[0] isEqualToString:@"C"] && c.count >= 2) {
                         NSString *key = c[1]; if (!key.length) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
                         NvShader *cs = warm_shader(dict, key, 5);
@@ -9471,6 +9506,7 @@ static id<MTLFunction> att_fb_take(NvProg *pr, uint64_t *rs, int *n) {
             if (b->kind == NVN_RB_IMG) h = b->reg < 32 ? S.img[sh->stage][b->reg] : 0; else if (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) h = b->reg < 128 ? S.tex[sh->stage][b->reg] : 0; else continue;
             if (h && has_ser(took, nt, h_ser(h))) return nil; } }
     id<MTLFunction> fn = fs_fn_fbread(fs, aid, att, k);
+    if (fn) { int o = 0; g_pso_fbrec[0] = 0; for (int i = 0; i < k && o < (int)sizeof g_pso_fbrec - 24; i++) o += snprintf(g_pso_fbrec + o, sizeof g_pso_fbrec - o, "%d:%d;", aid[i], att[i]); }
     if (!fn) return nil;
     int m = 0; for (int i = 0; i < *n; i++) if (!has_ser(took, nt, rs[i])) rs[m++] = rs[i];
     *n = m; return fn;
