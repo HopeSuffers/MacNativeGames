@@ -746,6 +746,16 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     uintptr_t a = lo & ~(pg - 1), b = (hi + pg - 1) & ~(pg - 1);
     pool_range_check(a, b, mem, size);
     id<MTLBuffer> buf = [g_dev newBufferWithBytesNoCopy:(void *)a length:b - a options:MTLResourceStorageModeShared deallocator:nil];
+    /* TOTK (2026-10-24, crash at boot 12:36): Metal refused the zero-copy buffer while pipelining had pages of the range
+       write-protected (a guest thread was faulting on one at the same moment). Retry with the tracked pages writable for
+       the call (nvn_dirty_gpu_write_begin / _end restore them), then a few more times before giving up. */
+    for (int k = 0; !buf && k < 8; k++) {
+        void *tok = nvn_dirty_tracked((void *)a, b - a) ? nvn_dirty_gpu_write_begin((void *)a, b - a) : NULL;
+        buf = [g_dev newBufferWithBytesNoCopy:(void *)a length:b - a options:MTLResourceStorageModeShared deallocator:nil];
+        nvn_dirty_gpu_write_end(tok);
+        MLOG("【红】内存池 %p+%#llx 零拷贝缓冲第 %d 次重试%s（保护页 %s）", mem, (unsigned long long)size, k + 1, buf ? "成功" : "失败", tok ? "临时解开" : "无");
+        if (!buf) usleep(2000 << k);
+    }
     if (!buf) MDIE("内存池 %p+%#llx 建零拷贝缓冲失败", mem, (unsigned long long)size);
     pthread_mutex_lock(&g_mu);
     if (pidx_overlaps(&g_pools, lo, hi)) { static int said; if (said++ < 8) MLOG("memory pool %p+%#llx overlaps a registered pool (%d live)", mem, (unsigned long long)size, g_pools.n); }
