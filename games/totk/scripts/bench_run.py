@@ -38,6 +38,28 @@ SCENE_HOUR = {'Kakariko': 12, 'Lookout Landing': 11, 'Great Sky Island': 20, 'Ko
 ALL_SCENES = 6
 
 
+def find_clock(s, attempts=8):
+    """survey clockfind until the group found holds the game's own clock (a value 0xd4428 into a 1 MiB-aligned heap
+    block in 1.2.1, world_survey.c): other timers of the same rate give a wrong sky; one scan in ~3 found one of them
+    (2026-10-24: 11669 s / 0 values instead of ~24800 s in p-pp-* runs, pose 040 at noon instead of 20:00). The last
+    group found stays set if none of the attempts finds the game's clock (reported)."""
+    found = None
+    for attempt in range(attempts):
+        s.send('survey clockfind')
+        addrs = []
+        while True:
+            line = s.wait(r'\[survey\] (clock value at|time of day: )', 90)
+            if not line or 'time of day: ' in line: break
+            addrs.append(int(line.split(' at ')[1].split()[0], 16))
+        found = line
+        if any((a & 0xfffff) == 0xd4428 for a in addrs):
+            return found
+        print(f'clock: attempt {attempt + 1} found {len(addrs)} values without the game clock; again', flush=True)
+        time.sleep(2)
+    print('clock: WARNING the game clock was not identified; scene hours may be wrong', flush=True)
+    return found
+
+
 class Session:
     def __init__(self, app, binary, out, env_extra, save=None, cache=None):
         self.out = out
@@ -156,12 +178,7 @@ def run(args):
         for c in args.cmd:   # extra input-file commands for the session (e.g. "flag <name> 1" for an A/B)
             s.send(c)
         time.sleep(3)
-        for attempt in range(4):   # the time-of-day clock, for the scenes' hours (it stands still until the world runs)
-            s.send('survey clockfind')
-            found = s.wait(r'\[survey\] time of day: ', 90)
-            if found and 'are not set' not in found:
-                break
-            time.sleep(2)
+        found = find_clock(s)
         print('clock:', found.strip() if found else 'not found', flush=True)
         time.sleep(max(0.0, args.start_delay - (time.time() - t_in)))
         for sc in scenes:
