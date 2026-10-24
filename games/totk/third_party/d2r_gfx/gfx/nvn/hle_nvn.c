@@ -993,7 +993,50 @@ typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uin
 #endif
 static _Atomic uint64_t g_copy_bytes;   /* live recording-copy bytes (logged with the copy count) */
 static copy_prefix *copy_of(NVNcommandHandle h) { copy_prefix *c = (copy_prefix *)(uintptr_t)h - 1; return c; }
+static uint8_t *flatten_recording_ops(const uint8_t *p);
+/* TOTK_FLATTEN_FAST (default on; =0 the op-by-op copy, =2 both and compare), 2026-10-24: a recording sits contiguous in
+   the recorder's one buffer (cmd_reserve reallocs it whole), so the copy is one exact-size allocation and one memcpy after
+   a header walk that checks the ops and works out what the op-by-op copy derives. The op-by-op copy grew its buffer from
+   4 KiB by doubling (realloc moved the bytes each time) and called memcpy per op: ~0.5 ms per frame on the game's main
+   thread at Kakariko (tl-dghot: memmove 51 + realloc 32 samples of 965 busy). A recording with a jump goes the old way. */
+static int flatten_fast_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_FLATTEN_FAST"); v = e ? atoi(e) : 1; } return v; }
 static uint8_t *flatten_recording(const uint8_t *p) {
+    int mode = flatten_fast_mode();
+    if (!mode) return flatten_recording_ops(p);
+    const uint8_t *q = p; int bulk_ok = 1, first = 1; uint32_t last_size = 0, end_size = 0;
+    for (;;) {
+        op_hdr h; memcpy(&h, q, sizeof h);
+        if (h.size < 8 || (h.size & 7)) die("corrupt recording at %p (op %u size %u)", (const void *)q, h.op, h.size);
+        if (h.op == OP_JUMP) return flatten_recording_ops(p);
+        if (h.op >= OP_COUNT_ || h.size > (64u << 20)) bulk_ok = 0;
+        if (first) { if (h.op != OP_BEGIN || h.size != 8) bulk_ok = 0; first = 0; }
+        else if (h.op == OP_BEGIN) bulk_ok = 0;
+        else if (h.op != OP_END) last_size = h.size;
+        q += h.size;
+        if (h.op == OP_END) { end_size = h.size; break; }
+    }
+    size_t len = (size_t)(q - p), n = sizeof(copy_prefix) + len;
+    uint8_t *out = malloc(n); if (!out) die("command copy allocation");
+    memcpy(out + sizeof(copy_prefix), p, len);
+    copy_prefix *c = (copy_prefix *)out; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits;
+#ifdef GAME_BOTW
+    c->used = 0;
+#endif
+    size_t body = n >= sizeof(copy_prefix) + 16 ? n - sizeof(copy_prefix) - 16 : 0;
+    c->body_bytes = bulk_ok && end_size == 8 && body <= UINT32_MAX ? (uint32_t)body : 0;
+    c->last_size = c->body_bytes ? last_size : 0;
+    g_copy_bytes += malloc_size(out);
+    if (mode == 2) {   /* self-check: the op-by-op copy must be byte-identical, prefix fields included */
+        uint8_t *ref = flatten_recording_ops(p); copy_prefix *r = (copy_prefix *)ref - 1;
+        static _Atomic uint64_t checked;
+        if (malloc_size(r) < n || memcmp(out + sizeof(copy_prefix), ref, len) || r->body_bytes != c->body_bytes || r->last_size != c->last_size)
+            die("TOTK_FLATTEN_FAST=2: fast copy differs (len %zu, body %u/%u, last %u/%u)", len, c->body_bytes, r->body_bytes, c->last_size, r->last_size);
+        g_copy_bytes -= malloc_size(r); free(r);
+        if (!(atomic_fetch_add(&checked, 1) % 20000)) LOG("[flatten] TOTK_FLATTEN_FAST=2: %llu recordings identical", (unsigned long long)checked + 1);
+    }
+    return out + sizeof(copy_prefix);
+}
+static uint8_t *flatten_recording_ops(const uint8_t *p) {
     size_t n = sizeof(copy_prefix), cap = 4096; uint8_t *out = malloc(cap);
     int bulk_ok = 1; uint32_t last_size = 0;
     if (!out) die("command copy allocation");
