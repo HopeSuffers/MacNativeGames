@@ -32,6 +32,7 @@
 #include <mach/mach.h>
 #include <pthread/qos.h>
 #include <dlfcn.h>
+int totk_tl_on(void) __attribute__((weak)); void totk_tl_at(int kind, uint64_t t_ns, uint64_t a, uint64_t b) __attribute__((weak));
 #include <unistd.h>
 #include <stdatomic.h>
 
@@ -85,6 +86,7 @@ typedef struct thr {
     int eco_epoch;                // g_eco_epoch this thread last applied (eco_apply)
     int is_main;                  // the game's main thread (svc_thread_main_init)
     int resume_first;             // TOTK async preemption: took the core away in the signal handler; gets it back first (core_grant)
+    uint32_t woke_by; int woke_by_prio;   // TOTK_MAIN_WAIT_MS: the thread that woke this one last (0: a host thread / timeout)
     uint64_t cpu_prev_us;         // TOTK_THREAD_CPU: CPU time at the previous report
 #ifdef GAME_BOTW
     uint64_t cwait_ns;            // when it last queued for a virtual core (starvation rule, core_beats)
@@ -177,6 +179,7 @@ static thr_t *pick(int kind, uint64_t a) {
 static void wake_queue(thr_t *t);   /* below, with the virtual cores */
 #endif
 static void wake(thr_t *t, int64_t res) { wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; pthread_cond_signal(&t->cv);
+    { thr_t *me = g_keythr ? pthread_getspecific(g_keythr) : NULL; t->woke_by = me ? me->handle : 0; t->woke_by_prio = me ? me->prio : -1; }
 #ifdef GAME_BOTW
     wake_queue(t);
 #endif
@@ -284,9 +287,17 @@ static void core_grant(int c) {   // holding G: give free core c to the best wai
     if (!b) return;
     *bp = b->cnext; b->cnext = NULL; b->cur_core = c; b->core_since = now_ns(); core_wait_complete(b, b->core_since); g_core_owner[c] = b; pthread_cond_signal(&b->cv);
 }
+/* TOTK_CORE_HOLD_MS=<ms> (diagnostic, 2026-10-24): log virtual-core holds longer than that whose owner a better
+   thread wanted to preempt (t->preempt set): with preemption only at SVC entry, such a hold is a priority inversion. */
+static int core_hold_ms(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_CORE_HOLD_MS"); v = e ? atoi(e) : 0; } return v; }
 static void core_put(thr_t *t) {   // holding G
     if (t->cur_core < 0) return;
     if (dm_core_diag_enabled() && t->core_since) t->core_held_ns += now_ns() - t->core_since;   // core_table
+    if (core_hold_ms() && (t->preempt || core_hold_ms() >= 20)) {   /* >= 20 ms: every long hold, preempt wanted or not */ uint64_t held = now_ns() - t->core_since; static int n;
+        if (held > (uint64_t)core_hold_ms() * 1000000ull && n++ < 400) {
+            thr_t *w = NULL; for (thr_t *x = g_core_wait; x; x = x->cnext) if (core_allowed(x, t->cur_core) && (!w || x->prio < w->prio)) w = x;
+            fprintf(stderr, "[core-hold] thread %#x prio %d held core %d %.1f ms (svc %#x lr %#llx, preempt %d) while %#x prio %d waited\n", t->handle, t->prio, t->cur_core, held / 1e6,
+                    t->last_svc, (unsigned long long)t->last_lr, t->preempt, w ? w->handle : 0, w ? w->prio : -1); } }
     int c = t->cur_core; t->cur_core = -1; t->preempt = 0; g_core_owner[c] = NULL; core_grant(c);
 }
 /* Asynchronous preemption (Breath of the Wild, botw.md). Horizon switches a core to a better thread the moment that thread
@@ -489,6 +500,7 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
         if (t->cur_core < 0 && now_ns() - w1 >= CORE_DIAG_NS) { core_wait_report(t, w1); reported = 1; }
     }
     t->core_wait_ns += now_ns() - w1; t->core_waits++;
+    if (totk_tl_on && totk_tl_on()) { uint64_t d = now_ns() - w1; if (d > 200000) totk_tl_at(24 /* TL_CWAIT */, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - d, d, (uint64_t)t->handle << 8 | (uint64_t)(t->prio & 0xff)); }
     }
     { static int on = -1; static uint64_t last; if (on < 0) on = getenv("TOTK_CORE_LOG") != NULL;   // diagnostic: who waits for a core, every 5 s
       uint64_t now = now_ns(); if (on && now - last > 5000000000ull) { last = now;
@@ -559,9 +571,21 @@ void runtime_core_checkpoint(void) {
 }
 int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? (t->cur_core >= 0 ? t->cur_core : t->core) : -1; }
 
+/* TOTK_MAIN_WAIT_MS=<ms> (diagnostic, 2026-10-24): log the game main thread's blocking waits longer than that (svc, guest
+   return address, wait kind / address, the thread that woke it); for the pipeline's periodic 40 ms frames. */
+static int main_wait_ms(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_MAIN_WAIT_MS"); v = e ? atoi(e) : 0; } return v; }
 static int64_t block(thr_t *t,int kind,int64_t ns) {
     if (ns == 0) return block_inner(t, kind, ns);
-    core_put(t); int64_t r = block_inner(t, kind, ns); core_take(t); return r;
+    int tl = t->is_main && totk_tl_on && totk_tl_on();
+    uint64_t t0 = (t->is_main && main_wait_ms()) || tl ? now_ns() : 0; uint64_t waddr = t->waddr;
+    core_put(t); int64_t r = block_inner(t, kind, ns);
+    if (tl) { uint64_t d = now_ns() - t0; totk_tl_at(23 /* TL_MWAIT */, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - d, d, (uint64_t)t->woke_by << 8 | (uint64_t)(t->last_svc & 0xff)); }
+    core_take(t);
+    if (t0) { uint64_t dt = now_ns() - t0; static int n;
+        if (dt > (uint64_t)main_wait_ms() * 1000000ull && n++ < 400)
+            LOG("[main-wait] %.1f ms svc %#x lr %#llx fp %#llx kind %d addr %#llx woken by %#x (prio %d) res %lld", dt / 1e6, t->last_svc, (unsigned long long)t->last_lr, (unsigned long long)t->last_fp,
+                kind, (unsigned long long)waddr, t->woke_by, t->woke_by_prio, (long long)r); }
+    return r;
 }
 static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
