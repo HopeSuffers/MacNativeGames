@@ -21,6 +21,9 @@ enum {
     TL_PASS_BEGIN, TL_PASS_END,     /* a render pass opened / ended on the replay thread: a = pass serial, b = draws in it (end) */
     TL_EARLY,                       /* TOTK_PIPELINE: the frame wait for fence a returned early (fence b, the previous frame's, completed) */
     TL_GATE_IN, TL_GATE_OUT,        /* TOTK_PIPELINE: waiting until early-released submissions really completed (a = fence) */
+    TL_HOLD,                        /* TOTK_PIPELINE: a CPU write waited for in-flight GPU work (t = start, a = ns waited, b = guest pc) */
+    TL_MWAIT,                       /* the game main thread blocked in an SVC (t = start, a = ns, b = waker handle << 8 | svc) */
+    TL_CWAIT,                       /* a guest thread waited for a virtual core (t = start, a = ns, b = handle << 8 | prio) */
 };
 
 int totk_tl_on(void);                                   /* the window is open (cheap after the first call) */
