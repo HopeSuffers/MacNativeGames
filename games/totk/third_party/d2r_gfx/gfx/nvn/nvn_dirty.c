@@ -671,8 +671,8 @@ uint64_t nvn_dirty_now(void) { return atomic_load(&g_now); }
 #if !defined(GAME_BOTW)
 int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp) {
     if (!len) return 0;
-    if (!nvn_dirty_tracked(addr, len)) return 1;   // 未跟踪时保守视为脏，宁可多传也不显示旧内容 | When untracked, conservatively treat as dirty: better to upload more than to show stale content
-    range_t *r = find((uintptr_t)addr);
+    range_t *r = find((uintptr_t)addr);   // TOTK (2026-10-24): one lookup (nvn_dirty_tracked looked the range up, then this again)
+    if (!r || (uintptr_t)addr + len > r->end) return 1;   // 未跟踪时保守视为脏，宁可多传也不显示旧内容 | When untracked, conservatively treat as dirty: better to upload more than to show stale content
     if (atomic_load(&r->latest) <= stamp) return 0;   // TOTK: nothing in the whole pool was written since the stamp (no per-page scan)
     uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
     return pages_since(r, p, q, stamp);   // 上传前最后一次写的代号 ≤ 戳；之后的写必 > 戳 | The generation of the last write before upload is <= the stamp; any later write must be > the stamp

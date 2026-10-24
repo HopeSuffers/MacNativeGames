@@ -11455,29 +11455,55 @@ static uint16_t vertex_stream_mask(NvShader *vs) {
 static const p_draw *g_pl_dw; static const p_draw_idx *g_pl_di;
 /* The largest index of a draw, kept per (index buffer, count, type) while no page of the indices is written (their pages
    are write-protected for that); a GPU write in flight over them: unknown. */
-typedef struct { uint64_t ibuf, stamp, sub; int32_t count, itype; uint32_t mx; } pl_mi;
+/* TOTK_PL_LEAN: an entry checked this submission is answered before the pool lookup when no pool came or went since
+   (pgen, read before the lookup that found it): the lookup would find the pool again and the next test answers c->mx.
+   TOTK_PL_LEAN=2: the lookup is made anyway and must succeed. */
+typedef struct { uint64_t ibuf, stamp, sub, pgen; int32_t count, itype; uint32_t mx; } pl_mi;
 static pl_mi g_pl_mi[4096];
 static int pl_max_index(const p_draw_idx *di, uint32_t *mx) {
     if (!di->ibuf || di->count <= 0 || di->count > (1 << 20) || di->itype < 0 || di->itype > 2) return 0;
     void *mb; uint64_t mo; size_t isz = di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4, len = (size_t)di->count * isz;
-    if (!mtl_addr(di->ibuf, len, &mb, &mo)) return 0;
     pl_mi *c = &g_pl_mi[((di->ibuf >> 4) ^ (di->ibuf >> 17) ^ (uint64_t)di->count * 31) & 4095];
-    if (c->sub == g_sub_serial && c->ibuf == di->ibuf && c->count == di->count && c->itype == di->itype) { *mx = c->mx; return 1; }   // checked this submission
+    int same = c->ibuf == di->ibuf && c->count == di->count && c->itype == di->itype;
+    if (g_pl_lean && same && c->sub == g_sub_serial && c->pgen == pl_pool_gen()) {
+        if (g_pl_lean == 2) { if (!mtl_addr(di->ibuf, len, &mb, &mo)) MDIE("TOTK_PL_LEAN=2: index buffer %#llx+%zu checked this submission is not in a pool", (unsigned long long)di->ibuf, len); g_pln_checked++; }
+        g_pln_mi_hits++; *mx = c->mx; return 1;
+    }
+    uint64_t pgen = pl_pool_gen();
+    if (!mtl_addr(di->ibuf, len, &mb, &mo)) return 0;
+    if (c->sub == g_sub_serial && same) { c->pgen = pgen; *mx = c->mx; return 1; }   // checked this submission
     if (nvn_pl_gpu_written((const void *)(uintptr_t)di->ibuf, len, pl_done_fn())) return 0;
-    if (c->ibuf == di->ibuf && c->count == di->count && c->itype == di->itype && !nvn_dirty_since((const void *)(uintptr_t)di->ibuf, len, c->stamp)) { c->sub = g_sub_serial; *mx = c->mx; return 1; }
+    if (same && !nvn_dirty_since((const void *)(uintptr_t)di->ibuf, len, c->stamp)) { c->sub = g_sub_serial; c->pgen = pgen; *mx = c->mx; return 1; }
     uint64_t stamp = nvn_dirty_now(); nvn_dirty_protect((const void *)(uintptr_t)di->ibuf, len); g_plmi_scans++; g_plmi_idx += (uint64_t)di->count;
     uint32_t m = 0, restart = di->itype == 0 ? 0xff : di->itype == 1 ? 0xffff : 0xffffffffu;
     const uint8_t *p = (const uint8_t *)(uintptr_t)di->ibuf;
     for (int i = 0; i < di->count; i++) { uint32_t v = isz == 1 ? p[i] : isz == 2 ? ((const uint16_t *)p)[i] : ((const uint32_t *)p)[i]; if (v != restart && v > m) m = v; }
-    *c = (pl_mi){di->ibuf, stamp, g_sub_serial, di->count, di->itype, m};
+    *c = (pl_mi){di->ibuf, stamp, g_sub_serial, pgen, di->count, di->itype, m};
     *mx = m; return 1;
+}
+/* TOTK_PL_LEAN: the attributes' furthest end per stream, made in one pass over the attributes at the first stream of a
+   bind_vertex_streams call that needs it (instead of one pass per stream); =2 compares it with the per-stream pass. */
+static uint64_t g_pl_vbme[16]; static int g_pl_vbme_ok;
+static uint64_t pl_vb_maxend(unsigned stream) {
+    uint64_t maxend = 0;
+    for (int a = 0; a < S.nattr && a < 16; a++) if (S.attr[a].stream == stream) { uint64_t e = (uint64_t)S.attr[a].offset + 16; if (e > maxend) maxend = e; }
+    return maxend;
 }
 static uint64_t pl_vb_extent(unsigned stream, uint64_t size) {
     static int on = -1; if (on < 0) { const char *e = getenv("TOTK_PIPELINE_VB_EXTENT"); on = !(e && !atoi(e)); }
     const p_draw *dw = g_pl_dw; const p_draw_idx *di = g_pl_di;
     if (!on || (!dw && !di)) return size;
-    uint64_t stride = S.stream[stream].stride, div = S.stream[stream].divisor, maxend = 0;
-    for (int a = 0; a < S.nattr && a < 16; a++) if (S.attr[a].stream == stream) { uint64_t e = (uint64_t)S.attr[a].offset + 16; if (e > maxend) maxend = e; }
+    uint64_t stride = S.stream[stream].stride, div = S.stream[stream].divisor, maxend;
+    if (!g_pl_lean || stream >= 16) maxend = pl_vb_maxend(stream);
+    else {
+        if (!g_pl_vbme_ok) {
+            memset(g_pl_vbme, 0, sizeof g_pl_vbme);
+            for (int a = 0; a < S.nattr && a < 16; a++) { unsigned st = S.attr[a].stream; uint64_t e = (uint64_t)S.attr[a].offset + 16; if (st < 16 && e > g_pl_vbme[st]) g_pl_vbme[st] = e; }
+            g_pl_vbme_ok = 1;
+        }
+        maxend = g_pl_vbme[stream];
+        if (g_pl_lean == 2) { if (pl_vb_maxend(stream) != maxend) MDIE("TOTK_PL_LEAN=2: vertex stream %u attribute end %llu, one-pass table %llu", stream, (unsigned long long)pl_vb_maxend(stream), (unsigned long long)maxend); g_pln_checked++; }
+    }
     if (!maxend) return size;
     int64_t nv;
     if (div) { int32_t inst = dw ? dw->instances : di->instances, bi = dw ? dw->base_instance : di->base_instance; if (inst < 1) inst = 1; nv = (int64_t)bi + (inst - 1) / (int64_t)div + 1; }
@@ -11487,21 +11513,39 @@ static uint64_t pl_vb_extent(unsigned stream, uint64_t size) {
     uint64_t ext = stride ? (uint64_t)(nv - 1) * stride + maxend : maxend;
     return ext < size ? ext : size;
 }
+/* TOTK_PL_LEAN: the GPU address of a vertex stream read in place, per stream, while no pool came or went (g_pool_gen,
+   read before the lookup): pool_lookup's per-thread records hold under the same rule. Only with TOTK_POOL_TLS on (as
+   those records); =2 looks the address up anyway and compares. */
+static struct { uint64_t addr, pgen, gpu; } g_pl_vbg[16];
+static int pl_vb_gpu(unsigned stream, uint64_t addr, uint64_t *gpu) {
+    void *mb; uint64_t mo;
+    if (g_pl <= 0 || !g_pl_lean || !pool_tls_on()) return mtl_gpu_addr(addr, 1, &mb, &mo, gpu);
+    uint64_t pgen = pl_pool_gen();
+    if (g_pl_vbg[stream].addr == addr && g_pl_vbg[stream].pgen == pgen) {
+        g_pln_vb_hits++; *gpu = g_pl_vbg[stream].gpu;
+        if (g_pl_lean == 2) { uint64_t g2; if (!mtl_gpu_addr(addr, 1, &mb, &mo, &g2) || g2 != *gpu) MDIE("TOTK_PL_LEAN=2: vertex stream %u at %#llx: remembered GPU address %#llx, lookup %#llx", stream, (unsigned long long)addr, (unsigned long long)*gpu, (unsigned long long)g2); g_pln_checked++; }
+        return 1;
+    }
+    if (!mtl_gpu_addr(addr, 1, &mb, &mo, gpu)) return 0;
+    g_pl_vbg[stream].addr = addr; g_pl_vbg[stream].pgen = pgen; g_pl_vbg[stream].gpu = *gpu;
+    return 1;
+}
 static void bind_vertex_streams(id<MTL4RenderCommandEncoder> en, NvShader *vs) {
     uint16_t mask=vertex_streams_on()?vertex_stream_mask(vs):UINT16_MAX;
     uint64_t bound=0,omitted=0;
     if(g_vertex_streams_negative)mask&=~(1u<<5);
+    g_pl_vbme_ok=0;   // TOTK_PL_LEAN: the attributes' ends per stream are made again for this call
     for(unsigned stream=0;stream<16;stream++) {
         if(!S.vbuf[stream].address)continue;
         if(!(mask&(1u<<stream))){omitted++;continue;}
-        void *mb;uint64_t mo,gpu;
+        uint64_t gpu;
         if(g_pl>0) {   // TOTK_PIPELINE: depth statistics host buffer, or a snapshot of recently CPU-written vertex data
             void *pb;uint64_t pg;uint64_t full=S.vbuf[stream].size?S.vbuf[stream].size:UINT64_MAX/2;
             if(plds_redirect(S.vbuf[stream].address,1,0,&pb,&pg)||pl_read_vb(S.vbuf[stream].address,full,pl_vb_extent,stream,&pb,&pg)) {
                 enc_r_vbuf(en,16+stream,pg);use_rec("buf",S.vbuf[stream].address,S.vbuf[stream].size,0,NULL);bound++;continue;
             }
         }
-        if(mtl_gpu_addr(S.vbuf[stream].address,1,&mb,&mo,&gpu)) {
+        if(pl_vb_gpu(stream,S.vbuf[stream].address,&gpu)) {
             enc_r_vbuf(en,16+stream,gpu);use_rec("buf",S.vbuf[stream].address,S.vbuf[stream].size,0,NULL);bound++;
         }
     }
