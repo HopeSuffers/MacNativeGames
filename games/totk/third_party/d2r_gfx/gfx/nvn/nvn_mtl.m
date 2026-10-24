@@ -2803,6 +2803,7 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "mfx_upscale")) { mfxup_set(v < 0 ? !mfxup_enabled() : v); return; }   // TOTK_MFX_UPSCALE at run time (manual key 3 picture mode)
     if (!strcmp(name, "mfx_interp")) { mfx_set(v); return; }
     if (!strcmp(name, "link_pause")) { void mtl_link_pause(int on); mtl_link_pause(v); MLOG("[flag] link_pause = %d (the display link stops calling back, as when the system stalls it)", v != 0); return; }   // tests the display-link rescue
+    if (!strcmp(name, "fbread")) { extern _Atomic int g_fbread; atomic_store(&g_fbread, v != 0); MLOG("[flag] fbread = %d", v != 0); return; }
     if (!strcmp(name, "draw_log")) { extern _Atomic long g_draw_log; atomic_store(&g_draw_log, v); MLOG("[flag] draw_log: every draw and dispatch of the next %d frames", v); return; }
     if (!strcmp(name, "uw_log")) { extern _Atomic long g_uw_log; atomic_store(&g_uw_log, v); MLOG("[flag] uw_log: canvas draws of the next %d frames", v); return; }   // key 4 UI squeeze diagnostic
     if (!strcmp(name, "mfx_output")) { mfxup_output_set(v < 0 ? !mfxup_output_enabled() : v); return; }   // TOTK_MFX_OUTPUT at run time (the window output stage)
@@ -6827,6 +6828,7 @@ static MTLBlendOperation bop(int e) { switch (e) { case 2: return MTLBlendOperat
 // 管线：按（程序, 目标格式, 混合 / 写掩码, 顶点布局, 采样数）缓存
 // Pipeline: cached by (program, target formats, blend / write mask, vertex layout, sample count)
 static const uint8_t *g_pso_lmap; static id<MTLFunction> g_pso_fsfn; static pso_fz_desc g_pso_fz, g_fz_desc;
+static int g_pso_fbr;   // TOTK_FBREAD: this pipeline reads the tile (fbread_fn); not recorded for the warm-up
 static os_unfair_lock g_fz_fn_lock = OS_UNFAIR_LOCK_INIT;
 static NSMutableDictionary<NSString *, id<MTLFunction>> *g_bf_fn_cache;
 static NSMutableDictionary<NSString *, id<MTLLibrary>> *g_bf_lib_cache;
@@ -7601,6 +7603,7 @@ static void pso_contribute(const pso_skey *sk, NSString *brec) {
     });
 }
 static void pso_adopt(const pso_key *k, NvShader *vs, NvShader *fs, int border, int merged, id<MTLRenderPipelineState> ps, uint64_t bt, int bg, NSString *brec) {
+    if (merged && g_pso_fbr) { hm_put_id(&g_pso, k, ps); g_pso_gen++; return; }   // TOTK_FBREAD pipelines are rebuilt from the draw
     pso_key rk = *k; rk.a2c &= ~PSO_VBORDER; if (border) rk.fsfn = NULL;   // the warm-up list records the plain pipeline: a border variant is built from the draw's samplers
     pso_skey sk; char shex[sizeof sk * 2 + 1]; pso_skey_from(&rk, vs, fs, merged, merged ? &g_pso_fz : NULL, &sk); pso_skey_hex(&sk, shex);
     if (survey_shader_log()) MLOG("[survey-shader] frame %llu render pipeline %s in %.2f ms%s", (unsigned long long)atomic_load(&g_cur_frame), shex, (bp_now() - bt) / 1e6, bg ? " (background, from queued to adopted)" : "");
@@ -10655,6 +10658,140 @@ static int fz_p2_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di, uint8_
     if (fz_check_on()) fz_snap_take(dw, di);
     g_fz_draws++; return 1;
 }
+/* TOTK_FBREAD (default on, =0 off): a draw that samples a colour attachment of its own pass at its own pixel reads the
+   tile instead ([[color(j)]], programmable blending). On Switch the sample sees what earlier draws of the pass wrote; on a
+   TBDR GPU the texture holds the pass's starting contents. att_unstored_read stores the pass first after a plain draw,
+   but not between the draws of a sampling run, which are assumed not to overlap: the waterfall sheets (fs b575e1e8, sky
+   island pools) do overlap, read the G-buffer flags under them, and wrote stale "not under water" flags (2026-10-24).
+   Reading the tile is right for both cases and saves the stores. Proven on the MSL text: every sample of such a texture
+   is a plain .sample at in.M.xy / in.M.w, and the vertex shader writes M = ((P.w + P.x) / 2, (P.w - P.y) / 2, -, P.w)
+   from its own gl_Position (the projected position of the pixel, as uv_proof's full-screen case). Anything else keeps
+   the old path. */
+_Atomic int g_fbread = -1;   // flag fbread 0/1
+static int fbread_on(void) { int v = atomic_load_explicit(&g_fbread, memory_order_relaxed); if (v < 0) { const char *e = getenv("TOTK_FBREAD"); v = !(e && !strcmp(e, "0")); atomic_store(&g_fbread, v); } return v; }
+static NSDictionary<NSString *, NSString *> *fbr_ssa(NSString *src) {   // _N -> right-hand side of "T _N = rhs;"
+    static NSRegularExpression *re; static dispatch_once_t once;
+    dispatch_once(&once, ^{ re = [NSRegularExpression regularExpressionWithPattern:@"^\\s*(?:float|float2|float3|float4|int|uint|bool) (_\\d+) = ([^;\\n]*);$" options:NSRegularExpressionAnchorsMatchLines error:nil]; });
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    for (NSTextCheckingResult *m in [re matchesInString:src options:0 range:NSMakeRange(0, src.length)]) d[[src substringWithRange:[m rangeAtIndex:1]]] = [src substringWithRange:[m rangeAtIndex:2]];
+    return d;
+}
+static int fbr_bin(NSString *rhs, NSString *op, NSString **a, NSString **b) {   // "X op Y" with plain operands
+    NSArray *p = [rhs componentsSeparatedByString:[NSString stringWithFormat:@" %@ ", op]];
+    if (p.count != 2) return 0; *a = p[0]; *b = p[1]; return 1;
+}
+static int fbr_in(NSDictionary *D, NSString *v, NSString *comp, NSString **m) {   // v = in.m_M.<comp>
+    NSString *r = D[v]; if (!r || ![r hasPrefix:@"in.m_"] || ![r hasSuffix:[@"." stringByAppendingString:comp]]) return 0;
+    NSString *mm = [r substringWithRange:NSMakeRange(3, r.length - 3 - 2)]; if (*m && ![*m isEqualToString:mm]) return 0; *m = mm; return 1;
+}
+static int fbr_coord(NSDictionary *D, NSString *v, NSString *comp, NSString **m) {   // v = in.M.comp / in.M.w (as x * (1.0 / w) or x / w)
+    NSString *a, *b, *r = D[v]; if (!r) return 0;
+    if (fbr_bin(r, @"/", &a, &b)) return fbr_in(D, a, comp, m) && fbr_in(D, b, @"w", m);
+    if (!fbr_bin(r, @"*", &a, &b)) return 0;
+    for (int k = 0; k < 2; k++) { NSString *x = k ? b : a, *y = k ? a : b, *w;
+        NSString *ry = D[y]; if (!ry || ![ry hasPrefix:@"1.0 / "]) continue; w = [ry substringFromIndex:6];
+        NSString *m0 = *m; if (fbr_in(D, x, comp, m) && fbr_in(D, w, @"w", m)) return 1; *m = m0; }
+    return 0;
+}
+static int fbr_vs_ok(NvShader *vs, NSString *locn) {   // the vertex output at locn is the screen position of gl_Position
+    NSString *src = sh_src(vs); if (!src) return 0;
+    NSRegularExpression *rf = [NSRegularExpression regularExpressionWithPattern:[NSString stringWithFormat:@"float4 (m_\\d+) \\[\\[user\\(%@\\)\\]\\];", locn] options:0 error:nil];
+    NSTextCheckingResult *f = [rf firstMatchInString:src options:0 range:NSMakeRange(0, src.length)]; if (!f) return 0;
+    NSString *o = [src substringWithRange:[f rangeAtIndex:1]];
+    NSRegularExpression *ra = [NSRegularExpression regularExpressionWithPattern:@"out\\.(m_\\d+|gl_Position)\\.([xyzw]) = ([^;\\n]+);" options:0 error:nil];
+    NSMutableDictionary *last = [NSMutableDictionary dictionary];
+    for (NSTextCheckingResult *m in [ra matchesInString:src options:0 range:NSMakeRange(0, src.length)])
+        last[[NSString stringWithFormat:@"%@.%@", [src substringWithRange:[m rangeAtIndex:1]], [src substringWithRange:[m rangeAtIndex:2]]]] = [src substringWithRange:[m rangeAtIndex:3]];
+    NSString *px = last[@"gl_Position.x"], *py = last[@"gl_Position.y"], *pw = last[@"gl_Position.w"];
+    NSString *ox = last[[o stringByAppendingString:@".x"]], *oy = last[[o stringByAppendingString:@".y"]], *ow = last[[o stringByAppendingString:@".w"]];
+    if (!px || !py || !pw || !ox || !oy || !ow || ![ow isEqualToString:pw]) return 0;
+    NSDictionary *D = fbr_ssa(src); NSString *a, *b;
+    NSString *(^half)(NSString *) = ^NSString *(NSString *v) { NSString *r = D[v], *x, *y; if (!r || !fbr_bin(r, @"*", &x, &y)) return nil;
+        return [y isEqualToString:@"0.5"] ? x : [x isEqualToString:@"0.5"] ? y : nil; };
+    NSString *tx = half(ox), *ty = half(oy); if (!tx || !ty) return 0;
+    if (!fbr_bin(D[tx] ?: @"", @"+", &a, &b) || !(([a isEqualToString:pw] && [b isEqualToString:px]) || ([a isEqualToString:px] && [b isEqualToString:pw]))) return 0;
+    NSString *ry = D[ty] ?: @"";
+    if (fbr_bin(ry, @"-", &a, &b)) return [a isEqualToString:pw] && [b isEqualToString:py];
+    if (!fbr_bin(ry, @"+", &a, &b)) return 0;
+    NSString *n = [a isEqualToString:pw] ? b : [b isEqualToString:pw] ? a : nil; if (!n) return 0;
+    return [D[n] ?: @"" isEqualToString:[@"-" stringByAppendingString:py]];
+}
+static NSMutableDictionary *g_fbr_cache; static os_unfair_lock g_fbr_lock = OS_UNFAIR_LOCK_INIT;
+static long g_fbr_draws;   // draws that read the tile
+/* The tile-reading fragment function for this draw, nil when it cannot be proven (the caller keeps the old path).
+   Cached per (vertex shader, fragment shader, sampled slot -> attachment); the first use compiles the rewritten MSL. */
+static id<MTLFunction> fbread_fn(NvProg *pr) {
+    NvShader *vs = pr->sh[0], *fs = pr->sh[1];
+    if (!vs || !fs || pr->sh[2] || pr->sh[3] || pr->sh[4] || !sh_has_src(vs) || !sh_has_src(fs) || fs->writes_depth) return nil;
+    if (S.has_vp && !(S.vp[0][0] == 0 && S.vp[0][1] == 0 && S.vp[0][2] == (float)g_pass.tw && S.vp[0][3] == (float)g_pass.th)) return nil;
+    if (fs_fn_border(fs, 0, NULL)) return nil;   // border-colour emulation and tile reads are not combined
+    int regj[128]; int nr = 0; NSMutableString *key = [NSMutableString stringWithFormat:@"%s|%s", vs->key, fs->key];
+    for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh || sh->stage >= 6) continue;
+        for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; uint64_t h;
+            if (b->kind == NVN_RB_IMG) h = b->reg < 32 ? S.img[sh->stage][b->reg] : 0; else if (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) h = b->reg < 128 ? S.tex[sh->stage][b->reg] : 0; else continue;
+            uint64_t ser = h ? h_ser(h) : 0; if (!ser) continue;
+            if (R.rt.depth && R.rt.depth->serial == ser) return nil;
+            int j = -1; for (int m = 0; m < R.rt.n && m < 8; m++) if (R.rt.color[m] && R.rt.color[m]->serial == ser) { j = m; break; }
+            if (j < 0) continue;
+            if (sh != fs || b->kind != NVN_RB_TEX || nr >= 128) return nil;
+            uint64_t s_; int lv, sl; rt_sub(&R.rt, j, &s_, &lv, &sl);
+            if (lv || sl || MAX(R.rt.color[j]->d.width, 1u) != g_pass.tw || MAX(R.rt.color[j]->d.height, 1u) != g_pass.th) return nil;
+            int tid_ = (int)(h & 0xfffff); void *tv_ = NULL; if (tid_) tex_fast_rid(tid_, &tv_); __unsafe_unretained id<MTLTexture> tv = (__bridge id<MTLTexture>)tv_;
+            uint32_t apf_ = tv.parentTexture ? (uint32_t)tv.parentTexture.pixelFormat : (uint32_t)tv.pixelFormat; uint8_t swz_[4];
+            if (R.rt.has_cview[j] && R.rt.cview[j].set_format && !(nvn_fmt_to_mtl(R.rt.cview[j].format, &apf_, swz_) && apf_)) apf_ = 0;
+            if (!tv || (tv.parentTexture && (tv.parentRelativeLevel || tv.parentRelativeSlice)) || tv.pixelFormat != (MTLPixelFormat)apf_ || tv.textureType != MTLTextureType2D) return nil;
+            if (g_pass.cfmt[j] != (uint32_t)apf_) return nil;
+            switch ((MTLPixelFormat)apf_) {   // float-typed colour formats only ([[color(j)]] is float4 here)
+                case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB: case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB:
+                case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatRG11B10Float: case MTLPixelFormatRGBA16Float: case MTLPixelFormatRG16Float:
+                case MTLPixelFormatR16Float: case MTLPixelFormatR32Float: case MTLPixelFormatRG32Float: case MTLPixelFormatRGBA32Float:
+                case MTLPixelFormatR8Unorm: case MTLPixelFormatRG8Unorm: case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatR16Unorm: case MTLPixelFormatRG16Unorm: break;
+                default: return nil; }
+            regj[nr++] = b->reg | j << 8; [key appendFormat:@",%d:%d", b->reg, j]; } }
+    if (!nr) return nil;
+    os_unfair_lock_lock(&g_fbr_lock);
+    if (!g_fbr_cache) g_fbr_cache = [NSMutableDictionary dictionary];
+    id hit = g_fbr_cache[key];
+    os_unfair_lock_unlock(&g_fbr_lock);
+    if (hit) return hit == VARIANT_NONE ? nil : hit;
+    id fn = VARIANT_NONE; NSString *why = nil;
+    NSMutableString *src = [sh_src(fs) mutableCopy]; NSDictionary *D = fbr_ssa(src); NSMutableSet *used = [NSMutableSet set];
+    for (int q = 0; q < nr && !why; q++) {
+        int reg = regj[q] & 0xff, j = regj[q] >> 8;
+        NSString *t = [NSString stringWithFormat:@"spvDescriptorSet0.fp_t_tcb_%X", reg * 2 + 8];
+        NSString *pat = [NSString stringWithFormat:@"%@\\.sample\\(%@Smplr, select\\((_\\d+), float2\\(0\\.0\\), isnan\\(\\1\\)\\)\\)", [NSRegularExpression escapedPatternForString:t], [NSRegularExpression escapedPatternForString:t]];
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pat options:0 error:nil];
+        NSArray *ms = [re matchesInString:src options:0 range:NSMakeRange(0, src.length)];
+        NSUInteger all = [src componentsSeparatedByString:[t stringByAppendingString:@"."]].count - 1;
+        if (!ms.count || ms.count != all) { why = [NSString stringWithFormat:@"slot %d: %lu of %lu uses are plain samples", reg, (unsigned long)ms.count, (unsigned long)all]; break; }
+        for (NSTextCheckingResult *m in ms) {
+            NSString *v = [src substringWithRange:[m rangeAtIndex:1]], *r = D[v], *a, *b, *mv = nil;
+            if (!r || ![r hasPrefix:@"float2("] || ![r hasSuffix:@")"]) { why = @"coordinate is not float2(a, b)"; break; }
+            NSArray *ab = [[r substringWithRange:NSMakeRange(7, r.length - 8)] componentsSeparatedByString:@", "];
+            if (ab.count != 2) { why = @"coordinate is not float2(a, b)"; break; } a = ab[0]; b = ab[1];
+            if (!fbr_coord(D, a, @"x", &mv) || !fbr_coord(D, b, @"y", &mv)) { why = @"coordinate is not in.M.xy / in.M.w"; break; }
+            NSRegularExpression *rl = [NSRegularExpression regularExpressionWithPattern:[NSString stringWithFormat:@"float4 %@ \\[\\[user\\((locn\\d+)\\)\\]\\];", mv] options:0 error:nil];
+            NSTextCheckingResult *l = [rl firstMatchInString:src options:0 range:NSMakeRange(0, src.length)];
+            if (!l) { why = @"varying is not a plain float4"; break; }
+            if (!fbr_vs_ok(vs, [src substringWithRange:[l rangeAtIndex:1]])) { why = @"vertex output is not the screen position"; break; }
+        }
+        if (why) break;
+        NSString *rep = [NSString stringWithFormat:@"fbin_%d", j];
+        for (NSTextCheckingResult *m in ms.reverseObjectEnumerator) [src replaceCharactersInRange:m.range withString:rep];
+        [used addObject:@(j)];
+    }
+    if (!why) {
+        NSRange sig = [src rangeOfString:@"fragment main0_out main0("]; NSRange end = sig.location == NSNotFound ? sig : [src rangeOfString:@")\n{" options:0 range:NSMakeRange(sig.location, src.length - sig.location)];
+        if (sig.location == NSNotFound || end.location == NSNotFound) why = @"entry signature not found";
+        else { NSMutableString *add = [NSMutableString string]; for (NSNumber *j in used) [add appendFormat:@", float4 fbin_%d [[color(%d)]]", j.intValue, j.intValue];
+            [src insertString:add atIndex:end.location]; }
+    }
+    if (!why) { NSError *e = nil; id<MTLLibrary> lib = variant_library(src, &e); id f = lib ? [lib newFunctionWithName:fs->fn.name] : nil;
+        if (f) fn = f; else why = [NSString stringWithFormat:@"compile: %@", e.localizedDescription]; }
+    MLOG("[fbread] %s / %s: %s", vs->key, fs->key, why ? why.UTF8String : "reads the tile");
+    os_unfair_lock_lock(&g_fbr_lock); g_fbr_cache[key] = fn; os_unfair_lock_unlock(&g_fbr_lock);
+    return fn == VARIANT_NONE ? nil : fn;
+}
 static void bloomq_reset(void) { memset(&g_bloomq, 0, sizeof g_bloomq); }
 static int bloomq_enabled(void) {
     if (g_bloom_q < 0) { const char *e = getenv("DM_NVN_BLOOM_Q"); g_bloom_q = !e || strcmp(e, "0"); }
@@ -11781,7 +11918,9 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     // TOTK: the draw samples an attachment whose pixels are still only in tile memory: store them first (att_unstored_read).
     // Not in the second half of a fused pass: it reads the first half's pixels from tile memory by construction (fz_p2_draw).
     uint64_t att_rs[ATT_READS_MAX]; int att_n = att_store_on() ? draw_att_reads(pr, att_rs) : 0;
-    if (!(g_fz.active && g_fz.phase == 2) && att_unstored_read(att_rs, att_n)) {
+    static id<MTLFunction> fbr_fn; fbr_fn = nil;
+    if (att_n && fbread_on() && !g_fz.active && !g_defer_replaying) { fbr_fn = fbread_fn(pr); if (fbr_fn) g_fbr_draws++; }
+    if (!fbr_fn && !(g_fz.active && g_fz.phase == 2) && att_unstored_read(att_rs, att_n)) {
         static int once; if (!once++) MLOG("[totk] a draw samples an attachment its pass drew: the pass is stored first (first: pass %llu)", g_stat_pass);
         PD("M %llu 绘制采样本通道画过的附件，先写回再画", g_stat_pass); rp_flush(); }
     static id<MTLFunction> fz_fn;   // 合并通道后一个通道本次绘制的特化片元函数（nil = 用原版本） | Specialized fragment function for this draw of the later pass in a merged render pass (nil = use the original version)
@@ -11845,9 +11984,10 @@ frz_plain:;
     // 管线只依赖（程序, 通道目标, 混合 / 颜色 / 写掩码 / 多重采样状态, 顶点布局）：这些没变就沿用上次的
     // The pipeline depends only on (program, render pass targets, blend / color / write mask / multisample state, vertex layout): if these did not change, reuse the previous one
     static id<MTLRenderPipelineState> cur_ps; static NvProg *cur_pr; static uint64_t cur_ps_pass;
-    if (g_fz.active && !g_defer_replaying) { g_pso_lmap = g_fz.phase == 1 ? g_fz.lmap1 : g_fz.lmap2; g_pso_fsfn = g_fz.phase == 1 ? nil : fz_fn; g_pso_fz = g_fz.phase == 1 ? (pso_fz_desc){0} : g_fz_desc; g_pso_dirty = 1; }   // 可读 tile 合并：按物理 → 逻辑映射与特化取管线 | Readable tile merge: fetch the pipeline by the physical -> logical mapping and the specialization
+    if (fbr_fn) { static const uint8_t ident[8] = {0, 1, 2, 3, 4, 5, 6, 7}; g_pso_lmap = ident; g_pso_fsfn = fbr_fn; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_fbr = 1; g_pso_dirty = 1; }
+    else if (g_fz.active && !g_defer_replaying) { g_pso_lmap = g_fz.phase == 1 ? g_fz.lmap1 : g_fz.lmap2; g_pso_fsfn = g_fz.phase == 1 ? nil : fz_fn; g_pso_fz = g_fz.phase == 1 ? (pso_fz_desc){0} : g_fz_desc; g_pso_dirty = 1; }   // 可读 tile 合并：按物理 → 逻辑映射与特化取管线 | Readable tile merge: fetch the pipeline by the physical -> logical mapping and the specialization
     if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial || (pr->sh[1] && pr->sh[1]->border_seen) || (pr->sh[0] && pr->sh[0]->border_seen)) { cur_ps = pso_get(pr, nil); cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps; }
-    if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = 1; }   // 下一次绘制重新按自身情况取 | The next draw fetches again according to its own situation
+    if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_fbr = 0; g_pso_dirty = 1; }   // 下一次绘制重新按自身情况取 | The next draw fetches again according to its own situation
     __unsafe_unretained id<MTLRenderPipelineState> ps = cur_ps;
     if (!ps && g_pso_deferred) { draw_skipped(); return; }   // async shaders: the pipeline is compiling in the background
     if (!ps) { g_draw_skip[9]++; static int failed_n; if (failed_n++ < 3) MLOG("[pipeline-draw] rt-depth=%p serial=%llu fmt=%#x pass-depth=%u dt=%u dw=%u fs-depth=%d", R.rt.depth, (unsigned long long)(R.rt.depth ? R.rt.depth->serial : 0), R.rt.depth ? R.rt.depth->d.format : 0, g_pass.dfmt, S.ds.dt, S.ds.dw, pr->sh[1] ? pr->sh[1]->writes_depth : 0); return; }
