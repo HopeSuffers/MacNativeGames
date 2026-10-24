@@ -43,7 +43,8 @@
    pages GPU work wrote), TOTK_PIPELINE_LOG=1 (first releases, snapshots and invalidates in detail),
    TOTK_PIPELINE_XCOMP=<percent> (the translate thread's declared real-time computation, default 90 % of the present
    period; 50 without the pipeline), TOTK_PIPELINE_ECOMP=<percent> (the encode stage becomes a real-time thread with this
-   computation, default 50; 0 = it stays user-interactive): hle_nvn.c x_thread. The stats lines come every 600
+   computation, default 50; 0 = it stays user-interactive): hle_nvn.c x_thread. TOTK_PL_LEAN=0 (per-draw fast paths off;
+   2: each fast answer checked against the full bookkeeping, see "TOTK_PL_LEAN" below). The stats lines come every 600
    submissions ("translate-thread hooks per submission": the cost of these hooks on the translate thread); hle_nvn.c logs
    "cores to frame N" every 300 frames in every mode (P / E core time and clocks of the translate and encode threads, the
    process's CPU time, P share, waiting for a core, CPU energy). */
@@ -60,6 +61,7 @@ static uint32_t g_pl_keep = 600, g_pl_probe = 4; static int g_pl_first = 1, g_pl
 static uint64_t g_pl_rwatch;   // dry run: watch from this submission (0 off)
 static uint64_t g_pl_snap_max = 2u << 20, g_pl_budget = 96u << 20, g_pl_sub_bytes, g_pl_first_max = 64u << 10;
 static uint64_t g_pl_rel;   // under g_mu: newest fence whose frame wait was released early (mode 1)
+static int g_pl_lean = 1;   // TOTK_PL_LEAN (see "lean" below): 1 fast paths, 0 off, 2 fast paths checked against the full path
 static int g_pl_wprot;      // TOTK_PIPELINE_WWHOLD=1: GPU write ranges are protected too (a CPU write that meets only GPU writes passes otherwise)
 static void pl_cfg_once(void) {
     const char *e;
@@ -75,6 +77,8 @@ static void pl_cfg_once(void) {
     if ((e = getenv("TOTK_PIPELINE_DSTATS"))) g_pl_dsnap = atoi(e) != 0;
     if ((e = getenv("TOTK_PIPELINE_TEXHOLD"))) g_pl_texhold = atoi(e) != 0;
     if ((e = getenv("TOTK_PIPELINE_LOG"))) g_pl_log = atoi(e) > 0 ? 40 : 0;
+    if ((e = getenv("TOTK_PL_LEAN"))) { g_pl_lean = atoi(e); if (g_pl_lean < 0 || g_pl_lean > 2) g_pl_lean = 1; }
+    if (g_pl_lean != 1) MLOG("TOTK_PL_LEAN=%d: %s", g_pl_lean, g_pl_lean ? "per-draw fast paths on, each hit checked against the full bookkeeping (MDIE on a difference)" : "every binding goes through the full pipeline bookkeeping");
     g_pl_wprot = nvn_pl_wwhold();
     if ((e = getenv("TOTK_PIPELINE_RWATCH")) && g_pl == 2 && atoll(e) > 0) g_pl_rwatch = atoll(e) == 1 ? 1800 : (uint64_t)atoll(e);
     MLOG("TOTK_PIPELINE=%d: %s; snapshots up to %llu KB, volatile for %u frames, probation %u frames%s; occlusion results %s; depth statistics ring %s%s",
@@ -221,7 +225,9 @@ static int plds_redirect_i(uint64_t a, uint64_t n, int rw, void **buf, uint64_t 
     }
     return 0;
 }
-static int plds_redirect(uint64_t a, uint64_t n, int rw, void **buf, uint64_t *gpu) { uint64_t t = plh_in(PLH_REDIR); int r = plds_redirect_i(a, n, rw, buf, gpu); plh_out(PLH_REDIR, t); return r; }
+static int plds_redirect(uint64_t a, uint64_t n, int rw, void **buf, uint64_t *gpu) {
+    if (g_pl_lean && (!g_plds_ln || !a)) { g_plh_c[PLH_REDIR] += !g_plh_depth; return 0; }   // TOTK_PL_LEAN: no live snapshot (plds_redirect_i answers 0 at once): counted, not timed
+    uint64_t t = plh_in(PLH_REDIR); int r = plds_redirect_i(a, n, rw, buf, gpu); plh_out(PLH_REDIR, t); return r; }
 static int plds_redirect_off(uint64_t a, uint64_t n, int rw, void **buf, uint64_t *off) {   // as plds_redirect, with the offset in the host buffer
     uint64_t g; if (!plds_redirect(a, n, rw, buf, &g)) return 0;
     *off = g - ((__bridge id<MTLBuffer>)*buf).gpuAddress; return 1;
@@ -459,16 +465,86 @@ static int pl_decide(uint64_t a0, uint64_t n0, pl_dm **out) {
     return c;
 }
 static uint64_t pl_clamp(uint64_t a, uint64_t n) { uintptr_t plo, phi; if (mtl_addr_range(a, 1, &plo, &phi) && a + n > phi) n = phi - a; return n; }
+static inline uint64_t pl_pool_gen(void) { return atomic_load_explicit(&g_pool_gen, memory_order_acquire); }   // pools added / removed: pl_clamp, mtl_addr answer the same while it stays
+/* TOTK_PL_LEAN (default 1; 0 off; 2 self-check), 2026-10-24. The pipeline's per-draw bookkeeping cost ~16% of the
+   translate thread's instructions (13.0k a draw with it, 11.2k without). Most bindings repeat within a submission (the
+   same vertex stream extent, index range, uniform block), and each repeat went through pl_decide's and pl_memo_find's
+   hash tables (live reads and bindings over 64 MiB also through a pool lookup) to get the same answer again. A
+   direct-mapped table keeps, per (address, size, kind), the outcome of the full path in this submission (g_plm_gen), and
+   a repeat the full path would answer from its memos is answered from there:
+   - a static span (its pl_dm entry, c 0): read in place, the bytes are already in the span's published union;
+   - otherwise (c 1 volatile, -1 GPU-written / untracked) the range's pl_memo entry m: its snapshot while m->snap > 0, else
+     in place. A GPU write that drops the snapshot clears m->snap (pl_write_i); it is read at every hit.
+   Only outcomes the full path memoised are kept (pl_dm entry present, and for c != 0 the pl_memo entry: with a crowded
+   table the full path decides again every time). A volatile decision is looked at again after a GPU write in the
+   submission (pl_decide: e->wep != g_pl_wep), so such an entry is used only while g_pl_wep has not changed. A size
+   clamped to its pool (over 64 MiB; live reads always) is used only while no pool came or went (g_pool_gen, read before
+   the lookup). Hits are counted as the full path counts them (memo hits, static reads). TOTK_PL_LEAN=2: every hit also
+   runs the full path and dies on any difference in the answer or in what the full path did (a decision, a published
+   range, a snapshot, other counts). */
+typedef struct { uint64_t a, n, pgen; pl_memo *m; uint32_t gen, wep; int8_t c, kind, clamped; } pl_ln;   // c: 0 static, 1 volatile, -1 GPU-written / untracked, 2 nothing (clamped to 0 bytes)
+#define PL_LEAN 2048
+static pl_ln g_pln[PL_LEAN];
+static uint64_t g_pln_hits, g_pln_live_hits, g_pln_mi_hits, g_pln_vb_hits, g_pln_checked;   // statistics (stats line)
+static inline pl_ln *pl_lean_slot(uint64_t a, uint64_t n) { uint64_t h = (a >> 4) ^ (a >> 15) ^ (n << 3) ^ (n >> 7); return &g_pln[(h ^ (h >> 22)) & (PL_LEAN - 1)]; }
+static inline int pl_lean_ok(const pl_ln *L, uint64_t a, uint64_t n, int kind) {
+    return L->gen == g_plm_gen && L->a == a && L->n == n && L->kind == kind && (L->c != 1 || L->wep == g_pl_wep) && (!L->clamped || L->pgen == pl_pool_gen());
+}
+static inline int pl_lean_out(const pl_ln *L, void **buf, uint64_t *off, uint64_t *gpu) {   // what the full path answers
+    if (L->c == 0 || L->c == 2) return 0;
+    const pl_memo *m = L->m; if (m->snap > 0) { *buf = m->buf; *off = m->off; *gpu = m->gpu; return 1; }
+    return 0;
+}
+static inline void pl_rec(pl_ln *rec, const pl_dm *d, pl_memo *m, int c, uint64_t pgen, int clamped) {   // an outcome the full path gives again (memoised)
+    if (rec && d && (c == 0 || m)) *rec = (pl_ln){.pgen = pgen, .m = m, .gen = g_plm_gen, .c = (int8_t)c, .clamped = (int8_t)clamped};
+}
+static int pl_read_s(uint64_t a, uint64_t n, int kind, void **buf, uint64_t *off, uint64_t *gpu, pl_ln *rec);
+static int pl_read_i(uint64_t a, uint64_t n, int kind, void **buf, uint64_t *off, uint64_t *gpu) {
+    if (g_pl <= 0 || !a || !n) return 0;
+    if (!g_pl_lean) return pl_read_s(a, n, kind, buf, off, gpu, NULL);
+    pl_ln *L = pl_lean_slot(a, n);
+    if (pl_lean_ok(L, a, n, kind)) {
+        g_pln_hits++;
+        if (g_pl_lean == 2) {   // self-check: the full path gives the same answer and does nothing but count memo hits
+            void *fb = NULL; uint64_t fo = 0, fg = 0; int fr = pl_lean_out(L, &fb, &fo, &fg);
+            uint64_t mh = g_pls_st.memo_hits, dc = g_pls_st.decides, ls = g_pls_st.live_static, lk = g_pls_st.live[kind], sb = g_pls_st.snap_bytes, ob = g_pls_st.over_budget, lb = g_pls_st.live_big, lg = g_pls_st.live_gpuw;
+            int na = g_plr_all.n, nn = g_plr_ns.n, nd = g_pldl_n, ns = g_plsr_n; uint32_t wep = g_pl_wep;
+            int r = pl_read_s(a, n, kind, buf, off, gpu, NULL);
+            uint64_t emh = L->c == 0 ? 1 : L->c == 2 ? 0 : 2;
+            if (r != fr || (r && (*buf != fb || *off != fo || *gpu != fg)) || g_pls_st.memo_hits - mh != emh || g_pls_st.decides != dc || g_pls_st.live_static - ls != (uint64_t)(L->c == 0) ||
+                g_pls_st.live[kind] - lk != (uint64_t)(L->c == 0) || g_pls_st.snap_bytes != sb || g_pls_st.over_budget != ob || g_pls_st.live_big != lb || g_pls_st.live_gpuw != lg ||
+                g_plr_all.n != na || g_plr_ns.n != nn || g_pldl_n != nd || g_plsr_n != ns || g_pl_wep != wep)
+                MDIE("TOTK_PL_LEAN=2: read %#llx+%llu (%s, remembered c %d) differs: full path %d (gpu %#llx), fast %d (gpu %#llx); memo hits +%llu (want %llu), decisions +%llu, ranges +%d, snapshots +%d",
+                     (unsigned long long)a, (unsigned long long)n, g_plk_name[kind], L->c, r, r ? (unsigned long long)*gpu : 0ull, fr, (unsigned long long)fg, (unsigned long long)(g_pls_st.memo_hits - mh),
+                     (unsigned long long)emh, (unsigned long long)(g_pls_st.decides - dc), (g_plr_all.n - na) + (g_plr_ns.n - nn) + (g_pldl_n - nd), g_plsr_n - ns);
+            g_pln_checked++;
+            return r;
+        }
+        if (L->c == 0) { g_pls_st.memo_hits++; g_pls_st.live_static++; g_pls_st.live[kind]++; }   // as the full path counts them
+        else if (L->c != 2) g_pls_st.memo_hits += 2;
+        return pl_lean_out(L, buf, off, gpu);
+    }
+    pl_ln rec; int r = pl_read_s(a, n, kind, buf, off, gpu, &rec);
+    if (rec.gen) { rec.a = a; rec.n = n; rec.kind = (int8_t)kind; rec.wep = g_pl_wep; *L = rec; }
+    return r;
+}
 /* A GPU read of guest [a, a+n) (kind PLK_*). 1: read the snapshot *buf / *off / *gpu (this submission's arena) instead
    of memory. 0: read memory. Decided per page span and submission (a static decision kept across submissions, pl_sc).
    What is read in place is published for the fault handler: a static page span once (CPU writes to static pages are
-   rare: a write there is held when the span is in flight), anything else as its exact bytes. */
-static int pl_read_i(uint64_t a, uint64_t n, int kind, void **buf, uint64_t *off, uint64_t *gpu) {
+   rare: a write there is held when the span is in flight), anything else as its exact bytes. rec (TOTK_PL_LEAN, may be
+   NULL): the outcome when the full path would give it again from its memos (rec->gen set), else rec->gen 0. */
+static int pl_read_s(uint64_t a, uint64_t n, int kind, void **buf, uint64_t *off, uint64_t *gpu, pl_ln *rec) {
+    if (rec) rec->gen = 0;
     if (g_pl <= 0 || !a || !n) return 0;
-    if (n > (64u << 20)) { n = pl_clamp(a, n); if (!n) return 0; }   // a binding past its pool's end (whole-pool sizes)
+    uint64_t pgen = 0; int clamped = 0;
+    if (n > (64u << 20)) {   // a binding past its pool's end (whole-pool sizes)
+        pgen = pl_pool_gen(); clamped = 1; n = pl_clamp(a, n);
+        if (!n) { if (rec) *rec = (pl_ln){.pgen = pgen, .gen = g_plm_gen, .c = 2, .clamped = 1}; return 0; }
+    }
     pl_dm *d = NULL; int c = pl_decide(a, n, &d);
     if (c == 0) {
         g_pls_st.live_static++; g_pls_st.live[kind]++;
+        pl_rec(rec, d, NULL, c, pgen, clamped);
         if (kind == PLK_TX && !g_pl_texhold) return 0;
         if (d && !d->pub) {   // the bytes read of a static span: their union is published at the commit (exact enough for the holds:
             d->pub = 1; d->ulo = a; d->uhi = a + n;   // the game streams new data next to data in use in the same 16 KiB page)
@@ -479,7 +555,7 @@ static int pl_read_i(uint64_t a, uint64_t n, int kind, void **buf, uint64_t *off
         return 0;
     }
     int fresh = 0; pl_memo *m = pl_memo_find(a, a + n, &fresh);
-    if (m && !fresh) { g_pls_st.memo_hits++; if (m->snap > 0) { *buf = m->buf; *off = m->off; *gpu = m->gpu; return 1; } return 0; }
+    if (m && !fresh) { g_pls_st.memo_hits++; pl_rec(rec, d, m, c, pgen, clamped); if (m->snap > 0) { *buf = m->buf; *off = m->off; *gpu = m->gpu; return 1; } return 0; }
     uint64_t t0 = pls_t0();
     if (c == 1 && (n > (64u << 20) ? (n = pl_clamp(a, n)) : n) <= g_pl_snap_max && g_pl_sub_bytes + n > g_pl_budget) g_pls_st.over_budget++;
     else if (c == 1 && n <= g_pl_snap_max) {
@@ -499,6 +575,7 @@ static int pl_read_i(uint64_t a, uint64_t n, int kind, void **buf, uint64_t *off
             }
             if (g_pl_log > 0) { g_pl_log--; MLOG("[pipeline] F%llu %s %#llx+%llu snapshot (volatile pages)", (unsigned long long)atomic_load(&g_cur_frame), g_plk_name[kind], (unsigned long long)a, (unsigned long long)n); }
             *buf = (__bridge void *)ab; *off = ao; *gpu = agpu;
+            pl_rec(rec, d, m, c, pgen, clamped);
             if (t0) g_pls_st.ns += (pl_now() - t0) * 16;
             return 1;
         }
@@ -507,6 +584,7 @@ static int pl_read_i(uint64_t a, uint64_t n, int kind, void **buf, uint64_t *off
     g_pls_st.live[kind]++;
     if (kind != PLK_TX || g_pl_texhold) pl_rng_add(a, a + n, 1, 0);
     if (m) { m->snap = 0; m->kind = (int8_t)kind; }
+    pl_rec(rec, d, m, c, pgen, clamped);
     if (t0) g_pls_st.ns += (pl_now() - t0) * 16;
     return 0;
 }
@@ -526,9 +604,8 @@ static int pl_read_vb(uint64_t a, uint64_t full, uint64_t (*ext)(unsigned, uint6
 }
 /* A GPU read of guest [a, a+n) that cannot use a snapshot (typed buffer views over pool memory, storage pointers of
    unknown extent, GPU-side texture uploads and index widening): its range is published (not static). */
-static void pl_live_read(uint64_t a, uint64_t n, int kind) {
-    if (g_pl <= 0 || !a || !n || (kind == PLK_TX && !g_pl_texhold)) return;
-    uint64_t t = plh_in(PLH_LIVE);
+static void pl_live_read_s(uint64_t a, uint64_t n, int kind, pl_ln *rec) {   // rec: as for pl_read_s
+    uint64_t pgen = pl_pool_gen();
     n = pl_clamp(a, n);
     int fresh = 0; pl_memo *m = n ? pl_memo_find(a, a + n, &fresh) : NULL;
     if (!n) {}
@@ -537,6 +614,26 @@ static void pl_live_read(uint64_t a, uint64_t n, int kind) {
         if (m && fresh) { m->snap = 0; m->kind = (int8_t)kind; }
         g_pls_st.live[kind]++; g_pls_st.live_noshot++;
         pl_rng_add(a, a + n, 1, 0);
+    }
+    if (rec) { rec->gen = 0; if (!n || m) *rec = (pl_ln){.pgen = pgen, .m = m, .gen = g_plm_gen, .c = (int8_t)(n ? -1 : 2), .clamped = 1}; }
+}
+static void pl_live_read(uint64_t a, uint64_t n, int kind) {
+    if (g_pl <= 0 || !a || !n || (kind == PLK_TX && !g_pl_texhold)) return;
+    uint64_t t = plh_in(PLH_LIVE);
+    if (!g_pl_lean) pl_live_read_s(a, n, kind, NULL);
+    else {   // TOTK_PL_LEAN: a repeat in this submission whose range is read in place already (memo entry without a snapshot) only counts a memo hit
+        pl_ln *L = pl_lean_slot(a, n); int lk = kind | 0x40;
+        if (pl_lean_ok(L, a, n, lk) && (L->c == 2 || L->m->snap == 0)) {
+            g_pln_live_hits++;
+            if (g_pl_lean == 2) {
+                uint64_t mh = g_pls_st.memo_hits, lv = g_pls_st.live[kind], no = g_pls_st.live_noshot; int na = g_plr_all.n, nn = g_plr_ns.n;
+                pl_live_read_s(a, n, kind, NULL);
+                if (g_pls_st.memo_hits - mh != (uint64_t)(L->c != 2) || g_pls_st.live[kind] != lv || g_pls_st.live_noshot != no || g_plr_all.n != na || g_plr_ns.n != nn)
+                    MDIE("TOTK_PL_LEAN=2: live read %#llx+%llu (%s) differs: memo hits +%llu (want %d), ranges +%d", (unsigned long long)a, (unsigned long long)n, g_plk_name[kind],
+                         (unsigned long long)(g_pls_st.memo_hits - mh), L->c != 2, (g_plr_all.n - na) + (g_plr_ns.n - nn));
+                g_pln_checked++;
+            } else if (L->c != 2) g_pls_st.memo_hits++;
+        } else { pl_ln rec; pl_live_read_s(a, n, kind, &rec); if (rec.gen) { rec.a = a; rec.n = n; rec.kind = (int8_t)lk; rec.wep = g_pl_wep; *L = rec; } }
     }
     plh_out(PLH_LIVE, t);
 }
@@ -835,6 +932,12 @@ static void pl_stats_line(void) {
            (double)(pushed - last_pushed) / s, (double)(seq - last_seq) / s, (double)(batches - last_batches) / s);
       last_pushed = pushed; last_seq = seq; last_batches = batches;
       memset(g_plh_t, 0, sizeof g_plh_t); memset(g_plh_c, 0, sizeof g_plh_c); g_plmi_scans = g_plmi_idx = 0; }
+    if (g_pl_lean) {   // TOTK_PL_LEAN: repeats answered without the full bookkeeping (still counted in the memo hits / static reads below)
+        MLOG("[pipeline] lean (TOTK_PL_LEAN=%d) per submission: reads answered from their last outcome %.0f, live reads %.0f, largest indices before the pool lookup %.0f, in-place vertex stream addresses %.0f%s",
+             g_pl_lean, g_pln_hits / s, g_pln_live_hits / s, g_pln_mi_hits / s, g_pln_vb_hits / s,
+             g_pl_lean == 2 ? [NSString stringWithFormat:@"; self-check: %llu fast answers matched the full path", (unsigned long long)g_pln_checked].UTF8String : "");
+        g_pln_hits = g_pln_live_hits = g_pln_mi_hits = g_pln_vb_hits = g_pln_checked = 0;
+    }
     MLOG("[pipeline] decisions per submission by reason: untracked %.1f, static %.1f, volatile %.1f (cached); new %.1f, static written %.1f, volatile expired %.1f, ranges changed %.1f (classified)",
          g_pls_st.dc[0] / s, g_pls_st.dc[1] / s, g_pls_st.dc[2] / s, g_pls_st.dc[3] / s, g_pls_st.dc[4] / s, g_pls_st.dc[5] / s, g_pls_st.dc[6] / s);
     MLOG("[pipeline] per submission: bookkeeping %.3f ms on the translate thread (decisions %.0f in %.3f ms, sampled; commit %.3f ms); snapshots %.1f (%.1f KB, copy %.3f ms; vertex %.1f index %.1f storage %.1f uniform %.1f copy %.1f; %.1f dropped by GPU writes), memo hits %.0f, static cache hits %.0f; in place %.1f (static %.1f, GPU-written or untracked %.1f, volatile but too big or over the budget %.1f (over budget %.1f), no snapshot possible %.1f; vertex %.1f index %.1f storage %.1f uniform %.1f copy %.1f texture %.1f), GPU writes %.1f; published ranges %.0f (not static %.1f)",
