@@ -6709,7 +6709,7 @@ static id<MTLFunction> fs_fn_border_with(NvShader *fs, int nodepth, NSString *bk
    the submit thread when a draw first needs it, never in the background: the draw has given up the store before it
    (att_fb_take), so it cannot be drawn with the plain function meanwhile. */
 static id<MTLFunction> fs_fn_fbread(NvShader *fs, const int aid[], const int att[], int n) {
-    if (!fs || !sh_has_src(fs) || fs->writes_depth || n <= 0) return nil;
+    if (!fs || !sh_has_src(fs) || n <= 0) return nil;   // a depth-writing shader keeps its depth output: callers draw it only into a pass with a depth plane (att_fb_take)
     NSMutableString *key = [NSMutableString stringWithString:@"fbread;"];
     for (int i = 0; i < n; i++) [key appendFormat:@"%d:%d;", aid[i], att[i]];
     os_unfair_lock_lock(&g_bpatch_lock); id fn = fs->bpatch[key]; os_unfair_lock_unlock(&g_bpatch_lock);
@@ -9481,7 +9481,12 @@ static int att_fb_on(void) { static int on = -1; if (on < 0) { const char *e = g
    longer store the pass first; returns the fragment function for the draw, or nil (rs unchanged). */
 static id<MTLFunction> att_fb_take(NvProg *pr, uint64_t *rs, int *n) {
     NvShader *fs = pr ? pr->sh[1] : nil;
-    if (!att_fb_on() || !*n || !fs || fs->writes_depth || !R.has_rt || g_pso_lmap || g_mfx.role || g_fz.active || g_rt_merged) return nil;
+    /* A fragment shader that writes depth can read the tile too when the draw's pass has its depth plane: pso_desc takes
+       the variant (whole source, depth output kept) instead of fs_fn_without_depth only when k->dfmt is 0. The decals that
+       write depth (b626c0ae at Kakariko, 65 draws a frame) were stored before and reloaded around: two G-buffer stores
+       and loads (~190 MB) a frame (2026-10-25). */
+    int depth_ok = !fs || !fs->writes_depth || (R.rt.depth && (!g_enc || g_pass.hd));
+    if (!att_fb_on() || !*n || !fs || !depth_ok || !R.has_rt || g_pso_lmap || g_mfx.role || g_fz.active || g_rt_merged) return nil;
     { float bc[8][4]; int ba[8], bn; unsigned bx[8]; samp_par bp[8]; if (border_key(fs, 1, bc, ba, bx, bp, &bn)) return nil; }   // one specialised fragment function per draw (a border variant)
     int aid[8], att[8], k = 0, nt = 0; uint64_t took[8];
     for (int i = 0; i < fs->rf.nb; i++) { const nvn_rbind *b = &fs->rf.b[i]; uint64_t h;
