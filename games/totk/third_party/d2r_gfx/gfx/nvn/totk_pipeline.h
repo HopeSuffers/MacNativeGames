@@ -789,7 +789,7 @@ static void pl_invalidate(const void *ap, uint64_t n, uint64_t caller) {
     uint64_t dt = hit ? pl_now() - t0 : 0;
     os_unfair_lock_lock(&g_plivs_lk);
     { int k = 0; while (k < 32 && g_plivs[k].caller && g_plivs[k].caller != caller) k++;
-      if (k < 32) { int fresh = !g_plivs[k].caller; g_plivs[k].caller = caller; g_plivs[k].n++; g_plivs[k].waited += hit; g_plivs[k].ns += dt;
+      if (k < 32) { int fresh = !g_plivs[k].n; g_plivs[k].caller = caller;   /* first invalidate of this caller (0 = not found: logged once too) */ g_plivs[k].n++; g_plivs[k].waited += hit; g_plivs[k].ns += dt;
           os_unfair_lock_unlock(&g_plivs_lk);
           static uint64_t waits_logged[32]; int log_wait = hit && waits_logged[k]++ < 3;   // the first 3 waits per caller
           if (fresh || log_wait || (hit && g_pl_log > 0)) MLOG("[pipeline] invalidate %#llx+%llu from main+%#llx%s", (unsigned long long)a, (unsigned long long)n, (unsigned long long)caller,
