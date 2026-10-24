@@ -7,6 +7,7 @@
 // (measured: the game writes streamed assets into texture storage that is still being sampled, without re-registering).
 // Signal handler constraint: the page-fault path uses only atomic operations and mprotect, no allocation, no locks.
 #include "nvn_dirty.h"
+#include "totk_timeline.h"
 #include "../../host/dm.h"
 #include <stdatomic.h>
 #include <pthread.h>
@@ -313,7 +314,9 @@ static void pl_before_write(range_t *r, uintptr_t p, uintptr_t a, uintptr_t b, u
         if ((mach_absolute_time() - t0) * g_tb.numer / g_tb.denom > (uint64_t)PL_HOLD_MS * 1000000ull) { atomic_fetch_add(&g_pl_st[NVN_PLS_TIMEOUT], 1); break; }
         pl_nap();
     }
-    atomic_fetch_add(&g_pl_st[NVN_PLS_HOLD_NS], (mach_absolute_time() - t0) * g_tb.numer / g_tb.denom);
+    uint64_t held = (mach_absolute_time() - t0) * g_tb.numer / g_tb.denom;
+    atomic_fetch_add(&g_pl_st[NVN_PLS_HOLD_NS], held);
+    if (totk_tl_on()) totk_tl_at(TL_HOLD, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - held, held, pc);
 }
 static inline void pl_wrote(range_t *r, uintptr_t p) {   // the page became writable for a CPU write (unprotect_page)
     if (!r->pl_wf || p >= r->pl_cap) return;
