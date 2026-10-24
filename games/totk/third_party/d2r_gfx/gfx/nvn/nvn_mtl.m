@@ -6829,6 +6829,7 @@ static MTLBlendOperation bop(int e) { switch (e) { case 2: return MTLBlendOperat
 // Pipeline: cached by (program, target formats, blend / write mask, vertex layout, sample count)
 static const uint8_t *g_pso_lmap; static id<MTLFunction> g_pso_fsfn; static pso_fz_desc g_pso_fz, g_fz_desc;
 static int g_pso_fbr;   // TOTK_FBREAD: this pipeline reads the tile (fbread_fn); not recorded for the warm-up
+static long g_fbr_draws, g_fbr_wait;   // TOTK_FBREAD: draws that read the tile / that drew plain while its pipeline compiled
 static os_unfair_lock g_fz_fn_lock = OS_UNFAIR_LOCK_INIT;
 static NSMutableDictionary<NSString *, id<MTLFunction>> *g_bf_fn_cache;
 static NSMutableDictionary<NSString *, id<MTLLibrary>> *g_bf_lib_cache;
@@ -7616,7 +7617,7 @@ static void pso_adopt(const pso_key *k, NvShader *vs, NvShader *fs, int border, 
 /* Async pipelines (async shaders): a draw that may be skipped (draw_may_skip) does not wait for a new pipeline. It is
    compiled on a background queue from the same descriptor and adopted by the submit thread (apso_claim); until then
    pso_get returns nil with g_pso_deferred set and the draw is skipped. Merged-pass pipelines are not deferred. */
-@interface ApsoItem : NSObject { @public pso_key k; NvShader *vs, *fs; int border; id<MTLRenderPipelineState> ps; NSError *e; uint64_t bt; NSString *brec; } @end
+@interface ApsoItem : NSObject { @public pso_key k; NvShader *vs, *fs; int border, fbr; id<MTLRenderPipelineState> ps; NSError *e; uint64_t bt; NSString *brec; } @end
 @implementation ApsoItem @end
 static nvn_hmap g_apso_wait = {.klen = sizeof(pso_key)};   // submit thread: keys compiling (@YES) or failed (kCFNull)
 static NSMutableArray<ApsoItem *> *g_apso_done;
@@ -7628,18 +7629,19 @@ static void apso_claim(void) {
     if (!atomic_exchange(&g_apso_ready, 0)) return;
     os_unfair_lock_lock(&g_apso_lock); NSArray<ApsoItem *> *done = g_apso_done; g_apso_done = nil; os_unfair_lock_unlock(&g_apso_lock);
     for (ApsoItem *it in done) {
-        if (it->ps) { hm_del_id(&g_apso_wait, &it->k); pso_adopt(&it->k, it->vs, it->fs, it->border, 0, it->ps, it->bt, 1, it->brec); continue; }
+        if (it->ps) { hm_del_id(&g_apso_wait, &it->k); int f0 = g_pso_fbr; g_pso_fbr = it->fbr; pso_adopt(&it->k, it->vs, it->fs, it->border, it->fbr, it->ps, it->bt, 1, it->brec); g_pso_fbr = f0; continue; }
         hm_put_id(&g_apso_wait, &it->k, (__bridge id)kCFNull);   // later draws build it synchronously and report the failure as before
         static int said; if (said++ < 12) MLOG("【红】后台建渲染管线失败：%s（vs %s ps %s）", it->e.localizedDescription.UTF8String, it->vs->key, it->fs ? it->fs->key : "-");
     }
 }
-static int apso_defer(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> bfn, NSString *brec) {
+/* fbr: a TOTK_FBREAD pipeline (k->lmap identity, fsfn its tile-reading function), built like a merged-pass one. */
+static int apso_defer_ex(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> bfn, NSString *brec, int fbr) {
     id waiting = hm_get_id(&g_apso_wait, k);
     if (waiting) return waiting != (__bridge id)kCFNull;
-    int pend = pso_pend_state(k);   // predicted by pso_predict_rest: take it once compiled, never wait for it
+    int pend = fbr ? -1 : pso_pend_state(k);   // predicted by pso_predict_rest: take it once compiled, never wait for it
     if (pend >= 0) return !pend;
-    ApsoItem *it = [ApsoItem new]; it->k = *k; it->vs = vs; it->fs = fs; it->border = bfn != nil; it->bt = bp_now(); it->brec = brec;
-    MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, bfn, 0); NSString *key = pso_archive_key(k, vs, fs, 0);
+    ApsoItem *it = [ApsoItem new]; it->k = *k; it->vs = vs; it->fs = fs; it->border = bfn != nil; it->fbr = fbr; it->bt = bp_now(); it->brec = brec;
+    MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, fbr ? (__bridge id<MTLFunction>)k->fsfn : bfn, fbr); NSString *key = pso_archive_key(k, vs, fs, fbr);
     hm_put_id(&g_apso_wait, k, @YES);
     // A few serial queues: a new area can bring hundreds of pipelines at once, which should not take every core from the game.
     static dispatch_queue_t q[APSO_QUEUES]; static unsigned next;
@@ -7654,6 +7656,7 @@ static int apso_defer(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFuncti
     });
     return 1;
 }
+static int apso_defer(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> bfn, NSString *brec) { return apso_defer_ex(k, vs, fs, bfn, brec, 0); }
 /* TOTK: plain pointer for the same reason as prog_get_p: every pipeline returned is in g_pso (pso_adopt puts each new one there). */
 #define pso_get(pr, d) ((__bridge id<MTLRenderPipelineState>)pso_get_p((pr), (d)))
 static void *pso_get_p(NvProg *pr, MTLRenderPassDescriptor *unused) {
@@ -7706,6 +7709,8 @@ static void *pso_get_p(NvProg *pr, MTLRenderPassDescriptor *unused) {
         if (g_vmissing) { g_pso_deferred = 1; return NULL; }
     }
     if (!g_pso_lmap && draw_may_skip(pr) && apso_defer(&k, vs, fs, bfn, brec)) { g_pso_deferred = 1; return NULL; }
+    if (g_pso_fbr && apso_defer_ex(&k, vs, fs, nil, nil, 1)) {   // TOTK_FBREAD: the tile-reading pipeline compiles in the background; the plain one meanwhile
+        g_pso_lmap = NULL; g_pso_fsfn = nil; g_pso_fbr = 0; g_fbr_wait++; return pso_get_p(pr, unused); }
     id<MTLRenderPipelineState> ps;
     NSError *e = nil; uint64_t bt = bp_now();
     ps = g_pso_lmap ? nil : pso_pend_take(&k);
@@ -10717,7 +10722,6 @@ static int fbr_vs_ok(NvShader *vs, NSString *locn) {   // the vertex output at l
     return [D[n] ?: @"" isEqualToString:[@"-" stringByAppendingString:py]];
 }
 static NSMutableDictionary *g_fbr_cache; static os_unfair_lock g_fbr_lock = OS_UNFAIR_LOCK_INIT;
-static long g_fbr_draws;   // draws that read the tile
 /* The tile-reading fragment function for this draw, nil when it cannot be proven (the caller keeps the old path).
    Cached per (vertex shader, fragment shader, sampled slot -> attachment); the first use compiles the rewritten MSL. */
 static id<MTLFunction> fbread_fn(NvProg *pr) {
@@ -10752,45 +10756,53 @@ static id<MTLFunction> fbread_fn(NvProg *pr) {
     os_unfair_lock_lock(&g_fbr_lock);
     if (!g_fbr_cache) g_fbr_cache = [NSMutableDictionary dictionary];
     id hit = g_fbr_cache[key];
+    if (!hit) g_fbr_cache[key] = @YES;   // pending: the rewrite and its compile run in the background, the draw keeps the old path
     os_unfair_lock_unlock(&g_fbr_lock);
-    if (hit) return hit == VARIANT_NONE ? nil : hit;
-    id fn = VARIANT_NONE; NSString *why = nil;
-    NSMutableString *src = [sh_src(fs) mutableCopy]; NSDictionary *D = fbr_ssa(src); NSMutableSet *used = [NSMutableSet set];
-    for (int q = 0; q < nr && !why; q++) {
-        int reg = regj[q] & 0xff, j = regj[q] >> 8;
-        NSString *t = [NSString stringWithFormat:@"spvDescriptorSet0.fp_t_tcb_%X", reg * 2 + 8];
-        NSString *pat = [NSString stringWithFormat:@"%@\\.sample\\(%@Smplr, select\\((_\\d+), float2\\(0\\.0\\), isnan\\(\\1\\)\\)\\)", [NSRegularExpression escapedPatternForString:t], [NSRegularExpression escapedPatternForString:t]];
-        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pat options:0 error:nil];
-        NSArray *ms = [re matchesInString:src options:0 range:NSMakeRange(0, src.length)];
-        NSUInteger all = [src componentsSeparatedByString:[t stringByAppendingString:@"."]].count - 1;
-        if (!ms.count || ms.count != all) { why = [NSString stringWithFormat:@"slot %d: %lu of %lu uses are plain samples", reg, (unsigned long)ms.count, (unsigned long)all]; break; }
-        for (NSTextCheckingResult *m in ms) {
-            NSString *v = [src substringWithRange:[m rangeAtIndex:1]], *r = D[v], *a, *b, *mv = nil;
-            if (!r || ![r hasPrefix:@"float2("] || ![r hasSuffix:@")"]) { why = @"coordinate is not float2(a, b)"; break; }
-            NSArray *ab = [[r substringWithRange:NSMakeRange(7, r.length - 8)] componentsSeparatedByString:@", "];
-            if (ab.count != 2) { why = @"coordinate is not float2(a, b)"; break; } a = ab[0]; b = ab[1];
-            if (!fbr_coord(D, a, @"x", &mv) || !fbr_coord(D, b, @"y", &mv)) { why = @"coordinate is not in.M.xy / in.M.w"; break; }
-            NSRegularExpression *rl = [NSRegularExpression regularExpressionWithPattern:[NSString stringWithFormat:@"float4 %@ \\[\\[user\\((locn\\d+)\\)\\]\\];", mv] options:0 error:nil];
-            NSTextCheckingResult *l = [rl firstMatchInString:src options:0 range:NSMakeRange(0, src.length)];
-            if (!l) { why = @"varying is not a plain float4"; break; }
-            if (!fbr_vs_ok(vs, [src substringWithRange:[l rangeAtIndex:1]])) { why = @"vertex output is not the screen position"; break; }
+    if (hit) return hit == VARIANT_NONE || hit == (id)@YES ? nil : hit;
+    int *rj = malloc(sizeof(int) * (size_t)nr); memcpy(rj, regj, sizeof(int) * (size_t)nr); NSString *ckey = [key copy];
+    static dispatch_queue_t q; static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("totk.fbread", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0)); });
+    dispatch_async(q, ^{ @autoreleasepool {
+        const int *regj = rj;
+        id fn = VARIANT_NONE; NSString *why = nil;
+        NSMutableString *src = [sh_src(fs) mutableCopy]; NSDictionary *D = fbr_ssa(src); NSMutableSet *used = [NSMutableSet set];
+        for (int i = 0; i < nr && !why; i++) {
+            int reg = regj[i] & 0xff, j = regj[i] >> 8;
+            NSString *t = [NSString stringWithFormat:@"spvDescriptorSet0.fp_t_tcb_%X", reg * 2 + 8];
+            NSString *pat = [NSString stringWithFormat:@"%@\\.sample\\(%@Smplr, select\\((_\\d+), float2\\(0\\.0\\), isnan\\(\\1\\)\\)\\)", [NSRegularExpression escapedPatternForString:t], [NSRegularExpression escapedPatternForString:t]];
+            NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pat options:0 error:nil];
+            NSArray *ms = [re matchesInString:src options:0 range:NSMakeRange(0, src.length)];
+            NSUInteger all = [src componentsSeparatedByString:[t stringByAppendingString:@"."]].count - 1;
+            if (!ms.count || ms.count != all) { why = [NSString stringWithFormat:@"slot %d: %lu of %lu uses are plain samples", reg, (unsigned long)ms.count, (unsigned long)all]; break; }
+            for (NSTextCheckingResult *m in ms) {
+                NSString *v = [src substringWithRange:[m rangeAtIndex:1]], *r = D[v], *a, *b, *mv = nil;
+                if (!r || ![r hasPrefix:@"float2("] || ![r hasSuffix:@")"]) { why = @"coordinate is not float2(a, b)"; break; }
+                NSArray *ab = [[r substringWithRange:NSMakeRange(7, r.length - 8)] componentsSeparatedByString:@", "];
+                if (ab.count != 2) { why = @"coordinate is not float2(a, b)"; break; } a = ab[0]; b = ab[1];
+                if (!fbr_coord(D, a, @"x", &mv) || !fbr_coord(D, b, @"y", &mv)) { why = @"coordinate is not in.M.xy / in.M.w"; break; }
+                NSRegularExpression *rl = [NSRegularExpression regularExpressionWithPattern:[NSString stringWithFormat:@"float4 %@ \\[\\[user\\((locn\\d+)\\)\\]\\];", mv] options:0 error:nil];
+                NSTextCheckingResult *l = [rl firstMatchInString:src options:0 range:NSMakeRange(0, src.length)];
+                if (!l) { why = @"varying is not a plain float4"; break; }
+                if (!fbr_vs_ok(vs, [src substringWithRange:[l rangeAtIndex:1]])) { why = @"vertex output is not the screen position"; break; }
+            }
+            if (why) break;
+            NSString *rep = [NSString stringWithFormat:@"fbin_%d", j];
+            for (NSTextCheckingResult *m in ms.reverseObjectEnumerator) [src replaceCharactersInRange:m.range withString:rep];
+            [used addObject:@(j)];
         }
-        if (why) break;
-        NSString *rep = [NSString stringWithFormat:@"fbin_%d", j];
-        for (NSTextCheckingResult *m in ms.reverseObjectEnumerator) [src replaceCharactersInRange:m.range withString:rep];
-        [used addObject:@(j)];
-    }
-    if (!why) {
-        NSRange sig = [src rangeOfString:@"fragment main0_out main0("]; NSRange end = sig.location == NSNotFound ? sig : [src rangeOfString:@")\n{" options:0 range:NSMakeRange(sig.location, src.length - sig.location)];
-        if (sig.location == NSNotFound || end.location == NSNotFound) why = @"entry signature not found";
-        else { NSMutableString *add = [NSMutableString string]; for (NSNumber *j in used) [add appendFormat:@", float4 fbin_%d [[color(%d)]]", j.intValue, j.intValue];
-            [src insertString:add atIndex:end.location]; }
-    }
-    if (!why) { NSError *e = nil; id<MTLLibrary> lib = variant_library(src, &e); id f = lib ? [lib newFunctionWithName:fs->fn.name] : nil;
-        if (f) fn = f; else why = [NSString stringWithFormat:@"compile: %@", e.localizedDescription]; }
-    MLOG("[fbread] %s / %s: %s", vs->key, fs->key, why ? why.UTF8String : "reads the tile");
-    os_unfair_lock_lock(&g_fbr_lock); g_fbr_cache[key] = fn; os_unfair_lock_unlock(&g_fbr_lock);
-    return fn == VARIANT_NONE ? nil : fn;
+        if (!why) {
+            NSRange sig = [src rangeOfString:@"fragment main0_out main0("]; NSRange end = sig.location == NSNotFound ? sig : [src rangeOfString:@")\n{" options:0 range:NSMakeRange(sig.location, src.length - sig.location)];
+            if (sig.location == NSNotFound || end.location == NSNotFound) why = @"entry signature not found";
+            else { NSMutableString *add = [NSMutableString string]; for (NSNumber *j in used) [add appendFormat:@", float4 fbin_%d [[color(%d)]]", j.intValue, j.intValue];
+                [src insertString:add atIndex:end.location]; }
+        }
+        if (!why) { NSError *e = nil; id<MTLLibrary> lib = variant_library(src, &e); id f = lib ? [lib newFunctionWithName:fs->fn.name] : nil;
+            if (f) fn = f; else why = [NSString stringWithFormat:@"compile: %@", e.localizedDescription]; }
+        MLOG("[fbread] %s / %s: %s", vs->key, fs->key, why ? why.UTF8String : "reads the tile");
+        free(rj);
+        os_unfair_lock_lock(&g_fbr_lock); g_fbr_cache[ckey] = fn; os_unfair_lock_unlock(&g_fbr_lock);
+    } });
+    return nil;
 }
 static void bloomq_reset(void) { memset(&g_bloomq, 0, sizeof g_bloomq); }
 static int bloomq_enabled(void) {
