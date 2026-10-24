@@ -338,13 +338,23 @@ static int async_preempt_on(void) {   // holding G
     }
     return g_async_preempt;
 }
+#ifndef GAME_BOTW
+/* TOTK_ASYNC_PREEMPT_MAXW=<priority> (default 44, 2026-10-24): only waiters at that priority or better signal an owner;
+   worse ones preempt at the owner's next SVC as before. With every waiter signalling, the save load livelocked about
+   3 times in 4 (priority 48-58 loader threads polling with yields kept handing the three cores among themselves, 76k
+   signals; hr-pr-1). The stall being fixed is the main thread and the job workers (44) and the 30-32 system threads
+   waiting behind a priority-58 thread's 30 ms of guest code (RESULTS.md 2026-10-24). */
+static int async_waiter_ok(const thr_t *t) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_ASYNC_PREEMPT_MAXW"); v = e ? atoi(e) : 44; } return eff_prio(t) <= v; }
+#else
+static int async_waiter_ok(const thr_t *t) { (void)t; return 1; }
+#endif
 static int core_kick(thr_t *t) {   // holding G, t waiting: mark (and signal) the owners t may preempt; returns how many
     int n = 0; uint64_t now = now_ns();
     for (int i = 0; i < NCORE; i++) {
         thr_t *o = g_core_owner[i];
         if (!o || !core_allowed(t, i) || !core_beats(t, o, now)) continue;
         __atomic_store_n(&o->preempt, 1, __ATOMIC_RELEASE); n++;
-        if (async_preempt_on() && !pthread_kill(o->pt, SIGUSR2)) g_preempt_kicks++;
+        if (async_preempt_on() && async_waiter_ok(t) && !pthread_kill(o->pt, SIGUSR2)) g_preempt_kicks++;
     }
     return n;
 }
