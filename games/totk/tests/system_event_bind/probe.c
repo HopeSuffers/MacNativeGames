@@ -39,10 +39,8 @@
 _Noreturn void runtime_fail(const char *message) { fprintf(stderr, "FAIL %s\n", message); exit(1); }
 void runtime_thread_init(void) {}
 uint64_t runtime_now_ns(void) { mach_timebase_info_data_t t; mach_timebase_info(&t); return (uint64_t)((__uint128_t)mach_absolute_time() * t.numer / t.denom); }
-#ifdef GAME_BOTW
 uint64_t runtime_hle_tsd_off;                                   /* hle_stack.c: 0 = no host-stack slot, the preemption signal does nothing */
 int runtime_guest_code_pc(uint64_t pc) { (void)pc; return 0; }  /* loader.c */
-#endif
 void hle_bind_system_event(void *event, int autoclear);
 void hle_signal_system_event(void *event);
 static void need(int c, const char *m) { if (!c) runtime_fail(m); }

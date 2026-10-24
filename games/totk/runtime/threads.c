@@ -31,6 +31,8 @@
 #include <mach/mach.h>
 #include <pthread/qos.h>
 #include <dlfcn.h>
+#include <unistd.h>
+#include <stdatomic.h>
 
 #define R_TIMEOUT     0xEA01u   // 内核模块 1，描述 117 | Kernel module 1, description 117
 #define R_CANCELLED   0xEC01u   // 118
@@ -77,6 +79,10 @@ typedef struct thr {
     uint32_t wh[4]; int nwh;   // handles of the current WaitSynchronization (state dump)
     int last_hle;              // 1 + wrapper index of the last host call made while "hletrace" was on (state dump)
     uint64_t yrun_ns, yrun_svc;   // the current run of yields: when it started, and nsvc at its last yield (yield_backoff_ns)
+    int eco_epoch;                // g_eco_epoch this thread last applied (eco_apply)
+    int is_main;                  // the game's main thread (svc_thread_main_init)
+    int resume_first;             // TOTK async preemption: took the core away in the signal handler; gets it back first (core_grant)
+    uint64_t cpu_prev_us;         // TOTK_THREAD_CPU: CPU time at the previous report
 #ifdef GAME_BOTW
     uint64_t cwait_ns;            // when it last queued for a virtual core (starvation rule, core_beats)
     uint64_t protect_until;       // given a core by the starvation rule: no priority preemption before this
@@ -216,7 +222,22 @@ static int eff_prio(const thr_t *o) {
 #define PROTECT_NS 2000000ull
 static uint64_t g_starve_grants;
 static int starved(const thr_t *w, uint64_t now) { sched_knobs(); return g_starve_on && w->cwait_ns && now - w->cwait_ns >= STARVE_NS; }
+#else
+/* Tears of the Kingdom: asynchronous preemption (TOTK_ASYNC_PREEMPT=1, see core_beats below) is off by default. Set once in
+   svc_thread_main_init, before any other guest thread exists; with it off every path below is the old one. */
+static int g_tk_async;
+/* With it on, a core owner runs, for the virtual cores, at the priority of the best thread blocked on a guest mutex it owns
+   (Horizon's priority inheritance, as in Breath of the Wild without its diagnostic knobs). Preempting at any guest
+   instruction would otherwise often catch a low-priority thread inside a critical section and let a middle-priority thread
+   keep a better thread blocked on that mutex for as long as it runs. Holding G. */
+static int eff_prio(const thr_t *o) {
+    int p = o->prio;
+    for (const thr_t *w = g_wait; w; w = w->next)
+        if (w->wkind == 1 && w->waddr && (__atomic_load_n((const uint32_t *)(uintptr_t)w->waddr, __ATOMIC_RELAXED) & ~WAITERS_BIT) == o->handle && w->prio < p) p = w->prio;
+    return p;
+}
 #endif
+static int async_waiter_ok(const thr_t *t);
 static void core_grant(int c) {   // holding G: give free core c to the best waiter
     thr_t *b = NULL, **bp = NULL;
 #ifdef GAME_BOTW
@@ -229,6 +250,22 @@ static void core_grant(int c) {   // holding G: give free core c to the best wai
     if (b && bst) { b->protect_until = now + PROTECT_NS; if (g_starve_grants++ < 20) fprintf(stderr, "[threads] core %d to thread %#x (priority %d) after %.1f ms waiting: starvation rule\n", c, b->handle, b->prio, (now - b->cwait_ns) / 1e6); }
     if (b) b->cqueued = 0;
 #else
+    if (g_tk_async) {   // by effective priority (inheritance), then first come
+        int bpri = 0; thr_t *r = NULL, **rp = NULL;
+        for (thr_t **p = &g_core_wait; *p; p = &(*p)->cnext) {
+            if (!core_allowed(*p, c)) continue;
+            int pr = eff_prio(*p);
+            if (!b || pr < bpri || (pr == bpri && (*p)->cseq < b->cseq)) { b = *p; bp = p; bpri = pr; }
+            if ((*p)->resume_first && (!r || (*p)->cseq < r->cseq)) { r = *p; rp = p; }
+        }
+        /* A thread the signal took the core from gets it back before every waiter that is not itself allowed to signal
+           (async_waiter_ok): the preemption only inserts the better thread's run. Otherwise a waiter of middle priority
+           took the core next and spun on work behind a guest mutex the preempted thread held (save-load livelock with
+           the pipeline, hr-both3-4: 0x1006 priority 48 spinning on core 1, 0x1011 priority 52 owning the mutex 0x1010 /
+           0x1012 waited on, queued for core 1). */
+        if (r && b != r && !async_waiter_ok(b)) { b = r; bp = rp; }
+        if (b) b->resume_first = 0;
+    } else
     for (thr_t **p = &g_core_wait; *p; p = &(*p)->cnext)
         if (core_allowed(*p, c) && (!b || (*p)->prio < b->prio || ((*p)->prio == b->prio && (*p)->cseq < b->cseq))) { b = *p; bp = p; }
 #endif
@@ -239,7 +276,6 @@ static void core_put(thr_t *t) {   // holding G
     if (t->cur_core < 0) return;
     int c = t->cur_core; t->cur_core = -1; t->preempt = 0; g_core_owner[c] = NULL; core_grant(c);
 }
-#ifdef GAME_BOTW
 /* Asynchronous preemption (Breath of the Wild, botw.md). Horizon switches a core to a better thread the moment that thread
    becomes ready, wherever the running one is. BotW's job workers spin on user-mode spinlocks without any SVC, so preempting
    only at SVC entry let spinning workers keep cores that better threads waited for, forever (2026-10-19: workers 0x1009 /
@@ -250,16 +286,27 @@ static void core_put(thr_t *t) {   // holding G
    guest code that a host function called). It then holds no host lock and is not in libc, so waiting in the handler is
    like a kernel switch. Otherwise it keeps the core until its next SVC or the next signal. Who may preempt is Horizon's
    rule: a strictly better priority, or at priority 59 (Horizon rotates that priority on cores 0-2 every 10 ms) a waiter
-   once the owner has held the core 10 ms. TOTK_ASYNC_PREEMPT=0 leaves only the preemption at SVC entry. */
+   once the owner has held the core 10 ms. TOTK_ASYNC_PREEMPT=0 leaves only the preemption at SVC entry.
+   Tears of the Kingdom (2026-10-24): off unless TOTK_ASYNC_PREEMPT=1. Its priority-58 background thread 0x1015 (core 2 only)
+   runs 25-35 ms of guest code without an SVC about 3 times a second while threads at 32 and 44 (a job worker the main thread
+   waits for) wait for core 2: 40 ms frames. With the switch on it uses the signal, the safe-point test, the re-kicking wait
+   in core_take, Horizon's rule (core_beats), priority inheritance (eff_prio) and the main thread's host-service stack
+   (loader.c, so the main thread can be preempted too; TOTK_MAIN_PREEMPT=0 leaves it out). Breath of the Wild's starvation
+   rule, protect_until and wake_queue stay BotW-only. */
 #include <string.h>
 #include <sys/ucontext.h>
 static int g_async_preempt = -1;
 static uint64_t g_preempt_kicks, g_preempt_async;   // signals sent / cores given up in the handler (state dump)
 static int core_beats(const thr_t *w, const thr_t *o, uint64_t now) {   // holding G: may waiter w take running o's core?
+#ifdef GAME_BOTW
     if (now < o->protect_until) return 0;
+#endif
     int wp = eff_prio(w), op = eff_prio(o);
     return wp < op || (wp == op && op == 59 && now - o->core_since >= 10000000ull)
-        || (starved(w, now) && now - o->core_since >= STARVE_NS);
+#ifdef GAME_BOTW
+        || (starved(w, now) && now - o->core_since >= STARVE_NS)
+#endif
+        ;
 }
 static int core_should_yield(const thr_t *t) {   // holding G: does a waiter that may run on t's core beat t?
     uint64_t now = now_ns();
@@ -269,26 +316,67 @@ static int core_should_yield(const thr_t *t) {   // holding G: does a waiter tha
 static void preempt_signal(int sig, siginfo_t *si, void *context);
 static int async_preempt_on(void) {   // holding G
     if (g_async_preempt < 0) {
-        const char *e = getenv("TOTK_ASYNC_PREEMPT"); g_async_preempt = !(e && !strcmp(e, "0"));
+        const char *e = getenv("TOTK_ASYNC_PREEMPT");
+#ifdef GAME_BOTW
+        g_async_preempt = !(e && !strcmp(e, "0"));
+#else
+        g_async_preempt = e && *e && strcmp(e, "0");   /* Tears of the Kingdom: off unless asked for */
+#endif
         if (g_async_preempt) {
             struct sigaction a = {0}; a.sa_sigaction = preempt_signal; a.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
             sigemptyset(&a.sa_mask);
             if (sigaction(SIGUSR2, &a, NULL)) g_async_preempt = 0;
         }
+#ifdef GAME_BOTW
         fprintf(stderr, "[threads] asynchronous preemption of virtual cores: %s\n", g_async_preempt ? "on" : "off (TOTK_ASYNC_PREEMPT=0)");
+#else
+        fprintf(stderr, "[threads] asynchronous preemption of virtual cores: %s\n", g_async_preempt ? "on (TOTK_ASYNC_PREEMPT=1)" : "off (signal handler not installed)");
+#endif
     }
     return g_async_preempt;
 }
+#ifndef GAME_BOTW
+/* TOTK_ASYNC_PREEMPT_MAXW=<priority> (default 44, 2026-10-24): only waiters at that priority or better signal an owner;
+   worse ones preempt at the owner's next SVC as before. With every waiter signalling, the save load livelocked about
+   3 times in 4 (priority 48-58 loader threads polling with yields kept handing the three cores among themselves, 76k
+   signals; hr-pr-1). The stall being fixed is the main thread and the job workers (44) and the 30-32 system threads
+   waiting behind a priority-58 thread's 30 ms of guest code (RESULTS.md 2026-10-24). */
+static int async_waiter_ok(const thr_t *t) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_ASYNC_PREEMPT_MAXW"); v = e ? atoi(e) : 44; } return eff_prio(t) <= v; }
+/* TOTK_ASYNC_PREEMPT_MINO=<priority> (default 55): and only owners at that priority or worse are signalled. With owners
+   of any worse priority signalled, the job workers (44) took the cores from the priority 48-54 loader threads at every
+   turn and the save load never finished (hr-both4-2, GPU busy, workers spinning on locks / yields). The stall being fixed
+   is a priority-58 thread's 30 ms of guest code without an SVC. */
+static int async_owner_ok(const thr_t *o) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_ASYNC_PREEMPT_MINO"); v = e ? atoi(e) : 55; } return eff_prio(o) >= v; }
+#else
+static int async_waiter_ok(const thr_t *t) { (void)t; return 1; }
+static int async_owner_ok(const thr_t *o) { (void)o; return 1; }
+#endif
 static int core_kick(thr_t *t) {   // holding G, t waiting: mark (and signal) the owners t may preempt; returns how many
     int n = 0; uint64_t now = now_ns();
     for (int i = 0; i < NCORE; i++) {
         thr_t *o = g_core_owner[i];
         if (!o || !core_allowed(t, i) || !core_beats(t, o, now)) continue;
         __atomic_store_n(&o->preempt, 1, __ATOMIC_RELEASE); n++;
-        if (async_preempt_on() && !pthread_kill(o->pt, SIGUSR2)) g_preempt_kicks++;
+        if (async_preempt_on() && async_waiter_ok(t) && async_owner_ok(o) && !pthread_kill(o->pt, SIGUSR2)) g_preempt_kicks++;
     }
     return n;
 }
+#ifndef GAME_BOTW
+/* Nothing to kick: when to look again. 20 ms (a priority or mask change), or sooner when t is at priority 59 and an owner it
+   may use, also at 59, reaches the 10 ms after which Horizon rotates it out. Holding G. */
+static long core_relook_ns(const thr_t *t) {
+    long ns = 20000000; uint64_t now = now_ns();
+    if (eff_prio(t) != 59) return ns;
+    for (int i = 0; i < NCORE; i++) {
+        const thr_t *o = g_core_owner[i];
+        if (!o || !core_allowed(t, i) || eff_prio(o) != 59) continue;
+        uint64_t at = o->core_since + 10000000ull; long d = at > now ? (long)(at - now) + 100000 : 100000;
+        if (d < ns) ns = d;
+    }
+    return ns;
+}
+#endif
+#ifdef GAME_BOTW
 static void core_unqueue(thr_t *t) {   // holding G: out of the core wait queue, if it is in it
     if (!t->cqueued) return;
     for (thr_t **p = &g_core_wait; *p; p = &(*p)->cnext) if (*p == t) { *p = t->cnext; break; }
@@ -351,20 +439,34 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
 #else
     if (c >= 0) { t->cur_core = c; t->core_since = now_ns(); g_core_owner[c] = t; return; }
     t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t;
+    if (g_tk_async) {   // TOTK_ASYNC_PREEMPT=1: owners t beats are signalled now and again every millisecond while it waits
+        uint64_t w0 = now_ns();
+        while (t->cur_core < 0) {
+            struct timespec again = {0, core_kick(t) ? 1000000 : core_relook_ns(t)};
+            pthread_cond_timedwait_relative_np(&t->cv, &G, &again);
+        }
+        t->core_wait_ns += now_ns() - w0; t->core_waits++;
+    } else {
     for (int i = 0; i < NCORE; i++) if (core_allowed(t, i) && g_core_owner[i] && g_core_owner[i]->prio > t->prio) g_core_owner[i]->preempt = 1;
     uint64_t w0 = now_ns();
     while (t->cur_core < 0) pthread_cond_wait(&t->cv, &G);
     t->core_wait_ns += now_ns() - w0; t->core_waits++;
+    }
     { static int on = -1; static uint64_t last; if (on < 0) on = getenv("TOTK_CORE_LOG") != NULL;   // diagnostic: who waits for a core, every 5 s
       uint64_t now = now_ns(); if (on && now - last > 5000000000ull) { last = now;
         for (thr_t *x = g_all; x; x = x->all) if (x->core_wait_ns > 50000000ull) fprintf(stderr, "[core-wait] thread %#x prio %d mask %#llx: %.1f ms in %llu waits (5 s)\n", x->handle, x->prio, (unsigned long long)x->mask, x->core_wait_ns / 1e6, (unsigned long long)x->core_waits);
+        if (g_tk_async) fprintf(stderr, "[core-wait] asynchronous preemption: %llu signals sent, %llu cores given up in the signal handler (since start)\n", (unsigned long long)g_preempt_kicks, (unsigned long long)g_preempt_async);
         for (thr_t *x = g_all; x; x = x->all) { x->core_wait_ns = 0; x->core_waits = 0; } } }
 #endif
 }
 static thr_t *me_or_null(void) { return g_keythr ? pthread_getspecific(g_keythr) : NULL; }
-#ifdef GAME_BOTW
 extern uint64_t runtime_hle_tsd_off;                 // hle_stack.c: host-stack slot, cleared while a host function runs
 int runtime_guest_code_pc(uint64_t pc);              // loader.c
+/* Safe point (both games): the thread gives its core up here only when it holds one, a waiter has marked it, its host-stack
+   slot is set -- so it is not inside a host function or in guest code a host function called (hle_stack.S / gate.S clear
+   the slot while they run host code), and a thread whose slot was never set is never preempted here -- and pc is in a
+   module's original code (not libc, the runtime, a gate or a rewritten window in the patch area). Host locks are only
+   taken in host code, so it holds none, and waiting for a core here is like a kernel thread switch. */
 static void preempt_signal(int sig, siginfo_t *si, void *context) {
     (void)sig; (void)si;
     thr_t *t = me_or_null();
@@ -374,12 +476,11 @@ static void preempt_signal(int sig, siginfo_t *si, void *context) {
     if (!runtime_hle_tsd_off || !*(volatile uintptr_t *)(tp + runtime_hle_tsd_off) || !runtime_guest_code_pc(pc)) return;
     int saved = errno;
     pthread_mutex_lock(&G);
-    if (t->cur_core >= 0 && core_should_yield(t)) { core_put(t); core_take(t); g_preempt_async++; }
+    if (t->cur_core >= 0 && core_should_yield(t)) { t->resume_first = 1; core_put(t); core_take(t); t->resume_first = 0; g_preempt_async++; }
     else t->preempt = 0;
     pthread_mutex_unlock(&G);
     errno = saved;
 }
-#endif
 void runtime_thread_note_hle(unsigned i) { thr_t *t = me_or_null(); if (t) t->last_hle = (int)i + 1; }   // hle_stack.c, while tracing
 uint32_t runtime_thread_current_handle(void) { thr_t *t = me_or_null(); return t ? t->handle : 0; }
 // Host services that wait for other threads or the GPU give the core up around the wait (no host locks held).
@@ -404,6 +505,16 @@ void runtime_core_checkpoint(void) {
     else t->preempt = 0;
     pthread_mutex_unlock(&G);
     return;
+#endif
+#ifndef GAME_BOTW
+    if (g_tk_async) {   /* TOTK_ASYNC_PREEMPT=1: the flag comes from core_kick; Horizon's rule is checked again before giving the core up */
+        if (!t || t->cur_core < 0 || !__atomic_load_n(&t->preempt, __ATOMIC_ACQUIRE)) return;
+        pthread_mutex_lock(&G);
+        if (t->cur_core >= 0 && core_should_yield(t)) { core_put(t); core_take(t); }
+        else t->preempt = 0;
+        pthread_mutex_unlock(&G);
+        return;
+    }
 #endif
     if (!t || !t->preempt) return;
     pthread_mutex_lock(&G); t->preempt = 0; core_put(t); core_take(t); pthread_mutex_unlock(&G);
@@ -520,6 +631,7 @@ void dm_thread_returned(void) { die("客体线程入口函数返回（Horizon �
 
 // 主线程登记，返回其句柄（交给 nnosInitialize 作主线程句柄）
 // Register the main thread and return its handle (passed to nnosInitialize as the main thread handle)
+void thread_cpu_start(void);
 uint32_t svc_thread_main_init(void) {
     pthread_key_create(&g_keythr, NULL);
     thr_t *t = calloc(1, sizeof *t);
@@ -529,16 +641,23 @@ uint32_t svc_thread_main_init(void) {
 #else
     t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt);
 #endif
-    t->cur_core = -1;
+    t->cur_core = -1; t->is_main = 1;
     pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; core_take(t); pthread_mutex_unlock(&G);
 #ifdef GAME_BOTW
     g_main_handle = t->handle;
+#else
+    { const char *e = getenv("TOTK_ASYNC_PREEMPT");   // before any other guest thread exists: afterwards g_tk_async is only read
+      if (e && *e && strcmp(e, "0")) { pthread_mutex_lock(&G); g_tk_async = async_preempt_on(); pthread_mutex_unlock(&G); } }
 #endif
     pthread_setspecific(g_keythr, t);
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
     pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
+    thread_cpu_start();
     return t->handle;
 }
+#ifndef GAME_BOTW
+int runtime_async_preempt_active(void) { return g_tk_async; }   // loader.c: the main thread's host-service stack goes with it
+#endif
 
 static _Atomic uint64_t g_main_yield_n, g_main_yield_ns;   // 只有客体主线程写；诊断行在同一线程读 | Written only by the guest main thread; the diagnostic line reads it on the same thread
 void dm_main_yield_stats(uint64_t *n, uint64_t *ns) { *n = g_main_yield_n; *ns = g_main_yield_ns; }
@@ -649,7 +768,61 @@ static uint64_t yield_backoff_ns(uint64_t run_ns) {
     return s < (uint64_t)cap ? s : (uint64_t)cap;
 }
 
+/* TOTK_ECO_PRIO=<p> / runtime "flag eco_prio <p>" (2026-10-24, experiment): guest threads whose Horizon priority is
+   numerically >= p (lower priority) run at QOS_CLASS_UTILITY, which Darwin schedules on the efficiency cores; the others
+   stay USER_INTERACTIVE. 64 = off (default). On the fanless Air the sustained package budget is ~12 W and the P-cores are
+   held at DVFS state ~5/20 (pwr, RESULTS.md 2026-10-24), so work an E-core can do in time frees P-core power. Each thread
+   applies a change itself at its next thread SVC (QoS can only be set on the calling thread). */
+static _Atomic int g_eco_prio = -1, g_eco_epoch, g_eco_main;   /* g_eco_main: the game's main thread too (flag eco_main); eco_prio leaves it out */
+static int eco_prio(void) {
+    int v = atomic_load_explicit(&g_eco_prio, memory_order_relaxed);
+    if (v < 0) { const char *e = getenv("TOTK_ECO_PRIO"); v = e ? atoi(e) : 64; if (v < 0) v = 64; atomic_store(&g_eco_prio, v); }
+    return v;
+}
+void runtime_eco_main_set(int v) { atomic_store(&g_eco_main, v != 0); atomic_fetch_add(&g_eco_epoch, 1); LOG("[eco] main thread at %s QoS", v ? "utility" : "user-interactive"); }
+void runtime_eco_prio_set(int p) { atomic_store(&g_eco_prio, p < 0 ? 64 : p); atomic_fetch_add(&g_eco_epoch, 1); LOG("[eco] guest threads with priority >= %d run at utility QoS (efficiency cores)", p); }
+static void eco_apply(thr_t *t) {
+    int ep = atomic_load_explicit(&g_eco_epoch, memory_order_relaxed) + 1;   // +1: the first check always applies (eco_epoch starts at 0)
+    if (t->eco_epoch == ep) return;
+    t->eco_epoch = ep;
+    qos_class_t want = (t->is_main ? atomic_load(&g_eco_main) : t->prio >= eco_prio()) ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INTERACTIVE;
+    if ((uint32_t)want != t->qos) { pthread_set_qos_class_self_np(want, 0); t->qos = (uint32_t)want; }
+}
+/* TOTK_THREAD_CPU=<seconds>: every so many seconds, each live guest thread's CPU share over the interval with its
+   priority, core and entry (to pick eco_prio candidates). */
+static void *thread_cpu_main(void *arg) {
+    int sec = (int)(intptr_t)arg; uint64_t last = now_ns();
+    pthread_setname_np("totk-thread-cpu");
+    for (;;) {
+        sleep((unsigned)sec);
+        uint64_t now = now_ns(); double span = (double)(now - last) / 1e3; last = now;
+        struct { uint32_t h; int prio, core; uint64_t entry; double pct; uint32_t qos; } r[256]; int n = 0;
+        pthread_mutex_lock(&G);
+        for (thr_t *t = g_all; t && n < 256; t = t->all) {
+            if (t->exited || !t->mport) continue;
+            thread_basic_info_data_t bi; mach_msg_type_number_t c = THREAD_BASIC_INFO_COUNT;
+            if (thread_info(t->mport, THREAD_BASIC_INFO, (thread_info_t)&bi, &c) != KERN_SUCCESS) continue;
+            uint64_t us = (uint64_t)bi.user_time.seconds * 1000000 + (uint64_t)bi.user_time.microseconds + (uint64_t)bi.system_time.seconds * 1000000 + (uint64_t)bi.system_time.microseconds;
+            double pct = t->cpu_prev_us && us >= t->cpu_prev_us ? 100.0 * (double)(us - t->cpu_prev_us) / span : 0; t->cpu_prev_us = us;
+            r[n].h = t->handle; r[n].prio = t->prio; r[n].core = t->core; r[n].entry = t->entry; r[n].pct = pct; r[n].qos = t->qos; n++;
+        }
+        pthread_mutex_unlock(&G);
+        for (int i = 1; i < n; i++) for (int j = i; j > 0 && r[j].pct > r[j - 1].pct; j--) { __typeof__(r[0]) x = r[j]; r[j] = r[j - 1]; r[j - 1] = x; }
+        char line[2048]; int o = 0;
+        for (int i = 0; i < n && i < 24 && r[i].pct >= 0.5; i++)
+            o += snprintf(line + o, sizeof line - (size_t)o, " %#x/p%d/c%d/%llx/%s:%.0f%%", r[i].h, r[i].prio, r[i].core, (unsigned long long)r[i].entry, r[i].qos == QOS_CLASS_UTILITY ? "u" : "i", r[i].pct);
+        LOG("[thread-cpu] handle/prio/core/entry/qos:cpu%s", line);
+    }
+    return NULL;
+}
+void thread_cpu_start(void) {
+    static int started; if (started) return; started = 1;
+    const char *e = getenv("TOTK_THREAD_CPU"); int sec = e ? atoi(e) : 0; if (sec <= 0) return;
+    pthread_t th; if (!pthread_create(&th, NULL, thread_cpu_main, (void *)(intptr_t)sec)) pthread_detach(th);
+}
+
 int svc_thread(int num, uint64_t *regs) {
+    { thr_t *me = (g_keythr ? pthread_getspecific(g_keythr) : NULL); if (me) eco_apply(me); }
     { thr_t *me = (g_keythr ? pthread_getspecific(g_keythr) : NULL); if (me) { me->last_svc = num; me->last_lr = regs[30]; me->last_fp = regs[29]; me->nsvc++; } }
 
     switch (num) {
@@ -754,6 +927,8 @@ int svc_thread(int num, uint64_t *regs) {
         if (ld32(addr) == ((uint32_t)regs[0] | WAITERS_BIT)) { t->waddr = addr; t->wtag = (uint32_t)regs[2];
 #ifdef GAME_BOTW
             for (thr_t *o = g_core_wait; o; o = o->cnext) if (o->handle == (uint32_t)regs[0]) { pthread_cond_signal(&o->cv); break; }   // an owner waiting for a core looks again (eff_prio)
+#else
+            if (g_tk_async) for (thr_t *o = g_core_wait; o; o = o->cnext) if (o->handle == (uint32_t)regs[0]) { pthread_cond_signal(&o->cv); break; }   // as BotW: it now inherits this waiter's priority
 #endif
             r = block(t, 1, -1); }
         pthread_mutex_unlock(&G);
@@ -1042,6 +1217,11 @@ static void dump_threads(unsigned secs) {
     fprintf(stderr, "[totk-dump] preemption signals %llu, cores given up in the signal handler %llu, starvation grants %llu\n",
             (unsigned long long)g_preempt_kicks, (unsigned long long)g_preempt_async, (unsigned long long)g_starve_grants);
     for (thr_t *w = g_core_wait; w; w = w->cnext) if (eff_prio(w) != w->prio) fprintf(stderr, "[totk-dump] core waiter %#x runs at %d (owns a mutex a better thread waits for)\n", w->handle, eff_prio(w));
+#else
+    if (g_tk_async) {
+        fprintf(stderr, "[totk-dump] preemption signals %llu, cores given up in the signal handler %llu\n", (unsigned long long)g_preempt_kicks, (unsigned long long)g_preempt_async);
+        for (thr_t *w = g_core_wait; w; w = w->cnext) if (eff_prio(w) != w->prio) fprintf(stderr, "[totk-dump] core waiter %#x runs at %d (owns a mutex a better thread waits for)\n", w->handle, eff_prio(w));
+    }
 #endif
     thr_t *run[64]; int nrun = 0;
     for (thr_t *t = g_all; t; t = t->all) {
