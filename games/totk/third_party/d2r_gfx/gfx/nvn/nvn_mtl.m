@@ -2803,6 +2803,7 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "mfx_upscale")) { mfxup_set(v < 0 ? !mfxup_enabled() : v); return; }   // TOTK_MFX_UPSCALE at run time (manual key 3 picture mode)
     if (!strcmp(name, "mfx_interp")) { mfx_set(v); return; }
     if (!strcmp(name, "link_pause")) { void mtl_link_pause(int on); mtl_link_pause(v); MLOG("[flag] link_pause = %d (the display link stops calling back, as when the system stalls it)", v != 0); return; }   // tests the display-link rescue
+    if (!strcmp(name, "eq_tol")) { extern _Atomic int g_eq_tol; atomic_store(&g_eq_tol, v != 0); MLOG("[flag] eq_tol = %d", v != 0); return; }
     if (!strcmp(name, "fbread")) { extern _Atomic int g_fbread; atomic_store(&g_fbread, v != 0); MLOG("[flag] fbread = %d", v != 0); return; }
     if (!strcmp(name, "draw_log")) { extern _Atomic long g_draw_log; atomic_store(&g_draw_log, v); MLOG("[flag] draw_log: every draw and dispatch of the next %d frames", v); return; }
     if (!strcmp(name, "uw_log")) { extern _Atomic long g_uw_log; atomic_store(&g_uw_log, v); MLOG("[flag] uw_log: canvas draws of the next %d frames", v); return; }   // key 4 UI squeeze diagnostic
@@ -11168,6 +11169,21 @@ static void mfx_take_camera(void) {
     } else { static int said; if (said++ < 5) MLOG("[mfx] G-buffer pass %llu: vertex uniform 1 is %#llx / %llu bytes, not the 2368-byte camera block (frame %llu)", g_stat_pass,
                                                  (unsigned long long)u->addr, (unsigned long long)u->size, (unsigned long long)atomic_load(&g_cur_frame)); }
 }
+/* TOTK_EQ_TOL (default on, =0 off): a draw that tests depth EQUAL against what an earlier draw wrote, without writing
+   depth, stencil or blending, is issued once more with a depth bias of -1 unit (one ulp of the float depth for depths in
+   [0.5, 1)). TotK draws foliage twice: a depth pre-pass (alpha-tested, d831fc0e / 8cc34bd8) and the G-buffer pass with
+   EQUAL (2a58a3e6 / cf61b26f). Here the second pass came out exactly 1 ulp farther on a few % of the leaf pixels (measured
+   2026-10-24: 17,385 equal, 704 one ulp farther), which left them out of the G-buffer: black specks in every tree. The
+   console's depth is D24 (we keep D32F); the re-issue lets those pixels pass and leaves the rest as they were (a pixel
+   passing both times is written twice with the same values). Not for D16 targets (the material-ID passes). */
+static long g_eq_tol_n;
+_Atomic int g_eq_tol = -1;   // flag eq_tol 0/1
+static int eq_tol_draw(void) {
+    int on = atomic_load_explicit(&g_eq_tol, memory_order_relaxed); if (on < 0) { const char *e = getenv("TOTK_EQ_TOL"); on = !(e && !strcmp(e, "0")); atomic_store(&g_eq_tol, on); }
+    if (!on || !S.ds.dt || S.ds.dw || S.ds.df != NVN_DEPTH_FUNC_EQUAL || S.ds.st || S.color.blend_en || (S.poly.offset_en & 4) || S.ms.a2c) return 0;
+    return g_pass.dfmt == MTLPixelFormatDepth32Float || g_pass.dfmt == MTLPixelFormatDepth32Float_Stencil8;
+}
+
 static void draw_inner(const p_draw *dw, const p_draw_idx *di);
 /* Diagnostic DM_NVN_NANDRAW=<first>-<last frame> (log DM_NVN_NANDRAW_LOG, default analysis/nandraw.tsv): after every
    draw into a full-size RG11B10F or R32F colour attachment (the HDR target, the linear depth), end the pass and count
@@ -12225,6 +12241,8 @@ frz_plain:;
     } else if (dw) {
         if (dw->count && (dw->instances > 1 || dw->base_instance)) enc_r_draw_instanced(en, mp, dw->first, dw->count, dw->instances, dw->base_instance);
         else if (dw->count && dw->instances >= 0) enc_r_draw(en, mp, dw->first, dw->count);
+        if (dw->count && dw->instances >= 0 && !(dw->instances > 1 || dw->base_instance) && eq_tol_draw()) {   // TOTK_EQ_TOL (see eq_tol_draw)
+            enc_r_depth_bias(en, -1, 0, 0); enc_r_draw(en, mp, dw->first, dw->count); enc_r_depth_bias(en, 0, 0, 0); g_eq_tol_n++; }
     } else {
         if (prim == 7) { RED_ONCE(20, "带索引的四边形未实现"); return; }
         void *mb; uint64_t mo;
@@ -12264,6 +12282,10 @@ frz_plain:;
             if (pl_read(di->ibuf, n, PLK_IB, &pb, &po, &pg)) { gpu = pg; ilen = n; } }
         if (di->count) enc_r_draw_indexed(en, mp, di->count, di->itype == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32, gpu, ilen,
                 di->instances ? di->instances : 1, di->base_vertex, di->base_instance);
+        if (di->count && eq_tol_draw()) {   // TOTK_EQ_TOL: the same draw once more 1 unit nearer (see eq_tol_draw)
+            enc_r_depth_bias(en, -1, 0, 0);
+            enc_r_draw_indexed(en, mp, di->count, di->itype == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32, gpu, ilen, di->instances ? di->instances : 1, di->base_vertex, di->base_instance);
+            enc_r_depth_bias(en, 0, 0, 0); g_eq_tol_n++; }
         drawn:;
     }
     if (g_rt_range_pending) { PD("j rt_level_range pass=%llu vc=%u", g_stat_pass, (unsigned)(dw ? dw->count : di->count)); g_rt_range_pending=0; }
