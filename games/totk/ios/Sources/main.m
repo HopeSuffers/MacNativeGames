@@ -79,6 +79,8 @@ void runtime_shortcut_help_toggle(void) {}
 #endif
 @end
 
+void phone_motion_start(void);   /* phone_motion.m: the device's motion sensors aim (TOTK_GYRO=1, no motion controller) */
+void phone_motion_orientation(UIInterfaceOrientation o);
 @interface TOTKGameController : UIViewController @property(nonatomic,strong) TOTKMetalView *gameView; @end
 @implementation TOTKGameController
 - (void)viewDidLoad {
@@ -140,6 +142,12 @@ void runtime_shortcut_help_toggle(void) {}
     pthread_attr_t attr; pthread_attr_init(&attr); pthread_attr_setstacksize(&attr, 64u << 20);
     pthread_t thread; pthread_create(&thread, &attr, run_host, NULL);
     pthread_detach(thread); pthread_attr_destroy(&attr);
+    phone_motion_orientation(self.view.window.windowScene.effectiveGeometry.interfaceOrientation);
+    phone_motion_start();
+}
+- (void)viewDidLayoutSubviews {   /* the motion sensors follow which way round the phone is held */
+    [super viewDidLayoutSubviews];
+    phone_motion_orientation(self.view.window.windowScene.effectiveGeometry.interfaceOrientation);
 }
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
 - (BOOL)prefersStatusBarHidden { return YES; }
@@ -277,7 +285,8 @@ static void audio_observe(void) {
       if (scene.length>0&&scene.length<12) setenv("TOTK_RENDER_RES",scene.UTF8String,0);
       NSString *overlay = [ud stringForKey:@"TOTK_OVERLAY"];   // "" everything, "fps" the FPS line only, "off" nothing
       if ([overlay isEqualToString:@"fps"]||[overlay isEqualToString:@"off"]) { setenv("TOTK_SHADER_OVERLAY","0",0); setenv("TOTK_LOAD_OVERLAY","0",0); }
-      if ([overlay isEqualToString:@"off"]) setenv("TOTK_FPS_OVERLAY","0",0); }
+      if ([overlay isEqualToString:@"off"]) setenv("TOTK_FPS_OVERLAY","0",0);
+      if ([ud boolForKey:@"TOTK_GYRO"]) setenv("TOTK_GYRO","1",0); }   // Settings › Motion aiming (phone_motion.m, or a controller's sensors)
 #if TARGET_OS_VISION
     setenv("TOTK_OPERATION_MODE","docked",1);
     setenv("TOTK_IOS_DRAWABLE_H","1080",0);
