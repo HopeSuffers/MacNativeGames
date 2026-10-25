@@ -279,8 +279,10 @@ static void audio_observe(void) {
        (TOTK_MFX_OUTPUT needs TOTK_MFX_UPSCALE; below 1280x720 MetalFX also draws the scene into the picture), instead of
        the game's FSR 1 to 720 rows and the system's stretch. */
     { NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-      if ([[ud stringForKey:@"TOTK_PICTURE"] isEqualToString:@"mfx"]) {
-          setenv("TOTK_MFX_UPSCALE","1",0); setenv("TOTK_MFX_OUTPUT","1",0); setenv("TOTK_IOS_DRAWABLE_H","1080",0); }
+      NSString *picture = [ud stringForKey:@"TOTK_PICTURE"];   // "mfx": 1080 rows; "mfx-native": the screen's own pixels
+      if ([picture isEqualToString:@"mfx"]||[picture isEqualToString:@"mfx-native"]) {
+          setenv("TOTK_MFX_UPSCALE","1",0); setenv("TOTK_MFX_OUTPUT","1",0);
+          setenv("TOTK_IOS_DRAWABLE_H",[picture isEqualToString:@"mfx"]?"1080":"0",0); }
       NSString *scene = [ud stringForKey:@"TOTK_RENDER_RES"];
       if (scene.length>0&&scene.length<12) setenv("TOTK_RENDER_RES",scene.UTF8String,0);
       NSString *overlay = [ud stringForKey:@"TOTK_OVERLAY"];   // "" everything, "fps" the FPS line only, "off" nothing

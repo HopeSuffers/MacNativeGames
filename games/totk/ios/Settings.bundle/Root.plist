@@ -71,6 +71,7 @@
 			<array>
 				<string>遊戲 FSR 1 → 720p · Game (FSR 1) to 720p</string>
 				<string>MetalFX → 1080p</string>
+				<string>MetalFX → 原生解析度 · native resolution</string>
 			</array>
 			<key>Type</key>
 			<string>PSMultiValueSpecifier</string>
@@ -78,6 +79,7 @@
 			<array>
 				<string></string>
 				<string>mfx</string>
+				<string>mfx-native</string>
 			</array>
 		</dict>
 		<dict>
