@@ -491,7 +491,7 @@ static int pl_read_i(uint64_t a, uint64_t n, int kind, void **buf, uint64_t *off
         uint64_t t1 = t0 ? pl_now() : 0;
         __unsafe_unretained id<MTLBuffer> ab; uint8_t *acpu; uint64_t agpu; size_t ao = arena_alloc_u((size_t)n, &ab, &acpu, &agpu);
         sigjmp_buf jb; int ok = 0;
-        if (sigsetjmp(jb, 1) == 0) { runtime_fault_guard = &jb; memcpy(acpu, (const void *)(uintptr_t)a, (size_t)n); ok = 1; }
+        if (sigsetjmp(jb, 0) == 0) { runtime_fault_guard = &jb; memcpy(acpu, (const void *)(uintptr_t)a, (size_t)n); ok = 1; }   // mask not saved: ~0.6% of the translate thread (2026-10-25)
         runtime_fault_guard = NULL;
         if (t1) g_pls_st.snap_ns += (pl_now() - t1) * 16;
         if (ok) {
