@@ -56,7 +56,7 @@
 #define PLDS_MAX (256u << 10)
 #define PLDS_RING 4
 static const char *const g_plk_name[PLK_N] = {"vertex", "index", "storage", "uniform", "copy source", "texture source"};
-static uint32_t g_pl_keep = 600, g_pl_probe = 4; static int g_pl_first = 1, g_pl_query_vis, g_pl_log, g_pl_dsnap = 1, g_pl_texhold = 1;
+static uint32_t g_pl_keep = 600, g_pl_probe = 4; static int g_pl_first = 1, g_pl_query_vis, g_pl_log, g_pl_dsnap = 1, g_pl_texhold = 1, g_pl_htime;
 static uint64_t g_pl_rwatch;   // dry run: watch from this submission (0 off)
 static uint64_t g_pl_snap_max = 2u << 20, g_pl_budget = 96u << 20, g_pl_sub_bytes, g_pl_first_max = 64u << 10;
 static uint64_t g_pl_rel;   // under g_mu: newest fence whose frame wait was released early (mode 1)
@@ -75,6 +75,7 @@ static void pl_cfg_once(void) {
     if ((e = getenv("TOTK_PIPELINE_DSTATS"))) g_pl_dsnap = atoi(e) != 0;
     if ((e = getenv("TOTK_PIPELINE_TEXHOLD"))) g_pl_texhold = atoi(e) != 0;
     if ((e = getenv("TOTK_PIPELINE_LOG"))) g_pl_log = atoi(e) > 0 ? 40 : 0;
+    if ((e = getenv("TOTK_PIPELINE_HOOKTIME"))) g_pl_htime = atoi(e) != 0;
     g_pl_wprot = nvn_pl_wwhold();
     if ((e = getenv("TOTK_PIPELINE_RWATCH")) && g_pl == 2 && atoll(e) > 0) g_pl_rwatch = atoll(e) == 1 ? 1800 : (uint64_t)atoll(e);
     MLOG("TOTK_PIPELINE=%d: %s; snapshots up to %llu KB, volatile for %u frames, probation %u frames%s; occlusion results %s; depth statistics ring %s%s",
@@ -100,17 +101,21 @@ static _Atomic uint64_t g_plds_pub, g_plds_merge, g_plds_conflict, g_plds_skip, 
 /* ---------- translate-thread cost of the hooks (replay thread): calls counted, time sampled 1 in 16 (pseudo-random, so
    the fixed call pattern of a draw does not alias), outermost hook only ---------- */
 enum { PLH_REDIR, PLH_VB, PLH_IB, PLH_READ, PLH_LIVE, PLH_WRITE, PLH_BEGIN, PLH_COMMIT, PLH_N };
+/* 2026-10-25: even sampled, the clock reads were ~1.3% of the translate thread at Kakariko (prof-up-kak3: pl_read,
+   plds_redirect, bind_vertex_streams); the times are diagnostics, so they are taken only with TOTK_PIPELINE_HOOKTIME=1
+   (the stats lines then show 0 ms; call counts stay). g_pl_htime is set in pl_cfg_once. */
 static uint32_t g_plh_depth, g_plh_rnd = 0x9e3779b9u; static uint64_t g_plh_t[PLH_N], g_plh_c[PLH_N], g_plmi_scans, g_plmi_idx;
 static inline uint64_t plh_in(int cat) {
     if (g_plh_depth++) return 0;
-    g_plh_c[cat]++; g_plh_rnd ^= g_plh_rnd << 13; g_plh_rnd ^= g_plh_rnd >> 17; g_plh_rnd ^= g_plh_rnd << 5;
+    g_plh_c[cat]++; if (!g_pl_htime) return 0;
+    g_plh_rnd ^= g_plh_rnd << 13; g_plh_rnd ^= g_plh_rnd >> 17; g_plh_rnd ^= g_plh_rnd << 5;
     return g_plh_rnd & 15 ? 0 : pl_now();
 }
 static inline void plh_out(int cat, uint64_t t0) { g_plh_depth--; if (t0) g_plh_t[cat] += (pl_now() - t0) * 16; }
 /* 2026-10-24: the snapshot / decision timers of pl_read_i and pl_write_i read the clock on every call (~10% of pl_read,
    2% of a draw on the translate thread, tl-dghot); sampled 1 in 16 like the hooks, scaled when added. */
 static uint32_t g_pls_rnd = 0x2545f491u;
-static inline uint64_t pls_t0(void) { g_pls_rnd ^= g_pls_rnd << 13; g_pls_rnd ^= g_pls_rnd >> 17; g_pls_rnd ^= g_pls_rnd << 5; return g_pls_rnd & 15 ? 0 : pl_now(); }
+static inline uint64_t pls_t0(void) { if (!g_pl_htime) return 0; g_pls_rnd ^= g_pls_rnd << 13; g_pls_rnd ^= g_pls_rnd >> 17; g_pls_rnd ^= g_pls_rnd << 5; return g_pls_rnd & 15 ? 0 : pl_now(); }
 
 /* ---------- per submission (replay thread) ---------- */
 typedef struct { uint64_t lo, hi, gpu, off; void *buf; uint32_t gen; int8_t snap, kind; } pl_memo;
@@ -435,7 +440,7 @@ static int pl_decide(uint64_t a0, uint64_t n0, pl_dm **out) {
         }
         if (e->gen != g_plm_gen) { d = e; break; }
     }
-    int samp = !(++g_pls_st.decides & 31); uint64_t t0 = samp ? pl_now() : 0;   // timed one in 32 (scaled in the stats)
+    int samp = !(++g_pls_st.decides & 31) && g_pl_htime; uint64_t t0 = samp ? pl_now() : 0;   // timed one in 32 (scaled in the stats)
     int c; pl_sc *sc = pl_sc_slot(a, a + n); int same = sc->lo == a && sc->hi == a + n;
     uint64_t rgen = nvn_dirty_range_gen();
     if (same && sc->c == -2 && sc->stamp == rgen) { c = -1; g_pls_st.dc[0]++; }   // untracked, no range came or went since
