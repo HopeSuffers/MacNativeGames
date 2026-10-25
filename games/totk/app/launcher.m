@@ -197,6 +197,18 @@ int runtime_app_launch(int argc, char **argv, char ***boot) {
             printf("%s: game version %s\n", ok ? "ok" : "missing game files or version mismatch", TOTK_GAME_VERSION);
             return ok ? 0 : 1;
         }
+        /* Settings kept between starts: the app's own defaults whose names start with TOTK_ are environment settings for
+           every start, e.g. defaults write org.macnativegames.totk TOTK_UNCAPPED_HZ 60 (a launch's own environment wins;
+           a boolean counts as 1 / 0). */
+        NSDictionary *prefs = [NSUserDefaults.standardUserDefaults persistentDomainForName:NSBundle.mainBundle.bundleIdentifier ?: @""];
+        for (NSString *key in prefs) {
+            id v = prefs[key];
+            if (![key hasPrefix:@"TOTK_"] || getenv(key.UTF8String)) continue;
+            NSString *value = [v isKindOfClass:NSString.class] ? v
+                            : [v isKindOfClass:NSNumber.class] ? (CFGetTypeID((__bridge CFTypeRef)v) == CFBooleanGetTypeID() ? ([v boolValue] ? @"1" : @"0") : [v stringValue])
+                            : nil;
+            if (value) setenv(key.UTF8String, value.UTF8String, 0);
+        }
         if (access(binary.fileSystemRepresentation, R_OK) != 0) {
             show_error(@"The game files are missing from this app. Build it again with build_app.py.");
             return 1;
