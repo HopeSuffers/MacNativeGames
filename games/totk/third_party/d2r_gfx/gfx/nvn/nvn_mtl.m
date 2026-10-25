@@ -7292,8 +7292,22 @@ static id<MTLFunction> fs_fn_border_with(NvShader *fs, int nodepth, NSString *bk
 /* The fragment function reading the given attachments from the tile (nvn_fbread.h), nil when it cannot be made. Built on
    the submit thread when a draw first needs it, never in the background: the draw has given up the store before it
    (att_fb_take), so it cannot be drawn with the plain function meanwhile. */
+static id<MTLFunction> fs_fn_fbread_slow(NvShader *fs, const int aid[], const int att[], int n);
 static id<MTLFunction> fs_fn_fbread(NvShader *fs, const int aid[], const int att[], int n) {
     if (!fs || !sh_has_src(fs) || n <= 0) return nil;   // a depth-writing shader keeps its depth output: callers draw it only into a pass with a depth plane (att_fb_take)
+    /* TOTK: the decals ask for the same variant draw after draw; formatting the key and the dictionary lookup were ~2% of
+       the translate thread at Kakariko (2026-10-25). The last four answers per thread (the warm-up asks from its own). */
+    typedef struct { const void *fs; int n, aid[8], att[8]; __unsafe_unretained id<MTLFunction> fn; } fbr_memo;   // fs retained: no reuse of its address; it holds fn in bpatch
+    static __thread fbr_memo memo[4]; static __thread unsigned next;   // a few decal shaders alternate draw after draw
+    for (int i = 0; i < 4; i++) { fbr_memo *e = &memo[i];
+        if (e->fs == (__bridge const void *)fs && e->n == n && !memcmp(aid, e->aid, sizeof *aid * (size_t)n) && !memcmp(att, e->att, sizeof *att * (size_t)n)) return e->fn; }
+    id<MTLFunction> got = fs_fn_fbread_slow(fs, aid, att, n);
+    if (got && n <= 8) { fbr_memo *e = &memo[next++ & 3];
+        if (e->fs) CFRelease(e->fs);
+        e->fs = (__bridge_retained const void *)fs; e->n = n; memcpy(e->aid, aid, sizeof *aid * (size_t)n); memcpy(e->att, att, sizeof *att * (size_t)n); e->fn = got; }
+    return got;
+}
+static id<MTLFunction> fs_fn_fbread_slow(NvShader *fs, const int aid[], const int att[], int n) {
     NSMutableString *key = [NSMutableString stringWithString:@"fbread;"];
     for (int i = 0; i < n; i++) [key appendFormat:@"%d:%d;", aid[i], att[i]];
     os_unfair_lock_lock(&g_bpatch_lock); id fn = fs->bpatch[key]; os_unfair_lock_unlock(&g_bpatch_lock);
