@@ -273,7 +273,9 @@ def main():
     run(['xcrun','devicectl','device','install','app','--device',dev['identifier'],app])
     if a.game_data: push_game_data(dev['identifier'], bundle_id, a.game_data)
     seed = a.ipa.with_name(a.ipa.stem + '-shader-seed')   # build_ipa.py --image-outside
-    if a.ipa.is_dir() and not (app/'GameData/shader-seed').is_dir() and (seed/'fingerprint.txt').is_file():
+    # beside an IPA as well as beside a .app folder: an IPA built with --ios-game-data documents carries no seed either, and
+    # its app started with "no shaders" (2026-10-25)
+    if not (app/'GameData/shader-seed').is_dir() and (seed/'fingerprint.txt').is_file():
         push_seed(dev['identifier'], bundle_id, seed)
     management = 'Device Management' if dev['hardwareProperties'].get('platform') == 'visionOS' else 'VPN & Device Management'
     print(f'installed. First time on this device: Settings > General > {management} > trust your Apple ID.')
