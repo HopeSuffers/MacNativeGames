@@ -2845,9 +2845,7 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "tex_slots_check")) { (void)tex_slots_on(); atomic_store(&g_tex_slots_check, v != 0); MLOG("[flag] tex_slots_check = %d verified=%llu hits=%llu", v != 0, (unsigned long long)atomic_load(&g_tex_slots_verified), (unsigned long long)atomic_load(&g_tex_slots_hits)); return; }
     if (!strcmp(name, "gpucap")) { gpucap_request(v); return; }   // Metal GPU capture of the next v submissions (MTL_CAPTURE_ENABLED=1)
     if (!strcmp(name, "hz")) { hz_set(v); return; }   // TOTK_HZ from the next render pass
-    if (!strcmp(name, "eco_main")) { extern void runtime_eco_main_set(int) __attribute__((weak)); if (runtime_eco_main_set) runtime_eco_main_set(v); return; }
     if (!strcmp(name, "eco_host")) { atomic_store(&g_eco_host, v); MLOG("[flag] eco_host = %d (1 uniform helpers, 2 encode stage: utility QoS)", v); return; }
-    if (!strcmp(name, "eco_prio")) { extern void runtime_eco_prio_set(int) __attribute__((weak)); if (runtime_eco_prio_set) runtime_eco_prio_set(v); return; }
     if (!strcmp(name, "rs_spin_us")) { if (v < 0 || v > 5000) { MLOG("[flag] rs_spin_us requires 0..5000"); return; } atomic_store(&g_rs_spin_ns, (int64_t)v * 1000); MLOG("[flag] rs_spin_us = %d", v); return; }
     if (!strcmp(name, "render_stream")) { atomic_store(&g_rs_on, v != 0); MLOG("[flag] render_stream = %d (next render pass)", v != 0); return; }
     if (!strcmp(name, "cube_merge")) { atomic_store(&g_cg_on, v != 0); MLOG("[flag] cube_merge = %d", v != 0); return; }
