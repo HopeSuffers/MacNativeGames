@@ -2243,7 +2243,7 @@ static void *x_thread(void *unused) {
         while (g_xq_done == g_xq_in) pthread_cond_wait(&g_xq_cv, &g_xq_mu);
         xjob j = g_xq[g_xq_done % XQ];
         pthread_mutex_unlock(&g_xq_mu);
-        static int xs = -1; if (xs < 0) { const char *e = getenv("TOTK_XLATE_STATS"), *p = getenv("TOTK_PIPELINE"); xs = (e && atoi(e) > 0) || (p && atoi(p) > 0); }
+        static int xs = -1; if (xs < 0) { const char *e = getenv("TOTK_XLATE_STATS"), *p = getenv("TOTK_PIPELINE"); (void)p; int nvn_pl_mode(void); xs = (e && atoi(e) > 0) || nvn_pl_mode() > 0; }
         static uint64_t q_sub, q_sub_ns, pres_n, pres_ns; uint64_t tj = xs ? now_ns() : 0;
         if (xs && j.kind == XJ_SUBMIT && j.t_push) { q_sub++; q_sub_ns += tj - j.t_push; }
         if (j.kind == XJ_SUBMIT) { submit_exec(j.n, j.h, j.ucap); free(j.h); }

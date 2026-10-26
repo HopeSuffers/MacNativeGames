@@ -224,6 +224,9 @@ static int g_pl_wwhold;   // TOTK_PIPELINE_WWHOLD=1: also hold CPU writes that o
 static _Atomic uintptr_t g_pl_uring[PL_URING]; static _Atomic uint64_t g_pl_uring_n; static uint64_t g_pl_uring_cur;
 static void pl_init(void) {
     if (g_pl_mode >= 0) return;
+    /* Off unless asked for (TOTK_PIPELINE=1). Measured on the Mac with an earlier asynchronous preemption (full bench
+       +10.6% / +13.8% average, 1% low equal); to be measured again with main's preemption (#488) and TOTK_SYNC_LAG (#680)
+       before it is turned on by default. */
     const char *e = getenv("TOTK_PIPELINE"); int m = e ? atoi(e) : 0;
     e = getenv("TOTK_PIPELINE_PASSKEEP"); if (e) g_pl_passkeep = atoi(e) != 0;
     e = getenv("TOTK_PIPELINE_WWHOLD"); if (e) g_pl_wwhold = atoi(e) != 0;

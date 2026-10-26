@@ -59,7 +59,7 @@ static uint64_t inval_caller(void) {
     return 0;
 }
 NVN(nvnMemoryPoolInvalidateMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {
-    static int pl = -1; if (pl < 0) { const char *e = getenv("TOTK_PIPELINE"); pl = e && atoi(e) > 0; }
+    static int pl = -1; if (pl < 0) { int nvn_pl_mode(void); pl = nvn_pl_mode() > 0; }   /* TOTK_PIPELINE (nvn_dirty.c) */
     if (off >= 0) mtl_pool_invalidate_from((const pool_t *)p, (uint64_t)off, n, pl ? inval_caller() : 0);
 }
 NVN(nvnBufferInvalidateMappedRange, void, const NVNbuffer *b, ptrdiff_t off, size_t n) { (void)b; (void)off; (void)n; }
