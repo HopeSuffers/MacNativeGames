@@ -27,3 +27,10 @@
 "Choose folder" = "Ordner wählen";
 "Stop syncing" = "Sync beenden";
 "Saves stay on this device; a copy goes to the chosen folder (e.g. an iCloud Drive folder shared with another Apple ID). Choose the same folder on the Mac to carry on there. The folder picker appears the next time the game opens, or long-press the Home Screen icon." = "Die Spielstände bleiben auf diesem Gerät; eine Kopie kommt in den gewählten Ordner (z. B. einen iCloud-Drive-Ordner, der mit einer anderen Apple-ID geteilt ist). Wähle auf dem Mac denselben Ordner, um dort weiterzuspielen. Die Ordnerauswahl erscheint beim nächsten Öffnen des Spiels, oder lange auf das Symbol im Home-Bildschirm drücken.";
+"Display" = "Anzeige";
+"On: the game's docked settings, 1920×1080 output with the scene at 1600×900 (for a fast iPad). Off: handheld 1280×720. Takes effect after relaunching the game." = "Ein: die Docking-Einstellungen des Spiels, Ausgabe 1920×1080 mit der Szene in 1600×900 (für ein schnelles iPad). Aus: Handheld 1280×720. Gilt nach einem Neustart des Spiels.";
+"Full HD (docked)" = "Full HD (Docking-Modus)";
+"Frame rate" = "Bildrate";
+"30 is steadier and keeps the phone cooler; the 60 / 30 button between − and + of the touch controls switches it while playing." = "30 ist gleichmäßiger und hält das iPhone kühler; die Taste 60 / 30 zwischen − und + der Touch-Steuerung schaltet sie während des Spielens um.";
+"Up to 60" = "Bis zu 60";
+"Held at 30" = "Fest bei 30";

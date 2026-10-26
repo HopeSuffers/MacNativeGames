@@ -27,3 +27,10 @@
 "Choose folder" = "选择文件夹";
 "Stop syncing" = "停止同步";
 "Saves stay on this device; a copy goes to the chosen folder (e.g. an iCloud Drive folder shared with another Apple ID). Choose the same folder on the Mac to carry on there. The folder picker appears the next time the game opens, or long-press the Home Screen icon." = "存档仍保存在本机，只把副本放进所选文件夹（例如 iCloud 云盘里与其他 Apple ID 共享的文件夹），Mac 选同一个文件夹即可接续游玩。下次打开游戏时会出现文件夹选择器；也可长按主屏幕图标选择。";
+"Display" = "画面";
+"On: the game's docked settings, 1920×1080 output with the scene at 1600×900 (for a fast iPad). Off: handheld 1280×720. Takes effect after relaunching the game." = "开启：游戏的底座设置，输出 1920×1080、内部 1600×900，需要较快的 iPad。关闭：手持 1280×720。重新启动游戏后生效。";
+"Full HD (docked)" = "Full HD（底座模式）";
+"Frame rate" = "帧率";
+"30 is steadier and keeps the phone cooler; the 60 / 30 button between − and + of the touch controls switches it while playing." = "锁 30 帧画面更稳、手机更凉；游戏中也可以点触控按键中间的 60 / 30 切换。";
+"Up to 60" = "最高 60";
+"Held at 30" = "锁 30";
