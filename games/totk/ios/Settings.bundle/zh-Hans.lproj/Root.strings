@@ -22,3 +22,8 @@
 "Debug" = "调试";
 "Writes Documents/log.txt for reading on a Mac (slightly slower); off records nothing. Takes effect after relaunching the game." = "开启后把日志写进 App 的 Documents/log.txt（在 Mac 上读取），会稍微影响性能；关闭时不记录任何日志。重新启动游戏后生效。";
 "Debug log" = "记录日志";
+"Save sync" = "存档同步";
+"Folder" = "文件夹";
+"Choose folder" = "选择文件夹";
+"Stop syncing" = "停止同步";
+"Saves stay on this device; a copy goes to the chosen folder (e.g. an iCloud Drive folder shared with another Apple ID). Choose the same folder on the Mac to carry on there. The folder picker appears the next time the game opens, or long-press the Home Screen icon." = "存档仍保存在本机，只把副本放进所选文件夹（例如 iCloud 云盘里与其他 Apple ID 共享的文件夹），Mac 选同一个文件夹即可接续游玩。下次打开游戏时会出现文件夹选择器；也可长按主屏幕图标选择。";

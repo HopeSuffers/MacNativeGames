@@ -22,3 +22,8 @@
 "Debug" = "Fehlersuche";
 "Writes Documents/log.txt for reading on a Mac (slightly slower); off records nothing. Takes effect after relaunching the game." = "Schreibt Documents/log.txt zum Lesen auf einem Mac (etwas langsamer); aus zeichnet nichts auf. Gilt nach einem Neustart des Spiels.";
 "Debug log" = "Protokoll";
+"Save sync" = "Spielstand-Sync";
+"Folder" = "Ordner";
+"Choose folder" = "Ordner wählen";
+"Stop syncing" = "Sync beenden";
+"Saves stay on this device; a copy goes to the chosen folder (e.g. an iCloud Drive folder shared with another Apple ID). Choose the same folder on the Mac to carry on there. The folder picker appears the next time the game opens, or long-press the Home Screen icon." = "Die Spielstände bleiben auf diesem Gerät; eine Kopie kommt in den gewählten Ordner (z. B. einen iCloud-Drive-Ordner, der mit einer anderen Apple-ID geteilt ist). Wähle auf dem Mac denselben Ordner, um dort weiterzuspielen. Die Ordnerauswahl erscheint beim nächsten Öffnen des Spiels, oder lange auf das Symbol im Home-Bildschirm drücken.";
