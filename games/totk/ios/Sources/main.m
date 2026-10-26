@@ -269,6 +269,21 @@ static void audio_observe(void) {
                             : @"No shaders. Install the game again from the Mac with ios/tools/install_device.py (it copies them to the device).";
         fprintf(stderr, "[totk] no shader seed: %s\n", g_no_game_data.UTF8String);
     }
+    /* Settings.bundle › Picture / Overlay (read like the language below; overwrite=0 keeps devicectl --environment-variables
+       winning when testing from the Mac, and these choices win over Full HD's drawable and scene size below). Upscaling
+       "mfx": MetalFX upscales the picture to a 1080-row drawable, "mfx-native" to the screen's own pixels
+       (TOTK_MFX_OUTPUT needs TOTK_MFX_UPSCALE; below the picture's size MetalFX also draws the scene into it), instead of
+       the game's FSR 1 to 720 rows and the system's stretch. */
+    { NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+      NSString *picture = [ud stringForKey:@"TOTK_PICTURE"];
+      if ([picture isEqualToString:@"mfx"]||[picture isEqualToString:@"mfx-native"]) {
+          setenv("TOTK_MFX_UPSCALE","1",0); setenv("TOTK_MFX_OUTPUT","1",0);
+          setenv("TOTK_IOS_DRAWABLE_H",[picture isEqualToString:@"mfx"]?"1080":"0",0); }
+      NSString *scene = [ud stringForKey:@"TOTK_RENDER_RES"];
+      if (scene.length>0&&scene.length<12) setenv("TOTK_RENDER_RES",scene.UTF8String,0);
+      NSString *overlay = [ud stringForKey:@"TOTK_OVERLAY"];   // "" everything, "fps" the FPS line only, "off" nothing
+      if ([overlay isEqualToString:@"fps"]||[overlay isEqualToString:@"off"]) { setenv("TOTK_SHADER_OVERLAY","0",0); setenv("TOTK_LOAD_OVERLAY","0",0); }
+      if ([overlay isEqualToString:@"off"]) setenv("TOTK_FPS_OVERLAY","0",0); }
 #if TARGET_OS_VISION
     setenv("TOTK_OPERATION_MODE","docked",1);
     setenv("TOTK_IOS_DRAWABLE_H","1080",0);
