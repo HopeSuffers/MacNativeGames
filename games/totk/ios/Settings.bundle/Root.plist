@@ -202,6 +202,24 @@
 		</dict>
 		<dict>
 			<key>FooterText</key>
+			<string>移動手機（或有體感的手把）來瞄準弓箭等，如 Switch。重新啟動遊戲後生效 · aim the bow and other aimed items by moving the device (or a controller with motion sensors), as on a Switch. Takes effect after relaunching the game</string>
+			<key>Title</key>
+			<string>體感瞄準 · Motion aiming</string>
+			<key>Type</key>
+			<string>PSGroupSpecifier</string>
+		</dict>
+		<dict>
+			<key>DefaultValue</key>
+			<false/>
+			<key>Key</key>
+			<string>TOTK_GYRO</string>
+			<key>Title</key>
+			<string>體感瞄準 · Motion aiming</string>
+			<key>Type</key>
+			<string>PSToggleSwitchSpecifier</string>
+		</dict>
+		<dict>
+			<key>FooterText</key>
 			<string>開啟後把日誌寫進 App 的 Documents/log.txt（在 Mac 上讀取），會稍微影響效能；關閉時不記錄任何日誌。重新啟動遊戲後生效 · writes Documents/log.txt for reading on a Mac (slightly slower); off records nothing. Takes effect after relaunching the game</string>
 			<key>Title</key>
 			<string>除錯 · Debug</string>
