@@ -144,7 +144,7 @@
 			<key>Title</key>
 			<string>觸控操作 · Touch controls</string>
 			<key>FooterText</key>
-			<string>未連接手柄時使用手機的陀螺儀和觸覺馬達；接上手柄後自動讓位。重新啟動遊戲後生效 · uses the phone's gyro and haptic actuator with no controller connected; a connected controller takes over. Takes effect after relaunching the game</string>
+			<string>未連接手柄時使用手機的陀螺儀和觸覺馬達；接上手柄後自動讓位。滑桿調整觸控按鍵的不透明度。重新啟動遊戲後生效 · uses the phone's gyro and haptic actuator with no controller connected; a connected controller takes over. The slider sets how visible the touch buttons are. Takes effect after relaunching the game</string>
 		</dict>
 		<dict>
 			<key>Type</key>
@@ -165,6 +165,18 @@
 			<string>手機震動 · Phone haptics</string>
 			<key>DefaultValue</key>
 			<true/>
+		</dict>
+		<dict>
+			<key>Type</key>
+			<string>PSSliderSpecifier</string>
+			<key>Key</key>
+			<string>TOTK_TOUCH_OPACITY</string>
+			<key>DefaultValue</key>
+			<real>0.32</real>
+			<key>MinimumValue</key>
+			<real>0.05</real>
+			<key>MaximumValue</key>
+			<real>0.6</real>
 		</dict>
 		<dict>
 			<key>Type</key>

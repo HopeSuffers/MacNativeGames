@@ -193,9 +193,21 @@ static void draw_stick(CGContextRef c, CGPoint o, CGPoint p, CGFloat r) {
     CGContextFillEllipseInRect(c, knob); CGContextStrokeEllipseInRect(c, knob);
 }
 
+/* Settings › Touch controls slider (main.m apply_settings hands it over as TOTK_TOUCH_OPACITY, 0.05 to 0.6; a devicectl
+   value wins and may go up to 1): how visible the buttons are. 0.32 when unset, as before the slider. */
+static CGFloat touch_opacity(void) {
+    static CGFloat alpha = -1;
+    if (alpha < 0) {
+        const char *e = getenv("TOTK_TOUCH_OPACITY");
+        alpha = e && *e ? atof(e) : .32;
+        alpha = alpha < .05 ? .05 : alpha > 1 ? 1 : alpha;
+    }
+    return alpha;
+}
+
 - (void)drawRect:(CGRect)rect {
     if (concealed) return;
-    (void)rect; CGContextRef c = UIGraphicsGetCurrentContext(); UIColor *ink = [UIColor colorWithWhite:1 alpha:.32];
+    (void)rect; CGContextRef c = UIGraphicsGetCurrentContext(); UIColor *ink = [UIColor colorWithWhite:1 alpha:touch_opacity()];
     // One fill for every button and knob, set before each fill: drawing a label leaves the context's fill colour at the
     // label's, which once made every button after A (the first drawn) brighter than A and the stick knobs.
     CGColorRef fill = ink.CGColor; CGContextSetStrokeColorWithColor(c, ink.CGColor); CGContextSetFillColorWithColor(c, fill); CGContextSetLineWidth(c, 2);

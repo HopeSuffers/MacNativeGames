@@ -302,7 +302,9 @@ static void apply_settings(void) {
         if (owned != TOTK_KEY_ALWAYS && owned != layer_of) continue;
         id value = [d objectForKey:key];
         if ([value isKindOfClass:NSNumber.class]) {
-            setenv(key.UTF8String, [value boolValue] ? "1" : "0", 0);
+            /* A switch is "1" / "0"; a slider (TOTK_TOUCH_OPACITY) keeps its number. */
+            if (CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID()) setenv(key.UTF8String, [value boolValue] ? "1" : "0", 0);
+            else setenv(key.UTF8String, [NSString stringWithFormat:@"%g", [value doubleValue]].UTF8String, 0);
         } else if ([value isKindOfClass:NSString.class] && [value length] && [value length] < 64) {
             /* services.c takes a language code of up to 7 bytes and runtime_fails on a longer one. */
             if ([key isEqualToString:@"TOTK_LANG"] && [value length] > 7) continue;
