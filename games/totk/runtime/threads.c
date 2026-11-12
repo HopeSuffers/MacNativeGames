@@ -371,7 +371,12 @@ static int async_waiter_ok(const thr_t *t) { static int v = -1; if (v < 0) { con
    turn and the save load never finished (hr-both4-2, GPU busy, workers spinning on locks / yields). The stall being fixed
    is a priority-58 thread's 30 ms of guest code without an SVC. */
 static int async_owner_ok(const thr_t *o) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_ASYNC_PREEMPT_MINO"); v = e ? atoi(e) : 55; } return eff_prio(o) >= v; }
+/* TOTK_ASYNC_PREEMPT_TOPW=<priority> (experiment, default off): a waiter at that priority or better signals any owner it
+   beats, whatever the owner's priority. Aimed at the game's submit thread (priority 30, core 1), which waited ~10% of the
+   full bench for a core held by priority 44-53 workers until their next SVC (TOTK_CORE_LOG, 2026-10-25). */
+static int async_top_waiter(const thr_t *t) { static int v = -2; if (v == -2) { const char *e = getenv("TOTK_ASYNC_PREEMPT_TOPW"); v = e ? atoi(e) : -1; } return v >= 0 && eff_prio(t) <= v; }
 #else
+static int async_top_waiter(const thr_t *t) { (void)t; return 0; }
 static int async_waiter_ok(const thr_t *t) { (void)t; return 1; }
 static int async_owner_ok(const thr_t *o) { (void)o; return 1; }
 #endif
@@ -381,7 +386,7 @@ static int core_kick(thr_t *t) {   // holding G, t waiting: mark (and signal) th
         thr_t *o = g_core_owner[i];
         if (!o || !core_allowed(t, i) || !core_beats(t, o, now)) continue;
         __atomic_store_n(&o->preempt, 1, __ATOMIC_RELEASE); n++;
-        if (async_preempt_on() && async_waiter_ok(t) && async_owner_ok(o) && !pthread_kill(o->pt, SIGUSR2)) g_preempt_kicks++;
+        if (async_preempt_on() && async_waiter_ok(t) && (async_owner_ok(o) || async_top_waiter(t)) && !pthread_kill(o->pt, SIGUSR2)) g_preempt_kicks++;
     }
     return n;
 }

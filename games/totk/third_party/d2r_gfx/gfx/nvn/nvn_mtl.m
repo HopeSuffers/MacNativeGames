@@ -7291,9 +7291,12 @@ static id<MTLFunction> fs_fn_border_with(NvShader *fs, int nodepth, NSString *bk
     fn = make();
     return fn == VARIANT_NONE ? nil : fn;
 }
-/* The fragment function reading the given attachments from the tile (nvn_fbread.h), nil when it cannot be made. Built on
-   the submit thread when a draw first needs it, never in the background: the draw has given up the store before it
-   (att_fb_take), so it cannot be drawn with the plain function meanwhile. */
+/* The fragment function reading the given attachments from the tile (nvn_fbread.h), nil when it cannot be made (yet).
+   TOTK (async shaders, 2026-10-25): on the submit thread a variant not compiled yet is compiled in the background and nil
+   is answered meanwhile, so att_fb_take leaves the draw's reads in rs and the draw samples memory after a store, as
+   before tile reads; its first frames in a new area were 100-200 ms compiling it here (4.8 G instructions in one frame,
+   1.4.3 play sessions). The warm-up (warm_tileread) builds it at once (g_fbr_sync). */
+static __thread int g_fbr_sync;
 static id<MTLFunction> fs_fn_fbread_slow(NvShader *fs, const int aid[], const int att[], int n);
 static id<MTLFunction> fs_fn_fbread(NvShader *fs, const int aid[], const int att[], int n) {
     if (!fs || !sh_has_src(fs) || n <= 0) return nil;   // a depth-writing shader keeps its depth output: callers draw it only into a pass with a depth plane (att_fb_take)
@@ -7309,12 +7312,38 @@ static id<MTLFunction> fs_fn_fbread(NvShader *fs, const int aid[], const int att
         e->fs = (__bridge_retained const void *)fs; e->n = n; memcpy(e->aid, aid, sizeof *aid * (size_t)n); memcpy(e->att, att, sizeof *att * (size_t)n); e->fn = got; }
     return got;
 }
+typedef struct { int aid[8], att[8], n; } fbr_req;
+static id<MTLFunction> fs_fn_fbread_build(NvShader *fs, fbr_req r, NSString *key, NSString *src);
 static id<MTLFunction> fs_fn_fbread_slow(NvShader *fs, const int aid[], const int att[], int n) {
     NSMutableString *key = [NSMutableString stringWithString:@"fbread;"];
     for (int i = 0; i < n; i++) [key appendFormat:@"%d:%d;", aid[i], att[i]];
     os_unfair_lock_lock(&g_bpatch_lock); id fn = fs->bpatch[key]; os_unfair_lock_unlock(&g_bpatch_lock);
     if (fn) return fn == VARIANT_NONE ? nil : fn;
+    if (n > 8) return nil;
+    fbr_req r; r.n = n; memcpy(r.aid, aid, sizeof *aid * (size_t)n); memcpy(r.att, att, sizeof *att * (size_t)n);
+    static NSMutableSet<NSString *> *busy; static os_unfair_lock busy_lock = OS_UNFAIR_LOCK_INIT; static _Atomic uint64_t queued;
+    NSString *job = g_fbr_sync ? nil : [NSString stringWithFormat:@"%p %@", (__bridge void *)fs, key];
+    if (job) { os_unfair_lock_lock(&busy_lock); BOOL compiling = [busy containsObject:job]; os_unfair_lock_unlock(&busy_lock); if (compiling) return nil; }
     NSString *src = nvn_fbread_src(sh_src(fs), fs->fn.name, aid, att, n);
+    if (g_fbr_sync || !async_shaders() || !src) return fs_fn_fbread_build(fs, r, key, src);
+#if !TARGET_OS_IPHONE
+    { NSData *raw = [src dataUsingEncoding:NSUTF8StringEncoding]; if (raw && shader_lib_prebuilt(raw)) return fs_fn_fbread_build(fs, r, key, src); }   // in the app: loading it takes a few ms
+#endif
+    os_unfair_lock_lock(&busy_lock);
+    if (!busy) busy = [NSMutableSet set];
+    BOOL fresh = ![busy containsObject:job]; if (fresh) [busy addObject:job];
+    os_unfair_lock_unlock(&busy_lock);
+    if (!fresh) return nil;   // compiling already
+    uint64_t q = atomic_fetch_add(&queued, 1) + 1;
+    if (q <= 8 || q % 100 == 0) MLOG("[async-shaders] tile-reading variant compiled in the background (%llu so far): %s %s", (unsigned long long)q, fs->key, key.UTF8String);
+    static dispatch_queue_t dq; static dispatch_once_t once;
+    dispatch_once(&once, ^{ dq = dispatch_queue_create("totk.shader-fbread", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_CONCURRENT, QOS_CLASS_USER_INITIATED, 0)); });
+    dispatch_async(dq, ^{ @autoreleasepool { g_variant_bg = 1; fs_fn_fbread_build(fs, r, key, src); g_variant_bg = 0; }
+        os_unfair_lock_lock(&busy_lock); [busy removeObject:job]; os_unfair_lock_unlock(&busy_lock); });
+    return nil;
+}
+static id<MTLFunction> fs_fn_fbread_build(NvShader *fs, fbr_req r, NSString *key, NSString *src) {
+    int n = r.n; id fn = nil;
     CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();   // about 90 ms cold on an M4 Max; Metal's cache keeps it, and the next packaging compiles it into the app (variant_library)
     NSError *err = nil; id<MTLLibrary> lib = src ? variant_library(src, &err) : nil;
     fn = lib ? [lib newFunctionWithName:fs->fn.name] : nil;
@@ -7776,6 +7805,7 @@ void mtl_wait_stats(uint64_t *plib_ns, uint64_t *pso_ns) { *plib_ns = atomic_loa
 static _Atomic uint64_t g_sp_ns;
 void mtl_scan_stats(uint64_t *shader_ns, uint64_t *pso_ns) { *shader_ns = atomic_load_explicit(&g_sp_ns, memory_order_relaxed); *pso_ns = atomic_load_explicit(&g_pp_scan_ns, memory_order_relaxed); }
 static void pso_predict_rest(void);
+static uint64_t g_pp_gaveup;   // draws that stopped waiting for a guess still compiling and built the pipeline themselves
 static int pso_pend_find(const pso_key *k) { for (int i = 0; i < PSO_PEND_MAX; i++) if (g_pp[i].used && !memcmp(&g_pp[i].k, k, sizeof *k)) return i; return -1; }
 // Called only with g_pp_mu held. An in-flight worker still owns its slot:
 // completion must be published before that slot can ever be reused. Negative 25 frees every slot.
@@ -7803,7 +7833,11 @@ static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // �
     pthread_mutex_unlock(&g_pp_mu);
     if (at >= 0 || slot < 0) return;
     uint64_t t0 = bp_now(); MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, nil, 0); g_pp_kicked++; NSString *key = pso_archive_key(k, vs, fs, 0); g_pp_desc_ns += bp_now() - t0;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    /* TOTK (2026-10-25): guesses compile at utility QoS (XPC carries it to the compiler service), so the pipeline a draw
+       builds itself (pso_pend_take gave up waiting) is not queued behind them: 1.4.3 play showed 0.7-0.9 s frames with
+       one new pipeline right after a scan had kicked 12-64. TOTK_PSO_PREDICT_QOS=1: user-initiated as before. */
+    static int qos = -1; if (qos < 0) { const char *e = getenv("TOTK_PSO_PREDICT_QOS"); qos = e && atoi(e) == 1 ? QOS_CLASS_USER_INITIATED : QOS_CLASS_UTILITY; }
+    dispatch_async(dispatch_get_global_queue(qos, 0), ^{
         NSError *e = nil; id<MTLRenderPipelineState> ps = pso_new(d, key, &e);
         pthread_mutex_lock(&g_pp_mu); g_pp[slot].ps = ps; g_pp[slot].done = 1; pthread_cond_broadcast(&g_pp_cv); pthread_mutex_unlock(&g_pp_mu);
     });
@@ -7811,9 +7845,17 @@ static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // �
 static id<MTLRenderPipelineState> pso_pend_take(const pso_key *k) {   // 提交线程调：表里有就等它编完并取走；没有返回 nil | Called by the submit thread: if it is in the table, wait for it to finish compiling and take it; otherwise return nil
     pthread_mutex_lock(&g_pp_mu);
     int at = pso_pend_find(k); id<MTLRenderPipelineState> ps = nil;
+    /* TOTK (2026-10-25): a guess still compiling is waited for TOTK_PSO_PEND_WAIT_US (2000) at most; then the draw builds
+       the pipeline itself (its compile is not queued behind the other guesses) and the slot stays until the guess is done
+       (pso_pend_reclaim frees it). <0: wait as long as it takes, as before. */
+    static long wait_us = -2; if (wait_us == -2) { const char *e = getenv("TOTK_PSO_PEND_WAIT_US"); wait_us = e ? atol(e) : 2000; }
     if (at >= 0) { uint64_t t0 = bp_now(); int waited = !g_pp[at].done;
-        while (!g_pp[at].done) pthread_cond_wait(&g_pp_cv, &g_pp_mu);
+        if (waited && wait_us >= 0) {
+            struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += wait_us * 1000; ts.tv_sec += ts.tv_nsec / 1000000000; ts.tv_nsec %= 1000000000;
+            while (!g_pp[at].done && pthread_cond_timedwait(&g_pp_cv, &g_pp_mu, &ts) == 0) {}
+        } else while (!g_pp[at].done) pthread_cond_wait(&g_pp_cv, &g_pp_mu);
         if (waited) { g_pp_waits++; atomic_fetch_add_explicit(&g_pp_wait_ns, bp_now() - t0, memory_order_relaxed); }
+        if (!g_pp[at].done) { g_pp_gaveup++; pthread_mutex_unlock(&g_pp_mu); return nil; }
         ps = g_pp[at].ps; g_pp[at].ps = nil; g_pp[at].used = 0; }
     pthread_mutex_unlock(&g_pp_mu);
     return ps;
@@ -8275,7 +8317,7 @@ static int warm_tileread(NSArray<NSString *> *c, NSMutableDictionary<NSString *,
         if (n == 8) return 0;
         aid[n] = q[0].intValue; att[n] = q[1].intValue; n++;
     }
-    id<MTLFunction> fn = n ? fs_fn_fbread(fs, aid, att, n) : nil;
+    g_fbr_sync = 1; id<MTLFunction> fn = n ? fs_fn_fbread(fs, aid, att, n) : nil; g_fbr_sync = 0;
     if (!fn) return 0;
     pso_key k = sk.k; k.vs = (__bridge void *)vs; k.fs = (__bridge void *)fs; k.fsfn = (__bridge void *)fn;
     NSError *e = nil; uint64_t ps_started = bp_now();
@@ -9786,10 +9828,10 @@ static void pso_predict_rest(void) {
     if (g_pp_scans % 100 == 0) {
         pthread_mutex_lock(&g_pp_mu); uint64_t full = g_pp_full, freed = g_pp_reclaimed, waits = g_pp_waits, wait_ns = g_pp_wait_ns; int busy = 0;
         for (int i = 0; i < PSO_PEND_MAX; i++) busy += g_pp[i].used; pthread_mutex_unlock(&g_pp_mu);
-        MLOG("并行预编 至提交 %llu：扫描 %llu 次（平均 %.2f ms；到上限：命令 %llu、键 %llu、时间 %llu），后台开编 %llu 条，绘制领用 %llu 条（等后台 %llu 次共 %.1f ms），提交线程同步编 %llu 条，表满没收 %llu 条，回收没用上的 %llu 条，表里现有 %d 条",
+        MLOG("并行预编 至提交 %llu：扫描 %llu 次（平均 %.2f ms；到上限：命令 %llu、键 %llu、时间 %llu），后台开编 %llu 条，绘制领用 %llu 条（等后台 %llu 次共 %.1f ms，不等了自己编 %llu 条），提交线程同步编 %llu 条，表满没收 %llu 条，回收没用上的 %llu 条，表里现有 %d 条",
              (unsigned long long)g_sub_serial, (unsigned long long)g_pp_scans, g_pp_scan_ns / 1e6 / (double)g_pp_scans,
              (unsigned long long)g_pp_stop[0], (unsigned long long)g_pp_stop[1], (unsigned long long)g_pp_stop[2],
-             (unsigned long long)g_pp_kicked, (unsigned long long)g_pp_taken, (unsigned long long)waits, wait_ns / 1e6,
+             (unsigned long long)g_pp_kicked, (unsigned long long)g_pp_taken, (unsigned long long)waits, wait_ns / 1e6, (unsigned long long)g_pp_gaveup,
              (unsigned long long)g_pp_sync, (unsigned long long)full, (unsigned long long)freed, busy);
         MLOG("并行预编 至提交 %llu：扫描到程序或绑定变体还没解析的绘制 %llu 次，其中用已加载的着色器预测 %llu 次（查找共 %.1f ms）；为后台建管线描述符共 %.1f ms，缺补丁函数先交给后台编的猜测 %llu 条；后台为预测开编着色器库 %llu 个，绘制领用 %llu 个（等它编完 %llu 次共 %.1f ms）",
              (unsigned long long)g_sub_serial, (unsigned long long)g_pp_unseen, (unsigned long long)g_pp_unseen_hit, g_pp_unseen_ns / 1e6, g_pp_desc_ns / 1e6, (unsigned long long)g_pp_vdefer,
